@@ -409,13 +409,23 @@ fn fresh_box_after_midnight_is_not_hard_stopped() {
     // Regressions-Test: frisch gemietete 0.12 $/h-Box kurz nach Mitternacht.
     // Alte Semantik rechnete bis Mitternacht (23.6 h × 0.12 = 2.83 ≥ 2.59
     // hard) und stoppte die Box sofort. Neu: hard = akkumuliert ≥ hard.
-    let a = inst(21, 2, Role::Media, InstanceState::Healthy);
+    let mut a = inst(21, 2, Role::Media, InstanceState::Healthy);
+    a.created_at = now(); // gerade erst gemietet
     let mut s = snap(vec![slot(2, Role::Media, vec![a], Some(21))]);
     s.seconds_to_day_end = 23 * 3600 + 40 * 60; // 00:20 Berlin
     s.spent_today_usd = 0.04; // gerade erst gemietet
     s.running_rate_usd_h = 0.12;
     let actions = decide(&s, &cfg());
-    assert!(!actions.iter().any(|x| matches!(x, Action::Stop { .. } | Action::Alert { kind, .. } if kind == "budget_hard")), "{actions:?}");
+    assert!(
+        !actions
+            .iter()
+            .any(|x| match x {
+                Action::Stop { .. } => true,
+                Action::Alert { kind, .. } if kind == "budget_hard" => true,
+                _ => false,
+            }),
+        "{actions:?}"
+    );
 }
 
 #[test]

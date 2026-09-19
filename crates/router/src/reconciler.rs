@@ -371,10 +371,15 @@ pub async fn build_snapshot(app: &SharedApp) -> anyhow::Result<Snapshot> {
             if !is_running && row.destroyed_at.is_none() {
                 storage_rate += row.storage_usd_h;
             }
-            let idle_since = app
-                .traffic
-                .snapshot(slot.id)
-                .last_request;
+            let idle_since = {
+                let last_req = app.traffic.snapshot(slot.id).last_request;
+                let created = crate::db::parse_iso(&row.created_at);
+                match (last_req, created) {
+                    (t, Some(c)) if t > 0 => Some(chrono::DateTime::from_timestamp(t, 0).unwrap_or(c)),
+                    (_, Some(c)) => Some(c), // frische Box: Idle zählt ab Creation
+                    _ => None,
+                }
+            };
             instances.push(InstanceSnapshot {
                 vast_id: row.vast_id,
                 offer_id: row.offer_id,
@@ -395,11 +400,7 @@ pub async fn build_snapshot(app: &SharedApp) -> anyhow::Result<Snapshot> {
                 dph_total: row.dph_total,
                 storage_usd_h: row.storage_usd_h,
                 created_at: crate::db::parse_iso(&row.created_at).unwrap_or_default(),
-                idle_since: if idle_since > 0 {
-                    chrono::DateTime::from_timestamp(idle_since, 0)
-                } else {
-                    None
-                },
+                idle_since,
                 stopped_since: row.stopped_since.as_deref().and_then(crate::db::parse_iso),
                 last_seen: None,
                 pinned: row.pinned || pins.get(&slot.id) == Some(&Some(row.vast_id)),

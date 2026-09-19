@@ -492,10 +492,9 @@ pub fn decide(snap: &Snapshot, cfg: &PolicyConfig) -> Vec<Action> {
             // Bei laufendem Ersatz-Swap kein Idle-Stop: die alte Instanz
             // haelt den Slot warm, bis das Replacement healthy ist.
             if !pinned && !replacement_queued && inst.state == InstanceState::Healthy && !inst.busy && slot.in_flight == 0 {
-                let idle_secs = inst
-                    .idle_since
-                    .map(|t| (snap.now - t).num_seconds())
-                    .unwrap_or(i64::MAX);
+                // idle_since None = noch kein Traffic: Idle zählt ab Creation.
+                let idle_base = inst.idle_since.unwrap_or(inst.created_at);
+                let idle_secs = (snap.now - idle_base).num_seconds();
                 let stop_after = match &inst.lifecycle {
                     praxis_common::Lifecycle::Sleep { stop_after_idle_s, .. } => *stop_after_idle_s,
                     _ => scfg.idle.stop_after_s,

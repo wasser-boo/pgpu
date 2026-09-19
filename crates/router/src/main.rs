@@ -6,6 +6,7 @@
 
 mod api;
 mod assets;
+mod connector;
 mod config;
 mod dashboard;
 mod db;
@@ -83,6 +84,14 @@ async fn async_main() -> Result<()> {
         &format!("pgpu {} — {} Slots", env!("CARGO_PKG_VERSION"), app.cfg.slots.len()),
         &serde_json::json!({"config": config_path}),
     );
+
+    // Agent-Connector: Router waehlt sich in die gpu-agents ein (:9100).
+    {
+        let app = app.clone();
+        tokio::spawn(async move {
+            connector::run(app).await;
+        });
+    }
 
     // Reconciler.
     {
