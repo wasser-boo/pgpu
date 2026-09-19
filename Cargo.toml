@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = ["crates/common", "crates/vast", "crates/policy", "crates/router"]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+axum = { version = "0.7", features = ["multipart", "ws"] }
+chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"
+hex = "0.4"
+http-body-util = "0.1"
+hyper = "1"
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "socks", "stream"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.21"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tower-http = { version = "0.5", features = ["fs"] }
+askama = "0.12"
+thiserror = "1"
+url = "2"
+
+[profile.release]
+lto = "thin"
+strip = true

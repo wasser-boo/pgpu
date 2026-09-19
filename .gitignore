@@ -1,0 +1,7 @@
+/target
+/data
+config.toml
+*.sqlite
+*.sqlite-journal
+.env
+nohup.out
