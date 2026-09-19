@@ -19,7 +19,9 @@ offer_poll_s = 60
 [netbird]
 # Management-API-Token (nbt_...) für ephemerere Setup-Keys pro Instanz.
 # Ohne: statischer setup_key (Fallback).
-# api_token = "nbt_..."
+# api_token = "nbt_..."       # Cloud; self-hosted: PAT (nbp_...) + api_url
+# api_url = "https://api.netbird.io"  # self-hosted: eigene Management-URL
+# management_url = "https://api.netbird.io"  # PEER-Enrollment-Ziel (NB_MANAGEMENT_URL auf den Boxen)!
 setup_key = ""
 group = "gpu"
 router_nb_ip = "100.64.0.1"  # NetBird-IP des Router-Hosts (Agents callen home)
@@ -52,9 +54,9 @@ name = "LLM (fork-llama)"
 image = "vayayo/praxis-llamap-gs-gpu:latest"
 disk_gb = 120
 # 16-GB-Guide-Filter (5070 Ti rar, 4060 Ti/A4000 Alternativen):
-search_query = 'gpu_ram>=15000 cpu_ram>=30000 disk_space>=120 inet_down>=500 disk_bw>=1500 reliability2>=0.95'
+search_query = 'gpu_ram>=15 cpu_ram>=30 disk_space>=120 inet_down>=500 disk_bw>=1500 reliability2>=0.95'
 # Flash-Next-82GB-Rezept:
-# search_query = 'gpu_name="RTX 5070 Ti" cpu_ram>=62000 cuda_max_good>=12.9 disk_space>=120 inet_down>=800 disk_bw>=1500 reliability2>=0.95'
+# search_query = 'gpu_name="RTX 5070 Ti" cpu_ram>=62 cuda_vers>=12.9 disk_space>=120 inet_down>=800 disk_bw>=1500 reliability2>=0.95'
 passthrough = { 11434 = "api", 11435 = "webui", 11436 = "embed" }
 
 [slots.services]
@@ -94,7 +96,7 @@ role = "media"
 name = "Media (fork-comfyui)"
 image = "vayayo/praxis-comfyui-gpu:latest"
 disk_gb = 60
-search_query = 'gpu_ram>=16000 gpu_name="RTX 3090" disk_space>=60 inet_down>=300 reliability2>=0.95'
+search_query = 'gpu_ram>=23 gpu_name="RTX 3090" disk_space>=60 inet_down>=300 reliability2>=0.95'
 passthrough = { 8188 = "comfy" }
 # STT läuft im Router (stt.mode=local); 2700 → Sidecar. Legacy-Slot:
 # passthrough = { 8188 = "comfy", 2700 = "stt" }

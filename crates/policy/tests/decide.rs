@@ -404,3 +404,28 @@ fn offer_score_prefers_cheap_rate_with_storage() {
     // 120 GB Disk, 20 GB Traffic, 4 h erwartet:
     assert!(o2.score(120, 20.0, 4.0) < o1.score(120, 20.0, 4.0));
 }
+#[test]
+fn fresh_box_after_midnight_is_not_hard_stopped() {
+    // Regressions-Test: frisch gemietete 0.12 $/h-Box kurz nach Mitternacht.
+    // Alte Semantik rechnete bis Mitternacht (23.6 h × 0.12 = 2.83 ≥ 2.59
+    // hard) und stoppte die Box sofort. Neu: hard = akkumuliert ≥ hard.
+    let a = inst(21, 2, Role::Media, InstanceState::Healthy);
+    let mut s = snap(vec![slot(2, Role::Media, vec![a], Some(21))]);
+    s.seconds_to_day_end = 23 * 3600 + 40 * 60; // 00:20 Berlin
+    s.spent_today_usd = 0.04; // gerade erst gemietet
+    s.running_rate_usd_h = 0.12;
+    let actions = decide(&s, &cfg());
+    assert!(!actions.iter().any(|x| matches!(x, Action::Stop { .. } | Action::Alert { kind, .. } if kind == "budget_hard")), "{actions:?}");
+}
+
+#[test]
+fn hard_cap_fires_on_accumulated_spend_only() {
+    let a = inst(21, 2, Role::Media, InstanceState::Healthy);
+    let mut s = snap(vec![slot(2, Role::Media, vec![a], Some(21))]);
+    s.seconds_to_day_end = 23 * 3600;
+    s.spent_today_usd = 2.80; // > 2.592 hard
+    s.running_rate_usd_h = 0.12;
+    let actions = decide(&s, &cfg());
+    assert!(actions.iter().any(|x| matches!(x, Action::Stop { instance_id: 21, .. })), "{actions:?}");
+    assert!(actions.iter().any(|x| matches!(x, Action::Alert { kind, .. } if kind == "budget_hard")), "{actions:?}");
+}

@@ -16,44 +16,28 @@ pub enum OfferType {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
 pub struct Offer {
     pub id: i64,
-    #[serde(default)]
     pub gpu_name: String,
-    #[serde(default)]
     pub gpu_ram: i64, // MB
-    #[serde(default)]
     pub cpu_ram: i64, // MB
-    #[serde(default)]
     pub disk_space: f64,
-    #[serde(default)]
     pub disk_bw: f64,
-    #[serde(default)]
     pub inet_down: f64,
-    #[serde(default)]
-    pub inet_down_cost: f64,
-    #[serde(default)]
-    pub inet_up_cost: f64,
-    #[serde(default)]
-    pub storage_cost: f64, // $/GB/Monat
-    #[serde(default)]
-    pub dph_total: f64,
-    #[serde(default)]
-    pub min_bid: f64,
-    #[serde(default)]
-    pub reliability2: f64,
-    #[serde(default)]
+    // Vast liefert je nach Suchmodus (bid/on-demand) null:
+    pub inet_down_cost: Option<f64>,
+    pub inet_up_cost: Option<f64>,
+    pub storage_cost: Option<f64>, // $/GB/Monat
+    pub dph_total: Option<f64>,
+    pub min_bid: Option<f64>,
+    pub reliability2: Option<f64>,
     pub machine_id: i64,
-    #[serde(default)]
-    pub cuda_max_good: String,
-    #[serde(default)]
+    pub cuda_max_good: Option<f64>,
     pub num_gpus: i64,
-    #[serde(default)]
-    pub geolocation: String,
-    #[serde(default)]
-    pub cpu_cores: i64,
-    #[serde(default)]
-    pub gpu_frac: f64,
+    pub geolocation: Option<String>,
+    pub cpu_cores: Option<f64>,
+    pub gpu_frac: Option<f64>,
 }
 
 impl Offer {
@@ -63,48 +47,57 @@ impl Offer {
     pub fn cpu_ram_gb(&self) -> f64 {
         self.cpu_ram as f64 / 1024.0
     }
+    pub fn min_bid_or(&self, alt: f64) -> f64 {
+        self.min_bid.unwrap_or(alt)
+    }
+    pub fn dph_or(&self, alt: f64) -> f64 {
+        self.dph_total.unwrap_or(alt)
+    }
+    pub fn storage_or(&self, alt: f64) -> f64 {
+        self.storage_cost.unwrap_or(alt)
+    }
     /// Storage-Preis $/h für `disk_gb`.
     pub fn storage_usd_h(&self, disk_gb: i64) -> f64 {
-        self.storage_cost * disk_gb as f64 / 30.0 / 24.0
+        self.storage_or(0.0) * disk_gb as f64 / 30.0 / 24.0
     }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
 pub struct Instance {
     pub id: i64,
-    #[serde(default)]
-    pub label: String,
-    #[serde(default)]
-    pub machine_id: i64,
-    #[serde(default)]
-    pub gpu_name: String,
-    #[serde(default)]
-    pub image: String,
-    /// vast: "running" | "loading" | "stopped" | "error" | ...
-    #[serde(default)]
-    pub actual_status: String,
-    #[serde(default)]
-    pub intended_status: String,
-    #[serde(default)]
-    pub cur_state: String,
-    #[serde(default)]
-    pub next_state: String,
-    #[serde(default)]
-    pub status: String,
-    #[serde(default)]
-    pub bid_value: f64,
-    #[serde(default)]
-    pub dph_total: f64,
-    #[serde(default)]
-    pub min_bid: f64,
-    #[serde(default)]
-    pub storage_total: f64,
-    #[serde(default)]
-    pub storage_cost: f64,
-    #[serde(default)]
-    pub inet_down_cost: f64,
-    #[serde(default)]
+    pub label: Option<String>,
+    pub machine_id: Option<i64>,
+    pub gpu_name: Option<String>,
+    pub image: Option<String>,
+    /// vast: "running" | "loading" | "stopped" | "error" | ... — null während Provisioning.
+    pub actual_status: Option<String>,
+    pub intended_status: Option<String>,
+    pub cur_state: Option<String>,
+    pub next_state: Option<String>,
+    pub status: Option<String>,
+    pub bid_value: Option<f64>,
+    pub dph_total: Option<f64>,
+    pub min_bid: Option<f64>,
+    pub storage_total: Option<f64>,
+    pub storage_cost: Option<f64>,
+    pub inet_down_cost: Option<f64>,
     pub extra_env: serde_json::Value,
+}
+
+impl Instance {
+    pub fn actual_or(&self, alt: &str) -> String {
+        self.actual_status.clone().unwrap_or_else(|| alt.to_string())
+    }
+    pub fn intended_or(&self, alt: &str) -> String {
+        self.intended_status.clone().unwrap_or_else(|| alt.to_string())
+    }
+    pub fn label_or<'a>(&'a self, alt: &'a str) -> &'a str {
+        self.label.as_deref().unwrap_or(alt)
+    }
+    pub fn gpu_or<'a>(&'a self, alt: &'a str) -> &'a str {
+        self.gpu_name.as_deref().unwrap_or(alt)
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -119,6 +112,8 @@ pub struct CurrentUser {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CreateInstanceParams<'a> {
+    #[serde(rename = "client_id")]
+    pub client: &'a str, // "me"
     pub image: &'a str,
     pub price: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -127,11 +122,21 @@ pub struct CreateInstanceParams<'a> {
     pub label: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub template_hash_id: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "onstart", skip_serializing_if = "Option::is_none")]
     pub onstart_cmd: Option<&'a str>,
+    /// "args" = Plain-Docker-Run des Image-Entrypoints (supervisord).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub runtype: Option<&'a str>, // "on-demand" | "interruptible"
+    pub runtype: Option<&'a str>,
     pub env: serde_json::Value,
+    pub extra: Option<String>,
+    pub image_login: Option<String>,
+    pub python_utf8: bool,
+    pub lang_utf8: bool,
+    pub use_jupyter_lab: bool,
+    pub jupyter_dir: Option<String>,
+    pub force: bool,
+    pub cancel_unavail: bool,
+    pub user: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

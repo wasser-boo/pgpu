@@ -97,6 +97,13 @@ pub struct NetbirdCfg {
     /// Management-API-Token (ephemerere Setup-Keys minten). Leer = statischer Key.
     #[serde(default)]
     pub api_token: String,
+    /// Management-API-Base (Cloud: https://api.netbird.io; self-hosted: eigene URL).
+    #[serde(default = "d_nb_api")]
+    pub api_url: String,
+    /// Management-URL für PEER-ENROLLMENT (NB_MANAGEMENT_URL auf den Boxen).
+    /// Pflicht bei self-hosted NetBird, sonst enrollt die Box in die Cloud!
+    #[serde(default = "d_nb_mgmt")]
+    pub management_url: String,
     /// Statischer Setup-Key als Fallback.
     #[serde(default)]
     pub setup_key: String,
@@ -108,6 +115,14 @@ pub struct NetbirdCfg {
     /// Port des Router-Dashboards aus Agent-Sicht (Call-home).
     #[serde(default = "d_nb_port")]
     pub router_nb_port: u16,
+}
+
+fn d_nb_api() -> String {
+    "https://api.netbird.io".into()
+}
+
+fn d_nb_mgmt() -> String {
+    "https://api.netbird.io".into()
 }
 
 fn d_group() -> String {

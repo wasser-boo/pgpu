@@ -9,6 +9,7 @@ services:
     container_name: pgpu-router
     network_mode: host # NetBird-TUN des Hosts nutzen
     restart: unless-stopped
+    user: "1000:1000" # Host-User besitzt /data (sqlite muss schreibbar sein)
     volumes:
       - ./data:/data
       - ./config.toml:/data/config.toml:ro

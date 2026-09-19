@@ -4,4 +4,4 @@ config.toml
 *.sqlite
 *.sqlite-journal
 .env
-nohup.out
+nohup.out.env

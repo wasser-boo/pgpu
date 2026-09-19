@@ -237,10 +237,22 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// Projektion bis Tagesende. `removed_rate` = Rate, die der Aktion
-    /// zufolge entfällt (Swap-Out der alten Instanz).
+    /// Projektion bis Tagesende (nur für Alerts/Berichte: „wenn die Box
+    /// durchläuft, kostet sie X bis Mitternacht").
     pub fn projected(&self, extra_rate_usd_h: f64, removed_rate_usd_h: f64, extra_one_off_usd: f64) -> f64 {
         let hours = (self.seconds_to_day_end.max(0) as f64) / 3600.0;
+        (self.running_rate_usd_h + extra_rate_usd_h - removed_rate_usd_h).max(0.0) * hours
+            + self.storage_rate_usd_h * hours
+            + self.spent_today_usd
+            + extra_one_off_usd
+    }
+
+    /// Aktionsfenster laut Bauplan: „projected(startup + 30 min) ≤ soft".
+    /// Bei Interruptibles begrenzt der Idle-Stop die reale Laufzeit;
+    /// die Mitternachts-Projektion würde jede frisch gemietete Box
+    /// fälschlich über den Cap werfen.
+    pub fn projected_30m(&self, extra_rate_usd_h: f64, removed_rate_usd_h: f64, extra_one_off_usd: f64) -> f64 {
+        let hours = (self.seconds_to_day_end.max(0).min(1800)) as f64 / 3600.0;
         (self.running_rate_usd_h + extra_rate_usd_h - removed_rate_usd_h).max(0.0) * hours
             + self.storage_rate_usd_h * hours
             + self.spent_today_usd
@@ -258,16 +270,15 @@ pub fn decide(snap: &Snapshot, cfg: &PolicyConfig) -> Vec<Action> {
     let monthly_usd = cfg.budget.monthly_eur * cfg.budget.usd_per_eur;
     let hours_to_end = (snap.seconds_to_day_end.max(0) as f64) / 3600.0;
 
-    // --- Budget-Hard-Cap: alles drainen und stoppen.
-    let projected_now = snap.projected(0.0, 0.0, 0.0);
-    if projected_now >= hard_usd {
+    // --- Budget-Hard-Cap: real akkumulierte Kosten ueberstiegen -> alles drainen.
+    if snap.spent_today_usd >= hard_usd {
         for slot in &snap.slots {
             for inst in &slot.instances {
                 if inst.is_running() {
                     actions.push(Action::Stop {
                         instance_id: inst.vast_id,
                         reason: format!(
-                            "budget hard cap: projected {projected_now:.2} USD >= {hard_usd:.2} USD"
+                            "budget hard cap: heute {spent:.2} USD >= {hard_usd:.2} USD", spent = snap.spent_today_usd
                         ),
                     });
                 }
@@ -276,23 +287,25 @@ pub fn decide(snap: &Snapshot, cfg: &PolicyConfig) -> Vec<Action> {
         actions.push(Action::Alert {
             kind: "budget_hard".into(),
             message: format!(
-                "Hard-Cap erreicht: heute {:.2} $ (Limit {hard_usd:.2} $) — alle Instanzen gestoppt.",
+                "Hard-Cap erreicht: heute {:.2} $ verbraucht (Limit {hard_usd:.2} $) — alle Instanzen gestoppt.",
                 snap.spent_today_usd
             ),
         });
         return actions;
     }
 
+    let projected_now = snap.projected(0.0, 0.0, 0.0);
     if projected_now >= soft_usd * 0.8 && projected_now < soft_usd {
         actions.push(Action::Alert {
             kind: "budget_80".into(),
             message: format!(
-                "Budget-Projektion {projected_now:.2} $ erreicht 80 % des Tages-Sof-Caps ({soft_usd:.2} $)."
+                "Budget-Projektion bis Mitternacht {projected_now:.2} $ erreicht 80 % des Tages-Sof-Caps ({soft_usd:.2} $)."
             ),
         });
     }
 
-    let over_soft = projected_now >= soft_usd;
+    // Fuer Starts/Erhoehungen zaehlt das 30-Minuten-Aktionsfenster.
+    let over_soft = snap.spent_today_usd >= soft_usd || snap.projected_30m(0.0, 0.0, 0.0) >= soft_usd;
     let over_monthly = snap.spent_month_usd >= monthly_usd;
 
     for slot in &snap.slots {
@@ -487,7 +500,7 @@ pub fn decide(snap: &Snapshot, cfg: &PolicyConfig) -> Vec<Action> {
                     praxis_common::Lifecycle::Sleep { stop_after_idle_s, .. } => *stop_after_idle_s,
                     _ => scfg.idle.stop_after_s,
                 };
-                let over_soft_idle = over_soft && idle_secs > 0;
+                let over_soft_idle = snap.spent_today_usd >= soft_usd && idle_secs > 0;
                 if idle_secs >= stop_after || over_soft_idle {
                     actions.push(Action::Stop {
                         instance_id: inst.vast_id,
@@ -644,7 +657,7 @@ fn budget_ok_for_start(
     monthly_usd: f64,
 ) -> Option<String> {
     let rate = inst.rate_usd_h();
-    let projected = snap.projected(rate, 0.0, 0.0);
+    let projected = snap.projected_30m(rate, 0.0, 0.0);
     if projected > soft_usd {
         return None;
     }
@@ -690,7 +703,7 @@ fn plan_create(
             ),
         });
     }
-    let projected = snap.projected(bid, replaced_rate.unwrap_or(0.0), 0.0);
+    let projected = snap.projected_30m(bid, replaced_rate.unwrap_or(0.0), 0.0);
     let soft_usd = cfg.budget.daily_soft_eur * cfg.budget.usd_per_eur;
     let monthly_usd = cfg.budget.monthly_eur * cfg.budget.usd_per_eur;
     let hours_to_end = (snap.seconds_to_day_end.max(0) as f64) / 3600.0;

@@ -23,7 +23,7 @@ pub async fn run(app: SharedApp) {
             }
         }
         if let Err(e) = tick(&app).await {
-            tracing::warn!(%e, "reconcile tick failed");
+            tracing::warn!(error = format!("{e:#}"), "reconcile tick failed");
         }
         offer_timer.tick().await;
         {
@@ -118,11 +118,12 @@ async fn sync_vast(app: &SharedApp, list: &[praxis_vast::Instance]) -> anyhow::R
             }
             continue;
         };
-        let _ = app.db.update_instance_vast(row.vast_id, &v.actual_status, v.min_bid, v.dph_total, v.machine_id, &v.gpu_name);
+        let _ = app.db.update_instance_vast(row.vast_id, &v.actual_or("loading"), v.min_bid.unwrap_or(0.0), v.dph_total.unwrap_or(0.0), v.machine_id.unwrap_or(0), v.gpu_or(""));
 
         // Preemption: wir WOLLEN running, Vast sagt nein.
-        let intended_run = v.intended_status.is_empty() || v.intended_status == "running" || row.intended_status == "running";
-        let actually_dead = matches!(v.actual_status.as_str(), "stopped" | "error" | "deleted");
+        let intended_run = v.intended_or("").is_empty() || v.intended_or("") == "running" || row.intended_status == "running";
+        let actually_dead = matches!(v.actual_or("").as_str(), "stopped" | "error" | "deleted")
+            || v.cur_state.as_deref() == Some("stopped");
         if intended_run && actually_dead && !matches!(row.state.as_str(), "preempted" | "stopped" | "destroyed" | "draining" | "failed") {
             let _ = app.db.set_instance_state(row.vast_id, "preempted");
             app.events.emit(
@@ -132,11 +133,11 @@ async fn sync_vast(app: &SharedApp, list: &[praxis_vast::Instance]) -> anyhow::R
                 Some(row.vast_id),
                 &format!(
                     "Instanz {} ({}) von Vast weggebrochen: actual={} intended={} min_bid={:.4} bid={:.4}",
-                    row.vast_id, row.gpu_name, v.actual_status, v.intended_status, v.min_bid, row.bid_usd_h
+                    row.vast_id, row.gpu_name, v.actual_or("?"), v.intended_or("?"), v.min_bid.unwrap_or(0.0), row.bid_usd_h
                 ),
-                &serde_json::json!({"min_bid": v.min_bid, "bid": row.bid_usd_h}),
+                &serde_json::json!({"min_bid": v.min_bid.unwrap_or(0.0), "bid": row.bid_usd_h}),
             );
-        } else if v.actual_status == "loading" && matches!(row.state.as_str(), "requested" | "booting") {
+        } else if v.actual_or("loading") == "loading" && matches!(row.state.as_str(), "requested" | "booting") {
             let _ = app.db.set_instance_state(row.vast_id, "provisioning");
         }
     }
@@ -264,24 +265,44 @@ pub async fn search_slot_offers(
     let Some(vast) = vast_client else {
         anyhow::bail!("vast api not configured");
     };
-    let raw = vast.search(&slot.search_query, None).await?;
-    let offers: Vec<OfferSnapshot> = raw
-        .iter()
-        .map(|o| OfferSnapshot {
-            id: o.id,
-            gpu_name: o.gpu_name.clone(),
-            min_bid: o.min_bid,
-            dph_total: o.dph_total,
-            storage_cost: o.storage_cost,
-            inet_down_cost: o.inet_down_cost,
-            cpu_ram_gb: o.cpu_ram_gb(),
-            gpu_ram_gb: o.gpu_ram_gb(),
-            disk_gb: o.disk_space,
-            inet_down: o.inet_down,
-            reliability2: o.reliability2,
-            disk_bw: o.disk_bw,
-        })
-        .collect();
+    // Beide Modi suchen und per offer-id mergen: min_bid (interruptible)
+    // und dph_total (on-demand) landen im selben Snapshot.
+    let disk = slot.disk_gb as f64;
+    let interruptible = vast.search(&slot.search_query, true, disk).await.inspect_err(|e| {
+        tracing::error!(%e, "vast bid-Suche fehlgeschlagen (API-Key? Filter?)");
+    })?;
+    let ondemand = vast.search(&slot.search_query, false, disk).await.inspect_err(|e| {
+        tracing::error!(%e, "vast on-demand-Suche fehlgeschlagen (API-Key? Filter?)");
+    })?;
+    let mut by_id: std::collections::HashMap<i64, OfferSnapshot> = std::collections::HashMap::new();
+    let snap_from = |o: &praxis_vast::Offer, min_bid: f64, dph: f64| OfferSnapshot {
+        id: o.id,
+        gpu_name: o.gpu_name.clone(),
+        min_bid,
+        dph_total: dph,
+        storage_cost: o.storage_or(0.0),
+        inet_down_cost: o.inet_down_cost.unwrap_or(0.0),
+        cpu_ram_gb: o.cpu_ram_gb(),
+        gpu_ram_gb: o.gpu_ram_gb(),
+        disk_gb: o.disk_space,
+        inet_down: o.inet_down,
+        reliability2: o.reliability2.unwrap_or(0.0),
+        disk_bw: o.disk_bw,
+    };
+    for o in &interruptible {
+        let snap = snap_from(o, o.min_bid_or(0.0).max(0.0), o.dph_or(0.0));
+        by_id.insert(snap.id, snap);
+    }
+    for o in &ondemand {
+        let snap = snap_from(o, 0.0, o.dph_or(0.0));
+        match by_id.get_mut(&snap.id) {
+            Some(existing) => existing.dph_total = snap.dph_total,
+            None => {
+                by_id.insert(snap.id, snap);
+            }
+        }
+    }
+    let offers: Vec<OfferSnapshot> = by_id.into_values().collect();
     let _ = app.db.cache_offers(slot_id, &slot.search_query, &serde_json::to_string(&offers)?);
     Ok(offers)
 }
@@ -532,29 +553,60 @@ pub fn mint_node_token() -> String {
 }
 
 async fn mint_netbird_key(app: &SharedApp, name: &str) -> anyhow::Result<String> {
-    let Some(token) = app.cfg.netbird.api_token.strip_prefix("nbt_").map(|t| t.to_string()).filter(|t| !t.is_empty()) else {
-        // statischer Key aus Config
+    let token = app.cfg.netbird.api_token.clone();
+    if token.is_empty() {
+        // statischer Key aus Config (Fallback, Variante B).
         let k = app.cfg.netbird.setup_key.clone();
         if k.is_empty() {
             anyhow::bail!("kein NetBird setup key konfiguriert");
         }
         return Ok(k);
+    }
+    let client = reqwest::Client::new();
+    let base = app.cfg.netbird.api_url.trim_end_matches('/').to_string();
+
+    // Gruppennamen (Config) → Management-ID auflösen (auto_groups will IDs).
+    let group_cfg = app.cfg.netbird.group.clone();
+    let group_id: String = if group_cfg.is_empty() {
+        String::new()
+    } else {
+        let resp = client
+            .get(format!("{base}/api/groups"))
+            .bearer_auth(&token)
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await;
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                let groups: Vec<serde_json::Value> = r.json().await.unwrap_or_default();
+                groups
+                    .iter()
+                    .find(|g| g.get("name").and_then(|n| n.as_str()) == Some(group_cfg.as_str()))
+                    .and_then(|g| g.get("id").and_then(|i| i.as_str()))
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| group_cfg.clone()) // evtl. direkt ID konfiguriert
+            }
+            _ => group_cfg.clone(),
+        }
     };
+
     let mut key = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut key);
     let key = format!("sk-{}", hex::encode(key));
-    let client = reqwest::Client::new();
+    let mut body = serde_json::json!({
+        "name": name,
+        "type": "one-off",
+        "key": key,
+        "usage_limit": 1,
+        "expires_in": 3600,
+    });
+    if !group_id.is_empty() {
+        body["auto_groups"] = serde_json::json!([group_id]);
+    }
     let resp = client
-        .post("https://api.netbird.io/api/setup-keys")
-        .bearer_auth(token)
-        .json(&serde_json::json!({
-            "name": name,
-            "type": "one-off",
-            "key": key,
-            "usage_limit": 1,
-            "expires_in": 3600,
-            "groups": [app.cfg.netbird.group],
-        }))
+        .post(format!("{base}/api/setup-keys"))
+        .bearer_auth(&token)
+        .json(&body)
         .timeout(std::time::Duration::from_secs(15))
         .send()
         .await;
@@ -564,7 +616,9 @@ async fn mint_netbird_key(app: &SharedApp, name: &str) -> anyhow::Result<String>
             Ok(j.get("key").and_then(|k| k.as_str()).unwrap_or(&key).to_string())
         }
         Ok(r) => {
-            tracing::warn!(status = %r.status(), "netbird key mint failed, fallback static");
+            let status = r.status();
+            let text = r.text().await.unwrap_or_default();
+            tracing::warn!(status = %status, "netbird mint failed ({text:.200}), fallback static");
             let k = app.cfg.netbird.setup_key.clone();
             if k.is_empty() {
                 anyhow::bail!("netbird mint fehlgeschlagen und kein statischer Key");
@@ -604,6 +658,9 @@ pub async fn create_instance(
 
     let mut env = serde_json::Map::new();
     env.insert("NB_SETUP_KEY".into(), serde_json::json!(nb_key));
+    if !app.cfg.netbird.management_url.is_empty() {
+        env.insert("NB_MANAGEMENT_URL".into(), serde_json::json!(app.cfg.netbird.management_url));
+    }
     env.insert("NB_HOSTNAME".into(), serde_json::json!(hostname));
     env.insert("NB_SOCKS5_LISTENER_PORT".into(), serde_json::json!("1080"));
     env.insert("ROUTER_URL".into(), serde_json::json!(crate::config::router_call_url(&app.cfg)));
@@ -613,23 +670,30 @@ pub async fn create_instance(
     }
 
     let params = CreateInstanceParams {
+        client: "me",
         image: &slot.image,
         price: price_usd_h,
         disk: Some(disk_gb),
         label: Some(&format!("praxis-{}-s{}", slot.role, slot_id)),
         template_hash_id: None,
         onstart_cmd: None,
-        runtype: Some(match mode {
-            Mode::OnDemand => "on-demand",
-            _ => "interruptible",
-        }),
+        runtype: Some("args"), // Plain-Docker-Run des Image-Entrypoints
         env: serde_json::Value::Object(env),
+        extra: None,
+        image_login: None,
+        python_utf8: false,
+        lang_utf8: false,
+        use_jupyter_lab: false,
+        jupyter_dir: None,
+        force: false,
+        cancel_unavail: false,
+        user: None,
     };
 
-    let inst = vast.create(offer.id, &params).await?;
+    let vast_id = vast.create(offer.id, &params).await?;
     let storage_usd_h = offer.storage_cost * disk_gb as f64 / 30.0 / 24.0;
     let row = crate::db::InstanceRow {
-        vast_id: inst.id,
+        vast_id,
         slot_id,
         role: slot.role,
         node_token,
@@ -657,11 +721,12 @@ pub async fn create_instance(
         label: format!("praxis-{}-s{}", slot.role, slot_id),
     };
     app.db.insert_instance(&row)?;
+    let _ = app.db.set_slot_desired(slot_id, true);
     app.events.emit(
         &app.db,
         "instance_created",
         Some(slot_id),
-        Some(inst.id),
+        Some(vast_id),
         &format!(
             "{} gemietet: offer {} ({}) {} $/h, disk {disk_gb} GB — {reason}",
             slot.name, offer.id, offer.gpu_name, price_usd_h
@@ -669,7 +734,7 @@ pub async fn create_instance(
         &serde_json::json!({"price": price_usd_h, "mode": mode, "offer": offer.id}),
     );
     app.reconcile_now.notify_one();
-    Ok(inst.id)
+    Ok(vast_id)
 }
 
 pub fn stop_instance(app: &SharedApp, vast_id: i64, reason: &str) -> anyhow::Result<()> {
