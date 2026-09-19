@@ -1,0 +1,35 @@
+# pgpu — Praxis GPU Router + STT-Sidecar (Vosk).
+# Router im Host-Netz (NetBird-TUN des Hosts), STT im Bridge-Netz mit
+# Host-Port 127.0.0.1:2701 (Router-Proxy bindet selbst 2700 auf der
+# NetBird-IP). Kein EXPOSE, alles lauscht nur auf der NetBird-IP/localhost.
+
+services:
+  router:
+    image: vayayo/praxis-gpu-router:latest
+    container_name: pgpu-router
+    network_mode: host # NetBird-TUN des Hosts nutzen
+    restart: unless-stopped
+    volumes:
+      - ./data:/data
+      - ./config.toml:/data/config.toml:ro
+    environment:
+      ROUTER_TOKEN: ${ROUTER_TOKEN:?ROUTER_TOKEN setzen}
+      VAST_API_KEY: ${VAST_API_KEY:-}
+      RUST_LOG: info
+    # Daten + Config liegen in /data; Binär lauscht auf bind_ip aus der Config.
+
+  stt:
+    image: vayayo/praxis-stt:latest
+    container_name: pgpu-stt
+    restart: unless-stopped
+    volumes:
+      - ./data/vosk:/data/vosk
+    environment:
+      STT_LANGUAGES: ${STT_LANGUAGES:-de,ja}
+      VOSK_BIND: 0.0.0.0
+    ports:
+      - "127.0.0.1:2701:2700" # nur localhost; Router-Proxy macht 2700 auf NetBird-IP
+    deploy:
+      resources:
+        limits:
+          memory: 8g # de≈4,5 GB + ja≈1,5 GB RAM geladen
