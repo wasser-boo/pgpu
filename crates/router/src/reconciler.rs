@@ -1,0 +1,749 @@
+//! Reconciler: 30-s-Takt (+ Wake-Notifies). Synchronisiert Vast-Instanzen,
+//! errechnet Busy pro Service, wendet die Policy an, meteret Kosten und
+//! reconciled stündlich gegen den Vast-Kontostand.
+
+use crate::state::SharedApp;
+use praxis_common::{Action, InstanceState, Mode};
+use praxis_policy::{InstanceSnapshot, OfferSnapshot, SlotSnapshot, Snapshot};
+use praxis_vast::CreateInstanceParams;
+use chrono::{Datelike, Timelike};
+use rand::RngCore;
+use std::collections::HashMap;
+
+pub async fn run(app: SharedApp) {
+    let poll = std::time::Duration::from_secs(app.cfg.vast.poll_interval_s.max(5));
+    let mut offer_timer = tokio::time::interval(std::time::Duration::from_secs(app.cfg.vast.offer_poll_s.max(15)));
+    let mut meter_hour = tokio::time::Instant::now() + std::time::Duration::from_secs(3600);
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(poll) => {},
+            _ = app.reconcile_now.notified() => {
+                // kleines Antibounce, damit Events nicht 100 % CPU fressen
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        }
+        if let Err(e) = tick(&app).await {
+            tracing::warn!(%e, "reconcile tick failed");
+        }
+        offer_timer.tick().await;
+        {
+            for slot in app.cfg.slots.clone() {
+                let _ = search_slot_offers(&app, slot.id, true).await;
+            }
+        }
+        if tokio::time::Instant::now() >= meter_hour {
+            meter_hour = tokio::time::Instant::now() + std::time::Duration::from_secs(3600);
+            reconcile_credit(&app).await;
+        }
+    }
+}
+
+pub async fn tick(app: &SharedApp) -> anyhow::Result<()> {
+    // 1. Vast-Sync.
+    let vast_client = app.vast.lock().unwrap().clone();
+    let vast_instances = match vast_client {
+        Some(vast) => Some(vast.instances().await?),
+        None => None,
+    };
+    if let Some(list) = &vast_instances {
+        sync_vast(app, list).await?;
+    }
+
+    // 2. Agent-Liveness: unreachable-Erkennung.
+    for inst in app.db.instances(false) {
+        if inst.state == "healthy" || inst.state == "agent_connected" || inst.state == "booting" {
+            let seen = app.hub.last_seen(inst.vast_id);
+            match seen {
+                Some(seen) if chrono::Utc::now().timestamp() - seen > 180 => {
+                    let _ = app.db.set_instance_state(inst.vast_id, "unreachable");
+                    app.events.emit(&app.db, "unreachable", Some(inst.slot_id), Some(inst.vast_id), "Agent >3 min still", &serde_json::json!({}));
+                }
+                None if inst.state != "booting" && inst.actual_status == "running" => {
+                    // kein Agent, aber Vast läuft: Booting bleibt bis Agent kommt
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // 3. Busy pro Instanz (Agent-Busy, Service-Probes, In-flight).
+    for inst in app.db.instances(false) {
+        if !matches!(inst.state.as_str(), "healthy" | "agent_connected" | "draining") {
+            continue;
+        }
+        let (busy, reason) = compute_busy(app, &inst).await;
+        if busy != inst.busy || reason != inst.busy_reason {
+            let _ = app.db.update_instance_busy(inst.vast_id, busy, &reason);
+        }
+    }
+
+    // 4. Targets-Cache aktualisieren (hot fürs Proxy).
+    for slot in &app.cfg.slots {
+        let active = app.db.active_instance(slot.id);
+        let mut target: Option<(i64, Option<String>, bool)> = None;
+        if let Some(vast_id) = active {
+            if let Some(inst) = app.db.instance(vast_id) {
+                let nb_ip = inst.nb_ip.clone().or_else(|| app.hub.nb_ip(vast_id));
+                target = Some((vast_id, nb_ip, inst.healthy));
+            }
+        }
+        match target {
+            Some((v, n, h)) => app.targets.set(slot.id, Some(v), n, h),
+            None => app.targets.set(slot.id, None, None, false),
+        }
+    }
+
+    // 5. Metering (dt × Rate).
+    meter(app).await;
+
+    // 6. Snapshot bauen + Policy.
+    let snap = build_snapshot(app).await?;
+    let actions = praxis_policy::decide(&snap, &app.cfg.policy_config());
+    for action in actions {
+        if let Err(e) = apply_action(app, &action).await {
+            tracing::warn!(?action, %e, "action failed");
+        }
+    }
+    Ok(())
+}
+
+async fn sync_vast(app: &SharedApp, list: &[praxis_vast::Instance]) -> anyhow::Result<()> {
+    let by_id: HashMap<i64, &praxis_vast::Instance> = list.iter().map(|i| (i.id, i)).collect();
+    for row in app.db.instances(true) {
+        let Some(v) = by_id.get(&row.vast_id) else {
+            // Vast kennt sie nicht mehr → destroyed markieren.
+            if row.state != "destroyed" {
+                let _ = app.db.mark_destroyed(row.vast_id);
+                app.events.emit(&app.db, "instance_gone", Some(row.slot_id), Some(row.vast_id), "nicht mehr in Vast-Liste", &serde_json::json!({}));
+            }
+            continue;
+        };
+        let _ = app.db.update_instance_vast(row.vast_id, &v.actual_status, v.min_bid, v.dph_total, v.machine_id, &v.gpu_name);
+
+        // Preemption: wir WOLLEN running, Vast sagt nein.
+        let intended_run = v.intended_status.is_empty() || v.intended_status == "running" || row.intended_status == "running";
+        let actually_dead = matches!(v.actual_status.as_str(), "stopped" | "error" | "deleted");
+        if intended_run && actually_dead && !matches!(row.state.as_str(), "preempted" | "stopped" | "destroyed" | "draining" | "failed") {
+            let _ = app.db.set_instance_state(row.vast_id, "preempted");
+            app.events.emit(
+                &app.db,
+                "PREEMPTED",
+                Some(row.slot_id),
+                Some(row.vast_id),
+                &format!(
+                    "Instanz {} ({}) von Vast weggebrochen: actual={} intended={} min_bid={:.4} bid={:.4}",
+                    row.vast_id, row.gpu_name, v.actual_status, v.intended_status, v.min_bid, row.bid_usd_h
+                ),
+                &serde_json::json!({"min_bid": v.min_bid, "bid": row.bid_usd_h}),
+            );
+        } else if v.actual_status == "loading" && matches!(row.state.as_str(), "requested" | "booting") {
+            let _ = app.db.set_instance_state(row.vast_id, "provisioning");
+        }
+    }
+    Ok(())
+}
+
+/// Busy: Agent-Meldung, Service-HTTP-Probe (ComfyUI-Queue), Router-In-flight.
+async fn compute_busy(app: &SharedApp, inst: &crate::db::InstanceRow) -> (bool, String) {
+    let traffic = app.traffic.snapshot(inst.slot_id);
+    let in_flight = traffic.in_flight;
+    if in_flight > 0 {
+        return (true, format!("{in_flight} in-flight"));
+    }
+    if let Some(hb) = app.hub.heartbeat(inst.vast_id) {
+        if hb.busy {
+            return (true, hb.busy_reason.clone());
+        }
+    }
+    // ComfyUI-Queue (Jobs laufen nach HTTP-Return weiter!).
+    if let Some(slot) = app.cfg.slot(inst.slot_id) {
+        if let Some(svc) = slot.services.values().find(|s| s.busy == crate::config::BusyKind::ComfyQueue) {
+            if let Some(nb_ip) = inst.nb_ip.clone().or_else(|| app.hub.nb_ip(inst.vast_id)) {
+                let url = format!("http://{nb_ip}:{}/prompt", svc.port);
+                if let Ok(resp) = reqwest::get(&url).await {
+                    if let Ok(j) = resp.json::<serde_json::Value>().await {
+                        let remaining = j
+                            .pointer("/exec_info/queue_remaining")
+                            .and_then(|r| r.as_i64())
+                            .unwrap_or(0);
+                        if remaining > 0 {
+                            return (true, format!("comfy queue {remaining}"));
+                        }
+                    }
+                }
+            }
+        }
+        // STT: lokale WS-Sessions (Router-proxy).
+        if slot.services.values().any(|s| s.busy == crate::config::BusyKind::WsSessions)
+            && app.cfg.stt.mode == "local"
+            && app.stt_sessions.load(std::sync::atomic::Ordering::Relaxed) > 0
+        {
+            return (true, "stt sessions aktiv".into());
+        }
+    }
+    // busy_grace: 60 s nach letztem Request.
+    let now = chrono::Utc::now().timestamp();
+    if traffic.last_request > 0 && now - traffic.last_request < 60 {
+        return (true, "busy_grace".into());
+    }
+    (false, String::new())
+}
+
+async fn meter(app: &SharedApp) {
+    let date = crate::node::local_date(app);
+    for inst in app.db.instances(false) {
+        let Some(created) = crate::db::parse_iso(&inst.created_at) else { continue };
+        let now = chrono::Utc::now();
+        let last = app.hub.last_seen(inst.vast_id).map(|t| chrono::DateTime::from_timestamp(t, 0).unwrap_or(created)).unwrap_or(created);
+        let dt_h = (now - last).num_milliseconds() as f64 / 3_600_000.0;
+        if dt_h <= 0.0 {
+            continue;
+        }
+        let running = inst.actual_status == "running" && matches!(inst.state.as_str(), "healthy" | "agent_connected" | "booting" | "provisioning" | "draining");
+        let rate = match inst.mode {
+            Mode::Interruptible => inst.bid_usd_h,
+            _ => inst.dph_total,
+        };
+        let metered = if running { rate * dt_h } else { 0.0 };
+        let storage = inst.storage_usd_h * dt_h;
+        if metered > 0.0 || storage > 0.0 {
+            let _ = app.db.meter(&date, inst.vast_id, metered, storage);
+        }
+    }
+}
+
+async fn reconcile_credit(app: &SharedApp) {
+    let vast_client = app.vast.lock().unwrap().clone();
+    let Some(vast) = vast_client else { return };
+    let Ok(user) = vast.current_user().await else { return };
+    let date = crate::node::local_date(app);
+    let metered = app.db.spent_today(&date);
+    match app.db.last_credit(&date) {
+        Some(start) => {
+            let spent = (start - user.credit).max(0.0);
+            let _ = app.db.set_reconciled(&date, spent, user.credit);
+            if metered > 0.05 && (spent - metered).abs() / metered.max(0.05) > 0.25 {
+                app.events.emit(
+                    &app.db,
+                    "budget_drift",
+                    None,
+                    None,
+                    &format!("Metering {metered:.2} $ vs. Kontostand {spent:.2} $ — Differenz > 25 %"),
+                    &serde_json::json!({"metered": metered, "reconciled": spent}),
+                );
+            }
+        }
+        None => {
+            let _ = app.db.set_reconciled(&date, 0.0, user.credit);
+        }
+    }
+}
+
+// ---------------------------------------------------------------- Offers
+
+pub async fn search_slot_offers(
+    app: &SharedApp,
+    slot_id: i64,
+    refresh: bool,
+) -> anyhow::Result<Vec<OfferSnapshot>> {
+    let Some(slot) = app.cfg.slot(slot_id) else {
+        anyhow::bail!("unknown slot {slot_id}");
+    };
+    if !refresh {
+        if let Some((ts, json)) = app.db.cached_offers(slot_id) {
+            if let Some(t) = crate::db::parse_iso(&ts) {
+                if (chrono::Utc::now() - t).num_seconds() < app.cfg.vast.offer_poll_s as i64 {
+                    if let Ok(v) = serde_json::from_str::<Vec<OfferSnapshot>>(&json) {
+                        return Ok(v);
+                    }
+                }
+            }
+        }
+    }
+    let vast_client = app.vast.lock().unwrap().clone();
+    let Some(vast) = vast_client else {
+        anyhow::bail!("vast api not configured");
+    };
+    let raw = vast.search(&slot.search_query, None).await?;
+    let offers: Vec<OfferSnapshot> = raw
+        .iter()
+        .map(|o| OfferSnapshot {
+            id: o.id,
+            gpu_name: o.gpu_name.clone(),
+            min_bid: o.min_bid,
+            dph_total: o.dph_total,
+            storage_cost: o.storage_cost,
+            inet_down_cost: o.inet_down_cost,
+            cpu_ram_gb: o.cpu_ram_gb(),
+            gpu_ram_gb: o.gpu_ram_gb(),
+            disk_gb: o.disk_space,
+            inet_down: o.inet_down,
+            reliability2: o.reliability2,
+            disk_bw: o.disk_bw,
+        })
+        .collect();
+    let _ = app.db.cache_offers(slot_id, &slot.search_query, &serde_json::to_string(&offers)?);
+    Ok(offers)
+}
+
+fn best_candidate(app: &SharedApp, slot_id: i64) -> Option<OfferSnapshot> {
+    let (_, json) = app.db.cached_offers(slot_id)?;
+    let offers: Vec<OfferSnapshot> = serde_json::from_str(&json).ok()?;
+    let slot = app.cfg.slot(slot_id)?;
+    offers
+        .into_iter()
+        .filter(|o| o.min_bid > 0.0)
+        .min_by(|a, b| {
+            a.score(slot.disk_gb, slot.traffic_gb, 4.0)
+                .partial_cmp(&b.score(slot.disk_gb, slot.traffic_gb, 4.0))
+                .unwrap()
+        })
+}
+
+// ---------------------------------------------------------------- Snapshot
+
+pub async fn build_snapshot(app: &SharedApp) -> anyhow::Result<Snapshot> {
+    let tz: chrono_tz::Tz = app.cfg.router.tz.parse().unwrap_or(chrono_tz::Europe::Berlin);
+    let now_local = chrono::Utc::now().with_timezone(&tz);
+    let seconds_to_day_end = {
+        let next_midnight = (now_local + chrono::Duration::days(1))
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        (next_midnight - now_local.naive_local()).num_seconds().max(0)
+    };
+    let local_weekday = now_local.weekday().number_from_monday() as u8;
+    let local_minutes = now_local.time().hour() as u32 * 60 + now_local.time().minute() as u32;
+    let date = now_local.format("%Y-%m-%d").to_string();
+
+    let rows = app.db.instances(false);
+    let pins: HashMap<i64, Option<i64>> = app.db.slot_pins().into_iter().collect();
+
+    let mut slots: Vec<SlotSnapshot> = Vec::new();
+    let mut running_rate = 0.0;
+    let mut storage_rate = 0.0;
+    let instance_count = rows.len();
+
+    for slot in &app.cfg.slots {
+        let active_db = app.db.active_instance(slot.id);
+        let desired_db = app.db.slot_desired(slot.id);
+        // warm_hours: Fenster erzwungen Gewünscht.
+        let warm = slot
+            .warm_hours
+            .as_deref()
+            .and_then(praxis_policy::schedule::parse_window)
+            .map(|w| w.contains(local_weekday, local_minutes))
+            .unwrap_or(false);
+        let desired_running = desired_db || warm;
+
+        let mut instances = Vec::new();
+        for row in rows.iter().filter(|r| r.slot_id == slot.id) {
+            let state = parse_state(&row.state);
+            let is_running = row.actual_status == "running" && state.is_active();
+            let rate = match row.mode {
+                Mode::Interruptible => row.bid_usd_h,
+                _ => row.dph_total,
+            };
+            if is_running {
+                running_rate += rate;
+            }
+            if !is_running && row.destroyed_at.is_none() {
+                storage_rate += row.storage_usd_h;
+            }
+            let idle_since = app
+                .traffic
+                .snapshot(slot.id)
+                .last_request;
+            instances.push(InstanceSnapshot {
+                vast_id: row.vast_id,
+                offer_id: row.offer_id,
+                machine_id: row.machine_id,
+                gpu_name: row.gpu_name.clone(),
+                role: row.role,
+                slot_id: row.slot_id,
+                mode: row.mode,
+                lifecycle: serde_json::from_str(&row.lifecycle).unwrap_or_default(),
+                state,
+                actual_status: row.actual_status.clone(),
+                intended_status: row.intended_status.clone(),
+                healthy: row.healthy,
+                busy: row.busy,
+                busy_reason: row.busy_reason.clone(),
+                min_bid: row.min_bid,
+                bid_usd_h: row.bid_usd_h,
+                dph_total: row.dph_total,
+                storage_usd_h: row.storage_usd_h,
+                created_at: crate::db::parse_iso(&row.created_at).unwrap_or_default(),
+                idle_since: if idle_since > 0 {
+                    chrono::DateTime::from_timestamp(idle_since, 0)
+                } else {
+                    None
+                },
+                stopped_since: row.stopped_since.as_deref().and_then(crate::db::parse_iso),
+                last_seen: None,
+                pinned: row.pinned || pins.get(&slot.id) == Some(&Some(row.vast_id)),
+            });
+        }
+        let in_flight = app.traffic.snapshot(slot.id).in_flight;
+        slots.push(SlotSnapshot {
+            id: slot.id,
+            role: slot.role,
+            name: slot.name.clone(),
+            pinned: pins.get(&slot.id).cloned().flatten().is_some(),
+            active_instance: active_db,
+            instances,
+            in_flight,
+            last_traffic: app.db.last_traffic(slot.id),
+            last_swap: app.db.last_swap(slot.id),
+            candidate_offer: best_candidate(app, slot.id),
+            desired_running,
+            local_weekday,
+            local_minutes_of_day: local_minutes,
+        });
+    }
+
+    Ok(Snapshot {
+        now: chrono::Utc::now(),
+        seconds_to_day_end,
+        spent_today_usd: app.db.spent_today(&date),
+        spent_month_usd: app.db.spent_month(&date[..7]),
+        slots,
+        instance_count,
+        running_rate_usd_h: running_rate,
+        storage_rate_usd_h: storage_rate,
+    })
+}
+
+fn parse_state(s: &str) -> InstanceState {
+    match s {
+        "requested" => InstanceState::Requested,
+        "provisioning" => InstanceState::Provisioning,
+        "booting" => InstanceState::Booting,
+        "agent_connected" => InstanceState::AgentConnected,
+        "healthy" => InstanceState::Healthy,
+        "draining" => InstanceState::Draining,
+        "stopped" => InstanceState::Stopped,
+        "destroyed" => InstanceState::Destroyed,
+        "preempted" => InstanceState::Preempted,
+        "unreachable" => InstanceState::Unreachable,
+        _ => InstanceState::Failed,
+    }
+}
+
+// ---------------------------------------------------------------- Actions
+
+pub async fn apply_action(app: &SharedApp, action: &Action) -> anyhow::Result<()> {
+    match action {
+        Action::Create { slot_id, offer_id, mode, price_usd_h, disk_gb, reason } => {
+            // Kein Doppel-Create während ein Backversuch läuft.
+            let pending: Vec<_> = app
+                .db
+                .instances(false)
+                .into_iter()
+                .filter(|r| r.slot_id == *slot_id && matches!(r.state.as_str(), "requested" | "provisioning" | "booting" | "agent_connected"))
+                .collect();
+            if !pending.is_empty() {
+                tracing::debug!(slot_id, "create skipped: backer already warming");
+                return Ok(());
+            }
+            let offers = search_slot_offers(app, *slot_id, true).await?;
+            let Some(offer) = offers.into_iter().find(|o| o.id == *offer_id) else {
+                anyhow::bail!("offer {offer_id} nicht mehr verfügbar");
+            };
+            let slot = app.cfg.slot(*slot_id).ok_or_else(|| anyhow::anyhow!("slot {slot_id} fehlt"))?;
+            let price = price_usd_h.unwrap_or(offer.min_bid * (1.0 + slot.bid.margin));
+            let disk = disk_gb.unwrap_or(slot.disk_gb);
+            let vast_id = create_instance(app, *slot_id, &offer, *mode, price, disk, praxis_common::Lifecycle::Auto, reason).await?;
+            let _ = vast_id;
+            Ok(())
+        }
+        Action::Start { instance_id, reason } => {
+            start_instance(app, *instance_id, reason).await?;
+            Ok(())
+        }
+        Action::Stop { instance_id, reason } => {
+            stop_instance(app, *instance_id, reason)?;
+            Ok(())
+        }
+        Action::Destroy { instance_id, reason } => {
+            destroy_instance(app, *instance_id, reason).await?;
+            Ok(())
+        }
+        Action::ChangeBid { instance_id, price_usd_h, reason } => {
+            let vast_client = app.vast.lock().unwrap().clone();
+            let Some(vast) = vast_client else {
+                anyhow::bail!("vast api not configured");
+            };
+            vast.set_bid(*instance_id, *price_usd_h).await?;
+            let _ = app.db.set_instance_bid(*instance_id, *price_usd_h);
+            app.events.emit(
+                &app.db,
+                "bid_changed",
+                app.db.instance(*instance_id).map(|i| i.slot_id),
+                Some(*instance_id),
+                reason,
+                &serde_json::json!({"price": price_usd_h}),
+            );
+            Ok(())
+        }
+        Action::FlipSlot { slot_id, to_instance, reason, .. } => {
+            let nb = app.db.instance(*to_instance).and_then(|i| i.nb_ip.clone().or_else(|| app.hub.nb_ip(*to_instance)));
+            app.db.set_active_instance(*slot_id, Some(*to_instance))?;
+            app.targets.set(*slot_id, Some(*to_instance), nb, true);
+            app.events.emit(&app.db, "slot_flipped", Some(*slot_id), Some(*to_instance), reason, &serde_json::json!({}));
+            Ok(())
+        }
+        Action::SwapOut { instance_id, destroy, reason } => {
+            let traffic = app
+                .db
+                .instance(*instance_id)
+                .map(|i| app.traffic.snapshot(i.slot_id).in_flight)
+                .unwrap_or(0);
+            if traffic > 0 {
+                let _ = app.db.set_instance_state(*instance_id, "draining");
+                Ok(())
+            } else if *destroy {
+                destroy_instance(app, *instance_id, reason).await
+            } else {
+                stop_instance(app, *instance_id, reason)
+            }
+        }
+        Action::Alert { kind, message } => {
+            app.events.emit(&app.db, kind, None, None, message, &serde_json::json!({}));
+            let url = &app.cfg.alerts.webhook_url;
+            if !url.is_empty() {
+                let url = url.clone();
+                let body = serde_json::json!({"kind": kind, "message": message});
+                let _ = tokio::spawn(async move {
+                    let _ = reqwest::Client::new().post(&url).json(&body).timeout(std::time::Duration::from_secs(10)).send().await;
+                });
+            }
+            Ok(())
+        }
+    }
+}
+
+// ---------------------------------------------------------------- Instanz-Op
+
+pub fn mint_node_token() -> String {
+    let mut bytes = [0u8; 24];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+async fn mint_netbird_key(app: &SharedApp, name: &str) -> anyhow::Result<String> {
+    let Some(token) = app.cfg.netbird.api_token.strip_prefix("nbt_").map(|t| t.to_string()).filter(|t| !t.is_empty()) else {
+        // statischer Key aus Config
+        let k = app.cfg.netbird.setup_key.clone();
+        if k.is_empty() {
+            anyhow::bail!("kein NetBird setup key konfiguriert");
+        }
+        return Ok(k);
+    };
+    let mut key = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut key);
+    let key = format!("sk-{}", hex::encode(key));
+    let client = reqwest::Client::new();
+    let resp = client
+        .post("https://api.netbird.io/api/setup-keys")
+        .bearer_auth(token)
+        .json(&serde_json::json!({
+            "name": name,
+            "type": "one-off",
+            "key": key,
+            "usage_limit": 1,
+            "expires_in": 3600,
+            "groups": [app.cfg.netbird.group],
+        }))
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await;
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            let j: serde_json::Value = r.json().await?;
+            Ok(j.get("key").and_then(|k| k.as_str()).unwrap_or(&key).to_string())
+        }
+        Ok(r) => {
+            tracing::warn!(status = %r.status(), "netbird key mint failed, fallback static");
+            let k = app.cfg.netbird.setup_key.clone();
+            if k.is_empty() {
+                anyhow::bail!("netbird mint fehlgeschlagen und kein statischer Key");
+            }
+            Ok(k)
+        }
+        Err(e) => {
+            tracing::warn!(%e, "netbird unreachable, fallback static");
+            let k = app.cfg.netbird.setup_key.clone();
+            if k.is_empty() {
+                anyhow::bail!("netbird unreachable und kein statischer Key");
+            }
+            Ok(k)
+        }
+    }
+}
+
+pub async fn create_instance(
+    app: &SharedApp,
+    slot_id: i64,
+    offer: &OfferSnapshot,
+    mode: Mode,
+    price_usd_h: f64,
+    disk_gb: i64,
+    lifecycle: praxis_common::Lifecycle,
+    reason: &str,
+) -> anyhow::Result<i64> {
+    let slot = app.cfg.slot(slot_id).ok_or_else(|| anyhow::anyhow!("slot {slot_id} fehlt"))?;
+    let vast_client = app.vast.lock().unwrap().clone();
+    let Some(vast) = vast_client else {
+        anyhow::bail!("vast api not configured");
+    };
+    let node_token = mint_node_token();
+    let tok8 = &node_token[..8];
+    let hostname = format!("gpu-{}-{}", slot.role, tok8);
+    let nb_key = mint_netbird_key(app, &format!("praxis-{tok8}")).await?;
+
+    let mut env = serde_json::Map::new();
+    env.insert("NB_SETUP_KEY".into(), serde_json::json!(nb_key));
+    env.insert("NB_HOSTNAME".into(), serde_json::json!(hostname));
+    env.insert("NB_SOCKS5_LISTENER_PORT".into(), serde_json::json!("1080"));
+    env.insert("ROUTER_URL".into(), serde_json::json!(crate::config::router_call_url(&app.cfg)));
+    env.insert("PRAXIS_NODE_TOKEN".into(), serde_json::json!(node_token));
+    for (k, v) in &slot.env {
+        env.insert(k.clone(), serde_json::json!(v));
+    }
+
+    let params = CreateInstanceParams {
+        image: &slot.image,
+        price: price_usd_h,
+        disk: Some(disk_gb),
+        label: Some(&format!("praxis-{}-s{}", slot.role, slot_id)),
+        template_hash_id: None,
+        onstart_cmd: None,
+        runtype: Some(match mode {
+            Mode::OnDemand => "on-demand",
+            _ => "interruptible",
+        }),
+        env: serde_json::Value::Object(env),
+    };
+
+    let inst = vast.create(offer.id, &params).await?;
+    let storage_usd_h = offer.storage_cost * disk_gb as f64 / 30.0 / 24.0;
+    let row = crate::db::InstanceRow {
+        vast_id: inst.id,
+        slot_id,
+        role: slot.role,
+        node_token,
+        offer_id: offer.id,
+        machine_id: 0,
+        gpu_name: offer.gpu_name.clone(),
+        nb_ip: None,
+        image: slot.image.clone(),
+        mode,
+        lifecycle: serde_json::to_string(&lifecycle)?,
+        pinned: false,
+        actual_status: "loading".into(),
+        intended_status: "running".into(),
+        state: "requested".into(),
+        healthy: false,
+        busy: false,
+        busy_reason: String::new(),
+        min_bid: offer.min_bid,
+        bid_usd_h: price_usd_h,
+        dph_total: offer.dph_total,
+        storage_usd_h,
+        created_at: crate::db::now_iso(),
+        stopped_since: None,
+        destroyed_at: None,
+        label: format!("praxis-{}-s{}", slot.role, slot_id),
+    };
+    app.db.insert_instance(&row)?;
+    app.events.emit(
+        &app.db,
+        "instance_created",
+        Some(slot_id),
+        Some(inst.id),
+        &format!(
+            "{} gemietet: offer {} ({}) {} $/h, disk {disk_gb} GB — {reason}",
+            slot.name, offer.id, offer.gpu_name, price_usd_h
+        ),
+        &serde_json::json!({"price": price_usd_h, "mode": mode, "offer": offer.id}),
+    );
+    app.reconcile_now.notify_one();
+    Ok(inst.id)
+}
+
+pub fn stop_instance(app: &SharedApp, vast_id: i64, reason: &str) -> anyhow::Result<()> {
+    let Some(inst) = app.db.instance(vast_id) else { return Ok(()) };
+    if inst.state == "destroyed" {
+        return Ok(());
+    }
+    let _ = app.db.set_instance_intended(vast_id, "stopped");
+    let _ = app.db.set_instance_state(vast_id, "stopped");
+    let _ = app.db.set_slot_desired(inst.slot_id, false);
+    app.events.emit(&app.db, "instance_stopped", Some(inst.slot_id), Some(vast_id), reason, &serde_json::json!({}));
+    let app2 = app.clone();
+    let vast_id2 = vast_id;
+    let reason2 = reason.to_string();
+    tokio::spawn(async move {
+        let vast_client = app2.vast.lock().unwrap().clone();
+        if let Some(vast) = vast_client {
+            if let Err(e) = vast.set_status(vast_id2, false).await {
+                tracing::warn!(%e, vast_id = vast_id2, "vast stop failed (ggf. schon gestoppt/preempted)");
+            }
+        }
+        let _ = reason2;
+    });
+    Ok(())
+}
+
+pub async fn start_instance(app: &SharedApp, vast_id: i64, reason: &str) -> anyhow::Result<()> {
+    let Some(inst) = app.db.instance(vast_id) else {
+        anyhow::bail!("unknown instance {vast_id}");
+    };
+    let vast_client = app.vast.lock().unwrap().clone();
+    let Some(vast) = vast_client else {
+        anyhow::bail!("vast api not configured");
+    };
+    // Backoff 3×: gestoppte Interruptibles starten nur, wenn die GPU frei ist.
+    let mut attempt = 0;
+    loop {
+        match vast.set_status(vast_id, true).await {
+            Ok(_) => break,
+            Err(e) => {
+                attempt += 1;
+                if attempt >= 3 {
+                    app.events.emit(&app.db, "resume_fallback_fresh", Some(inst.slot_id), Some(vast_id), &format!("start fehlgeschlagen ({e}), RESUME_FALLBACK_FRESH"), &serde_json::json!({}));
+                    anyhow::bail!("start failed: {e}");
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(15 * attempt as u64)).await;
+            }
+        }
+    }
+    let _ = app.db.set_instance_intended(vast_id, "running");
+    let _ = app.db.set_instance_state(vast_id, "booting");
+    let _ = app.db.set_slot_desired(inst.slot_id, true);
+    app.events.emit(&app.db, "instance_started", Some(inst.slot_id), Some(vast_id), reason, &serde_json::json!({}));
+    Ok(())
+}
+
+pub async fn destroy_instance(app: &SharedApp, vast_id: i64, reason: &str) -> anyhow::Result<()> {
+    let Some(inst) = app.db.instance(vast_id) else { return Ok(()) };
+    if let Some(active) = app.db.active_instance(inst.slot_id) {
+        if active == vast_id {
+            let _ = app.db.set_active_instance(inst.slot_id, None);
+        }
+    }
+    let _ = app.db.mark_destroyed(vast_id);
+    app.events.emit(&app.db, "instance_destroyed", Some(inst.slot_id), Some(vast_id), reason, &serde_json::json!({}));
+    let app2 = app.clone();
+    let vast_id2 = vast_id;
+    tokio::spawn(async move {
+        let vast_client = app2.vast.lock().unwrap().clone();
+        if let Some(vast) = vast_client {
+            if let Err(e) = vast.destroy(vast_id2).await {
+                tracing::warn!(%e, vast_id = vast_id2, "vast destroy failed (ggf. schon weg)");
+            }
+        }
+    });
+    Ok(())
+}

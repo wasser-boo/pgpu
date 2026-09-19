@@ -42,7 +42,7 @@ fn d_max_rate() -> f64 {
     0.60
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BidConfig {
     #[serde(default = "d_margin")]
     pub margin: f64,
@@ -117,7 +117,7 @@ pub struct PolicyConfig {
 
 // ---------------------------------------------------------------- Snapshot
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OfferSnapshot {
     pub id: i64,
     pub gpu_name: String,
@@ -125,6 +125,19 @@ pub struct OfferSnapshot {
     pub dph_total: f64,
     pub storage_cost: f64, // $/GB/Monat
     pub inet_down_cost: f64,
+    // Anzeige-Felder (Dashboard), Policy ignoriert sie.
+    #[serde(default)]
+    pub cpu_ram_gb: f64,
+    #[serde(default)]
+    pub gpu_ram_gb: f64,
+    #[serde(default)]
+    pub disk_gb: f64,
+    #[serde(default)]
+    pub inet_down: f64,
+    #[serde(default)]
+    pub reliability2: f64,
+    #[serde(default)]
+    pub disk_bw: f64,
 }
 
 impl OfferSnapshot {

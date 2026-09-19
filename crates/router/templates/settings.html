@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}pgpu — Settings{% endblock %}
+{% block content %}
+<h1>Settings</h1>
+<div class="grid">
+<div class="card">
+  <h2 style="margin-top:0">Budget</h2>
+  <table>
+    <tr><td>Tages Soft-Cap</td><td>{{ budget.daily_soft_eur }} €</td></tr>
+    <tr><td>Tages Hard-Cap</td><td>{{ budget.daily_hard_eur }} €</td></tr>
+    <tr><td>Monats-Cap</td><td>{{ budget.monthly_eur }} €</td></tr>
+    <tr><td>Umrechnung</td><td>{{ budget.usd_per_eur }} $/€</td></tr>
+    <tr><td>Heute verbraucht</td><td class="mono">{{ budget.spent_usd|fmt2 }} $</td></tr>
+    <tr><td>Monat verbraucht</td><td class="mono">{{ budget.spent_month_usd|fmt2 }} $</td></tr>
+    <tr><td>Zeitzone</td><td>{{ budget.tz }}</td></tr>
+  </table>
+</div>
+<div class="card">
+  <h2 style="margin-top:0">Limits & Ceilings</h2>
+  <table>
+    <tr><td>Max. Instanzen</td><td>{{ limits.max_instances }}</td></tr>
+    <tr><td>Max. pro Slot</td><td>{{ limits.max_per_slot }}</td></tr>
+    <tr><td>Max. Gesamt-Rate</td><td>{{ limits.max_total_rate_usd_h }} $/h</td></tr>
+    {% for s in slots %}
+    <tr><td>Slot {{ s.id }} Ceiling</td><td>{{ s.ceiling }} $/h · margin {{ s.margin }}</td></tr>
+    <tr><td>Slot {{ s.id }} Idle</td><td>stop {{ s.stop_after_s }}s · destroy {{ s.destroy_after_s }}s</td></tr>
+    <tr><td>Slot {{ s.id }} Swap</td><td>preempt={{ s.on_preempt }} bid_pressure={{ s.on_bid_pressure }} optimize={{ s.optimize_cost }}</td></tr>
+    {% endfor %}
+  </table>
+  <p class="mut">Änderungen: config.toml anpassen + Router neu starten (docker compose restart router).</p>
+</div>
+<div class="card">
+  <h2 style="margin-top:0">Routing</h2>
+  <table>
+    <tr><td>Bind-IP</td><td class="mono">{{ routing.bind_ip }}</td></tr>
+    <tr><td>Dashboard</td><td class="mono">:{{ routing.dashboard_port }}</td></tr>
+    {% for p in routing.passthrough %}
+    <tr><td>Passthrough</td><td class="mono">:{{ p.0 }} → slot {{ p.1 }} · {{ p.2 }}</td></tr>
+    {% endfor %}
+    <tr><td>STT</td><td class="mono">{{ routing.stt }}</td></tr>
+    <tr><td>Vast-API</td><td>{% if routing.vast_ok %}aktiv{% else %}<span class="badge b-bad">nicht konfiguriert</span>{% endif %}</td></tr>
+  </table>
+</div>
+</div>
+{% endblock %}

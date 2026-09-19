@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}pgpu — Praxis GPU Router{% endblock %}</title>
+<script src="/static/htmx.min.js"></script>
+<style>
+:root { --bg:#101418; --panel:#1a2027; --line:#2a323c; --fg:#dbe2ea; --mut:#7d8a97; --acc:#4fc3f7; --ok:#66bb6a; --warn:#ffb74d; --bad:#e57373; }
+* { box-sizing:border-box; }
+body { margin:0; font:14px/1.45 system-ui,sans-serif; background:var(--bg); color:var(--fg); }
+a { color:var(--acc); text-decoration:none; }
+nav { display:flex; gap:18px; padding:10px 18px; border-bottom:1px solid var(--line); background:var(--panel); align-items:center; }
+nav .brand { font-weight:700; color:var(--fg); letter-spacing:.5px; }
+main { padding:18px; max-width:1200px; margin:0 auto; }
+h1 { font-size:18px; margin:0 0 12px; }
+h2 { font-size:15px; margin:18px 0 8px; color:var(--mut); text-transform:uppercase; letter-spacing:.8px; }
+.card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px 16px; margin-bottom:14px; }
+.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:14px; }
+table { width:100%; border-collapse:collapse; font-size:13px; }
+th { text-align:left; color:var(--mut); font-weight:600; padding:6px 8px; border-bottom:1px solid var(--line); }
+td { padding:6px 8px; border-bottom:1px solid #212830; }
+.badge { display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px; font-weight:600; }
+.b-ok { background:#1b3a1e; color:var(--ok); } .b-warn { background:#3a2f1b; color:var(--warn); } .b-bad { background:#3a1b1b; color:var(--bad); } .b-info { background:#1b2f3a; color:var(--acc); } .b-mut { background:#232b33; color:var(--mut); }
+button, .btn { background:#22303c; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:5px 12px; font-size:13px; cursor:pointer; }
+button:hover, .btn:hover { border-color:var(--acc); color:var(--acc); }
+input, select { background:#0d1116; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:5px 8px; font-size:13px; }
+.bar { height:10px; border-radius:5px; background:#232b33; overflow:hidden; margin:6px 0; }
+.bar > div { height:100%; background:var(--acc); }
+.bar > div.hard { background:var(--bad); }
+.bar > div.warn { background:var(--warn); }
+.mono { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px; }
+.mut { color:var(--mut); }
+#events { max-height:340px; overflow-y:auto; font-size:12px; }
+#events .row { padding:3px 0; border-bottom:1px dotted #212830; }
+.row .k { color:var(--acc); font-weight:600; margin-right:8px; }
+pre { background:#0d1116; padding:10px; border-radius:8px; overflow:auto; max-height:420px; font-size:12px; border:1px solid var(--line); }
+.actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
+.actions form { display:inline; }
+</style>
+{% block head %}{% endblock %}
+</head>
+<body>
+<nav>
+  <a class="brand" href="/">pgpu</a>
+  <a href="/">Overview</a>
+  <a href="/offers">Offers</a>
+  <a href="/schedules">Zeitpläne</a>
+  <a href="/assets">Assets</a>
+  <a href="/settings">Settings</a>
+  <span class="mut" style="margin-left:auto">Praxis GPU Router</span>
+</nav>
+<main>
+{% block content %}{% endblock %}
+</main>
+</body>
+</html>

@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}pgpu — Zeitpläne{% endblock %}
+{% block content %}
+<h1>Zeitpläne & Lifecycle</h1>
+{% if instances.is_empty() %}<p class="mut">Keine Instanzen — Zeitpläne gelten pro Instanz (beim Mieten oder nachträglich am Instanz-Detail).</p>{% endif %}
+{% for i in instances %}
+<div class="card">
+  <h2 style="margin-top:0">#{{ i.vast_id }} · Slot {{ i.slot_id }} · {{ i.role }}</h2>
+  <table>
+    <tr><td>Modus</td><td>{{ i.mode }}</td></tr>
+    <tr><td>Lifecycle</td><td class="mono">{{ i.lifecycle }}</td></tr>
+    <tr><td>Warm-Hours des Slots</td><td>{{ i.warm_hours }}</td></tr>
+    <tr><td>Idle → Stop</td><td>{{ i.stop_after_s }}s</td></tr>
+    <tr><td>Gestoppt → Destroy</td><td>{{ i.destroy_after_s }}s</td></tr>
+    <tr><td>State</td><td>{{ i.state }}</td></tr>
+  </table>
+  <div class="actions">
+    <a class="btn" href="/instances/{{ i.vast_id }}">Bearbeiten (Instanz-Detail)</a>
+    <form method="post" action="/do/instances/{{ i.vast_id }}/lifecycle">
+      <input type="hidden" name="kind" value="schedule">
+      <input name="value" placeholder="Mo-Fr 09:00-18:00" size="18">
+      <input type="hidden" name="destroy" value="0">
+      <button>Zeitfenster setzen</button>
+    </form>
+    <form method="post" action="/do/instances/{{ i.vast_id }}/lifecycle">
+      <input type="hidden" name="kind" value="auto">
+      <button>Auto-Regel aktivieren</button>
+    </form>
+  </div>
+</div>
+{% endfor %}
+{% endblock %}

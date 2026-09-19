@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+{% block title %}pgpu — Instanz #{{ inst.vast_id }}{% endblock %}
+{% block content %}
+<h1>Instanz #{{ inst.vast_id }} <span class="badge {{ state_class }}">{{ state }}</span> {% if inst.pinned %}<span class="badge b-warn">PINNED</span>{% endif %}</h1>
+
+<div class="grid">
+<div class="card">
+  <h2 style="margin-top:0">Fakten</h2>
+  <table>
+    <tr><td>Slot</td><td>#{{ inst.slot_id }} ({{ inst.role }})</td></tr>
+    <tr><td>GPU</td><td>{{ inst.gpu_name }}</td></tr>
+    <tr><td>Image</td><td class="mono">{{ inst.image }}</td></tr>
+    <tr><td>NetBird-IP</td><td class="mono">{{ inst.nb_ip }}</td></tr>
+    <tr><td>Modus</td><td>{{ inst.mode }}</td></tr>
+    <tr><td>Vast-Status</td><td class="mono">{{ inst.actual_status }} / {{ inst.intended_status }}</td></tr>
+    <tr><td>Preis</td><td class="mono">{{ inst.bid_usd_h|fmt4 }} $/h · min_bid {{ inst.min_bid|fmt4 }}</td></tr>
+    <tr><td>Busy</td><td>{% if inst.busy %}{{ inst.busy_reason }}{% else %}idle{% endif %}</td></tr>
+    <tr><td>Lifecycle</td><td class="mono">{{ inst.lifecycle }}</td></tr>
+  </table>
+  <div class="actions">
+    <form method="post" action="/do/instances/{{ inst.vast_id }}/start"><button>Start</button></form>
+    <form method="post" action="/do/instances/{{ inst.vast_id }}/stop"><button>Stop</button></form>
+    <form method="post" action="/do/instances/{{ inst.vast_id }}/destroy" onsubmit="return confirm('Wirklich zerstören?')"><button>Zerstören</button></form>
+    <form method="post" action="/do/instances/{{ inst.vast_id }}/pin"><button>Pin</button></form>
+    <form method="post" action="/do/instances/{{ inst.vast_id }}/unpin"><button>Unpin</button></form>
+    <a class="btn" href="/term/{{ inst.vast_id }}">Terminal</a>
+  </div>
+  <div class="actions">
+    <form method="post" action="/do/instances/{{ inst.vast_id }}/cmd">
+      <input type="hidden" name="command" value="restart">
+      Service <input name="service" value="llama-chat" size="12">
+      <button>supervisorctl restart</button>
+    </form>
+    <form method="post" action="/do/instances/{{ inst.vast_id }}/cmd">
+      <input type="hidden" name="command" value="sync_assets">
+      <button>Assets sync</button>
+    </form>
+    <form method="post" action="/do/instances/{{ inst.vast_id }}/cmd">
+      <input type="hidden" name="command" value="nvidia-smi">
+      <button>nvidia-smi</button>
+    </form>
+    <form method="post" action="/do/instances/{{ inst.vast_id }}/cmd">
+      <input type="hidden" name="command" value="run_acceptance">
+      <button>Acceptance</button>
+    </form>
+  </div>
+  {% match cmd_output %}{% when Some with (o) %}<pre>{{ o }}</pre>{% when None %}{% endmatch %}
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">Lifecycle setzen</h2>
+  <form method="post" action="/do/instances/{{ inst.vast_id }}/lifecycle">
+    <select name="kind">
+      <option value="auto">auto (idle → stop → destroy)</option>
+      <option value="ttl">ttl (Dauer)</option>
+      <option value="until">until (Zeitpunkt)</option>
+      <option value="schedule">schedule (Zeitfenster)</option>
+      <option value="sleep">sleep (Idle-Stop + Resume)</option>
+    </select>
+    <input name="value" placeholder="z. B. 7200 / 23:00 / Mo-Fr 09:00-18:00 / 07:30">
+    <label><input type="checkbox" name="destroy" value="1"> destroy am Ende</label>
+    <button>Setzen</button>
+  </form>
+  <h2>Modus</h2>
+  <form method="post" action="/do/instances/{{ inst.vast_id }}/mode">
+    <select name="mode">
+      <option value="interruptible">interruptible</option>
+      <option value="on_demand">on-demand (Fixpreis, unkillebar)</option>
+      <option value="manual">manual</option>
+    </select>
+    <button>Wechseln</button>
+    <p class="mut">Moduswechsel = Hot-Swap (neue Instanz im Zielmodus, alte drainen).</p>
+  </form>
+  <h2>Gebot</h2>
+  <form method="post" action="/do/instances/{{ inst.vast_id }}/bid">
+    <input name="price" value="{{ inst.bid_usd_h|fmt4 }}" size="8"> $/h <button>Setzen</button>
+  </form>
+</div>
+</div>
+
+<div class="card">
+  <h2>Logs</h2>
+  <form method="post" action="/instances/{{ inst.vast_id }}">
+    <button>Logs laden (Vast + Agent-Tail)</button>
+  </form>
+  {% match logs %}{% when Some with (l) %}<pre>{{ l }}</pre>{% when None %}{% endmatch %}
+</div>
+
+<div class="card">
+  <h2>Events</h2>
+  {% for e in events %}
+  <div class="row"><span class="k">{{ e.kind }}</span><span class="mut">{{ e.ts }}</span> {{ e.reason }}</div>
+  {% endfor %}
+</div>
+{% endblock %}

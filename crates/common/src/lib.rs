@@ -23,9 +23,10 @@ impl std::fmt::Display for Role {
 }
 
 /// Instanz-Modus.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Mode {
+    #[default]
     Interruptible,
     OnDemand,
     Manual,

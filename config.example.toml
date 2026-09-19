@@ -1,0 +1,126 @@
+# pgpu — Praxis GPU Router Konfiguration
+# Kopieren nach config.toml und anpassen. Produktion: bind_ip = NetBird-IP.
+
+[router]
+bind_ip = "127.0.0.1"        # Produktion: NetBird-IP (z. B. 100.x.y.z)
+dashboard_port = 8080
+data_dir = "/data"           # lokal testen: "./data"
+# Router-Token: API-Bearer + Dashboard-Login. env ROUTER_TOKEN überschreibt.
+token = "change-me"
+tz = "Europe/Berlin"
+# Hold-Window für X-Router-Wait (Sekunden, 0 = sofort 503)
+wait_for_backend_max_s = 600
+
+[vast]
+# api_key = ""               # oder env VAST_API_KEY
+poll_interval_s = 30
+offer_poll_s = 60
+
+[netbird]
+# Management-API-Token (nbt_...) für ephemerere Setup-Keys pro Instanz.
+# Ohne: statischer setup_key (Fallback).
+# api_token = "nbt_..."
+setup_key = ""
+group = "gpu"
+router_nb_ip = "100.64.0.1"  # NetBird-IP des Router-Hosts (Agents callen home)
+router_nb_port = 8080
+
+[stt]
+mode = "local"               # "local" = Vosk-Sidecar im Router-Compose
+url = "http://127.0.0.1:2701"   # Sidecar-Host-Port (compose: 127.0.0.1:2701:2700)
+
+[budget]
+daily_soft_eur = 2.0
+daily_hard_eur = 2.4
+monthly_eur = 50.0
+usd_per_eur = 1.08
+
+[limits]
+max_instances = 3
+max_per_slot = 2
+max_total_rate_usd_h = 0.60
+
+[alerts]
+# webhook_url = "https://***REMOVED***"   # POST {"kind","message"}
+
+# ------------------------------------------------------------- Slot 1: LLM
+
+[[slots]]
+id = 1
+role = "llm"
+name = "LLM (fork-llama)"
+image = "vayayo/praxis-llamap-gs-gpu:latest"
+disk_gb = 120
+# 16-GB-Guide-Filter (5070 Ti rar, 4060 Ti/A4000 Alternativen):
+search_query = 'gpu_ram>=15000 cpu_ram>=30000 disk_space>=120 inet_down>=500 disk_bw>=1500 reliability2>=0.95'
+# Flash-Next-82GB-Rezept:
+# search_query = 'gpu_name="RTX 5070 Ti" cpu_ram>=62000 cuda_max_good>=12.9 disk_space>=120 inet_down>=800 disk_bw>=1500 reliability2>=0.95'
+passthrough = { 11434 = "api", 11435 = "webui", 11436 = "embed" }
+
+[slots.services]
+api = { port = 11434, health = "/health", busy = "inflight" }
+webui = { port = 11435, busy = "inflight" }
+embed = { port = 11436, health = "/health", busy = "inflight" }
+agent = { port = 9100, busy = "none" }
+
+[slots.bid]
+margin = 0.15
+ceiling_usd_h = 0.30
+defend_when_busy = true
+
+[slots.idle]
+stop_after_s = 900            # 15 min
+destroy_after_stopped_s = 172800  # 48 h Disk warm halten
+
+[slots.swap]
+on_preempt = true
+on_bid_pressure = true
+optimize_cost = false         # 82-GB-Download macht Swap teurer als Behalten
+max_warmup_s = 2700           # 45 min (Model-Download)
+keep_warm_window_s = 1800
+
+# Extra-Env beim Create (Modellvariante!):
+[slots.env]
+LLAMA_MODEL = "qwen3.8-flash-next"
+LLAMA_DOWNLOAD_MODELS = "1"
+# traffic_gb = 85.0            # Score-Gewichtung: geschätzter Model-Traffic
+# warm_hours = "09:00-18:00"   # Slot automatisch warm halten im Fenster
+
+# ----------------------------------------------------------- Slot 2: Media
+
+[[slots]]
+id = 2
+role = "media"
+name = "Media (fork-comfyui)"
+image = "vayayo/praxis-comfyui-gpu:latest"
+disk_gb = 60
+search_query = 'gpu_ram>=16000 gpu_name="RTX 3090" disk_space>=60 inet_down>=300 reliability2>=0.95'
+passthrough = { 8188 = "comfy" }
+# STT läuft im Router (stt.mode=local); 2700 → Sidecar. Legacy-Slot:
+# passthrough = { 8188 = "comfy", 2700 = "stt" }
+
+[slots.services]
+comfy = { port = 8188, health = "/object_info/PraxisQwen3TTS", busy = "comfy_queue" }
+stt = { port = 2700, health = "/health", busy = "ws_sessions" }
+agent = { port = 9100, busy = "none" }
+
+[slots.bid]
+margin = 0.10
+ceiling_usd_h = 0.20
+defend_when_busy = true
+
+[slots.idle]
+stop_after_s = 600
+destroy_after_stopped_s = 3600
+
+[slots.swap]
+on_preempt = true
+on_bid_pressure = true
+optimize_cost = true          # Frisch-Instanzen sind billig (kleines Image)
+min_savings_pct = 25
+max_warmup_s = 1200
+min_swap_interval_s = 3600
+
+[slots.env]
+PRAXIS_QWEN_TTS_DOWNLOAD = "1"
+VOSK_DOWNLOAD_MODELS = "1"

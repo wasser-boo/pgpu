@@ -99,6 +99,12 @@ fn slot(id: i64, role: Role, instances: Vec<InstanceSnapshot>, active: Option<i6
             dph_total: 0.22,
             storage_cost: 0.15,
             inet_down_cost: 0.002,
+            cpu_ram_gb: 126.0,
+            gpu_ram_gb: 16.0,
+            disk_gb: 200.0,
+            inet_down: 900.0,
+            reliability2: 0.98,
+            disk_bw: 2000.0,
         }),
         desired_running: false,
         local_weekday: 1,
@@ -310,6 +316,12 @@ fn cost_optimization_only_when_enabled_and_cheap_enough() {
         dph_total: 0.25,
         storage_cost: 0.15,
         inet_down_cost: 0.002,
+        cpu_ram_gb: 64.0,
+        gpu_ram_gb: 24.0,
+        disk_gb: 512.0,
+        inet_down: 1200.0,
+        reliability2: 0.99,
+        disk_bw: 3000.0,
     });
     let actions = decide(&s, &cfg());
     assert!(actions.iter().any(|x| matches!(x, Action::Create { slot_id: 2, offer_id: 999, .. })), "{actions:?}");
@@ -380,20 +392,14 @@ fn limits_block_create() {
 #[test]
 fn offer_score_prefers_cheap_rate_with_storage() {
     let o1 = OfferSnapshot {
-        id: 1,
-        gpu_name: "A".into(),
-        min_bid: 0.10,
-        dph_total: 0.0,
-        storage_cost: 0.30,
-        inet_down_cost: 0.005,
+        id: 1, gpu_name: "A".into(), min_bid: 0.10, dph_total: 0.0,
+        storage_cost: 0.30, inet_down_cost: 0.005,
+        cpu_ram_gb: 0.0, gpu_ram_gb: 0.0, disk_gb: 0.0, inet_down: 0.0, reliability2: 0.0, disk_bw: 0.0,
     };
     let o2 = OfferSnapshot {
-        id: 2,
-        gpu_name: "B".into(),
-        min_bid: 0.11,
-        dph_total: 0.0,
-        storage_cost: 0.05,
-        inet_down_cost: 0.001,
+        id: 2, gpu_name: "B".into(), min_bid: 0.11, dph_total: 0.0,
+        storage_cost: 0.05, inet_down_cost: 0.001,
+        cpu_ram_gb: 0.0, gpu_ram_gb: 0.0, disk_gb: 0.0, inet_down: 0.0, reliability2: 0.0, disk_bw: 0.0,
     };
     // 120 GB Disk, 20 GB Traffic, 4 h erwartet:
     assert!(o2.score(120, 20.0, 4.0) < o1.score(120, 20.0, 4.0));

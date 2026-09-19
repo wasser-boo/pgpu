@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block title %}pgpu — Offers{% endblock %}
+{% block content %}
+<h1>Angebote</h1>
+<form method="get" action="/offers" class="card">
+  <select name="slot">
+    {% for s in slot_names %}<option value="{{ s.0 }}" {% if s.0 == slot_id %}selected{% endif %}>Slot {{ s.0 }} · {{ s.1 }}</option>{% endfor %}
+  </select>
+  <select name="mode">
+    <option value="interruptible" {% if mode == "interruptible" %}selected{% endif %}>interruptible (Gebot)</option>
+    <option value="on_demand" {% if mode == "on_demand" %}selected{% endif %}>on-demand (Fixpreis)</option>
+  </select>
+  <button type="submit">Suchen</button>
+</form>
+
+{% match error %}{% when Some with (e) %}<div class="card"><span class="badge b-bad">{{ e }}</span></div>{% when None %}{% endmatch %}
+
+<div class="card">
+<table>
+<tr><th>ID</th><th>GPU</th><th>RAM</th><th>Disk</th><th>inet ↓</th><th>Reliab.</th><th>min_bid</th><th>on-demand</th><th>Storage</th><th></th></tr>
+{% for o in offers %}
+<tr>
+  <td class="mono">{{ o.id }}</td>
+  <td>{{ o.gpu_name }}</td>
+  <td class="mono">{{ o.cpu_ram_gb|fmt1 }} GB</td>
+  <td class="mono">{{ o.disk_gb|fmt0 }} GB</td>
+  <td class="mono">{{ o.inet_down|fmt0 }} Mbps</td>
+  <td class="mono">{{ o.reliability2|fmt2 }}</td>
+  <td class="mono">{{ o.min_bid|fmt4 }} $/h</td>
+  <td class="mono">{{ o.dph_total|fmt4 }} $/h</td>
+  <td class="mono">{{ o.storage_cost|fmt3 }} $/GB·Mo</td>
+  <td>
+    <form method="post" action="/do/rent">
+      <input type="hidden" name="offer_id" value="{{ o.id }}">
+      <input type="hidden" name="slot_id" value="{{ slot_id }}">
+      <input type="hidden" name="mode" value="{{ mode }}">
+      Disk <input name="disk_gb" size="4" value="{{ default_disk_gb }}">
+      <button>Mieten</button>
+    </form>
+  </td>
+</tr>
+{% endfor %}
+</table>
+</div>
+{% if offers.is_empty() %}<p class="mut">Keine Angebote — Suche fehlgeschlagen oder Filter zu eng. Vast-Key gesetzt?</p>{% endif %}
+{% endblock %}

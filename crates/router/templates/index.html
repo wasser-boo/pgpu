@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block title %}pgpu — Slots{% endblock %}
+{% block content %}
+<h1>Overview</h1>
+
+<div class="card">
+  <h2>Budget (heute)</h2>
+  <div class="mono">
+    {{ budget.spent_usd|fmt2 }} $ verbraucht · Projektion bis Mitternacht {{ budget.projected_usd|fmt2 }} $ ·
+    Soft {{ budget.soft_usd|fmt2 }} $ / Hard {{ budget.hard_usd|fmt2 }} $ · Monat {{ budget.spent_month_usd|fmt2 }} / {{ budget.monthly_usd|fmt2 }} $
+  </div>
+  <div class="bar"><div class="{{ budget.bar_class }}" style="width:{{ budget.pct }}%"></div></div>
+  {% if stt_sessions > 0 %}<span class="badge b-info">STT: {{ stt_sessions }} WS-Session(s) aktiv</span>{% else %}<span class="badge b-mut">STT idle</span>{% endif %}
+</div>
+
+<div class="grid">
+{% for s in slots %}
+<div class="card">
+  <h2 style="margin-top:0">Slot {{ s.id }} · {{ s.name }}</h2>
+  {% match s.state %}
+  {% when Some with (st) %}<div>State: <span class="badge {{ st.class }}">{{ st.label }}</span> {% if s.healthy %}<span class="badge b-ok">healthy</span>{% else %}<span class="badge b-warn">warming</span>{% endif %}</div>
+  {% when None %}<div>State: <span class="badge b-bad">cold</span></div>
+  {% endmatch %}
+  <div class="mono">
+    {% if s.vast_id > 0 %}Instanz #{{ s.vast_id }} · {{ s.gpu_name }}{% endif %}
+    {% if s.pct >= 0.0 %}<br>Download: {{ s.pct|fmt1 }} %{% endif %}
+    <br>Gebot {{ s.bid|fmt4 }} $/h vs. min_bid {{ s.min_bid|fmt4 }} $/h
+    <br>In-flight: {{ s.in_flight }} · Busy: {% if s.busy %}<span class="badge b-info">{{ s.busy_reason }}</span>{% else %}idle{% endif %}
+    <br>Kosten heute: {{ s.cost_today|fmt2 }} $
+    {% if s.pinned %}<br><span class="badge b-warn">PINNED</span>{% endif %}
+  </div>
+  <div class="actions">
+    <form method="post" action="/do/slots/{{ s.id }}/wake"><button>Wake</button></form>
+    <form method="post" action="/do/slots/{{ s.id }}/stop"><button>Stop</button></form>
+    <form method="post" action="/do/slots/{{ s.id }}/destroy" onsubmit="return confirm('Instanz wirklich zerstören?')"><button>Zerstören</button></form>
+    <form method="post" action="/do/slots/{{ s.id }}/swap"><button>Swap now</button></form>
+    {% if s.pinned %}
+    <form method="post" action="/do/slots/{{ s.id }}/unpin"><button>Unpin</button></form>
+    {% else %}
+    <form method="post" action="/do/slots/{{ s.id }}/pin"><button>Pin</button></form>
+    {% endif %}
+    {% if s.vast_id > 0 %}<a class="btn" href="/instances/{{ s.vast_id }}">Details</a>{% endif %}
+  </div>
+</div>
+{% endfor %}
+</div>
+
+<div class="card">
+  <h2>Events (live)</h2>
+  <div id="events">
+    {% for e in events %}
+    <div class="row"><span class="k">{{ e.kind }}</span><span class="mut">{{ e.ts }}</span> {{ e.reason }}</div>
+    {% endfor %}
+  </div>
+</div>
+
+<script>
+const es = new EventSource('/api/v1/events/stream');
+es.onmessage = (m) => {
+  try {
+    const e = JSON.parse(m.data);
+    const div = document.createElement('div');
+    div.className = 'row';
+    div.innerHTML = '<span class="k">' + e.kind + '</span><span class="mut">' + e.ts + '</span> ' + e.reason;
+    const el = document.getElementById('events');
+    el.prepend(div);
+    while (el.children.length > 200) el.lastChild.remove();
+  } catch (err) {}
+};
+</script>
+{% endblock %}

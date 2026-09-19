@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}pgpu — Terminal #{{ vast_id }}{% endblock %}
+{% block head %}
+<link rel="stylesheet" href="/static/xterm.css">
+<script src="/static/xterm.js"></script>
+{% endblock %}
+{% block content %}
+<h1>Terminal · Instanz #{{ vast_id }}</h1>
+<div class="card">
+  <div id="term"></div>
+  <p class="mut">Pipes-bash (kein vty): interaktive Programme ohne Fullscreen-Modus. exit beendet.</p>
+</div>
+<script>
+const wsUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/api/v1/instances/{{ vast_id }}/ws/term';
+const ws = new WebSocket(wsUrl);
+const term = new Terminal({ fontSize: 13, cursorBlink: true, cols: 100, rows: 30 });
+term.open(document.getElementById('term'));
+term.onData((d) => ws.send(JSON.stringify({ type: 'input', data: d })));
+ws.onmessage = (m) => {
+  try {
+    const v = JSON.parse(m.data);
+    if (v.type === 'output') term.write(v.data);
+    if (v.type === 'exit') { term.write('\r\n\x1b[31m[Session beendet]\x1b[0m\r\n'); ws.close(); }
+  } catch (e) {}
+};
+ws.onopen = () => term.write('\x1b[32mverbunden — bash auf Instanz {{ vast_id }}\x1b[0m\r\n');
+ws.onclose = () => term.write('\r\n\x1b[31m[getrennt]\x1b[0m\r\n');
+</script>
+{% endblock %}
