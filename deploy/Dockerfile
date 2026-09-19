@@ -8,8 +8,8 @@ FROM rust:1-bookworm AS agent-builder
 RUN rustup target add x86_64-unknown-linux-musl && \
     apt-get update && apt-get install -y --no-install-recommends musl-tools && rm -rf /var/lib/apt/lists/*
 WORKDIR /agent
-COPY agent/Cargo.toml ./
-COPY agent/src ./src
+COPY --from=agent Cargo.toml ./
+COPY --from=agent src ./src
 RUN cargo build --release --target x86_64-unknown-linux-musl && \
     cp target/x86_64-unknown-linux-musl/release/praxis-gpu-agent /gpu-agent
 
