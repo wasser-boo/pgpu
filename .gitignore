@@ -5,3 +5,4 @@ config.toml
 *.sqlite-journal
 .env
 nohup.out.env
+deploy/data/
