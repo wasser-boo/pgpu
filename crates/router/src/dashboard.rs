@@ -300,9 +300,18 @@ pub fn state_json(app: &SharedApp) -> serde_json::Value {
     let mut slots = Vec::new();
     for s in &app.cfg.slots {
         let active = app.db.active_instance(s.id);
-        let inst = active.and_then(|v| app.db.instance(v));
+        // Ohne aktive Instanz: jüngste lebende Box des Slots zeigen
+        // (Warmup/Download-Progress), sonst bleibt state/progress null.
+        let fallback = app
+            .db
+            .instances(false)
+            .into_iter()
+            .filter(|r| r.slot_id == s.id)
+            .max_by_key(|r| r.vast_id);
+        let shown = active.or_else(|| fallback.map(|r| r.vast_id));
+        let inst = shown.and_then(|v| app.db.instance(v));
         let traffic = app.traffic.snapshot(s.id);
-        let hb = active.and_then(|v| app.hub.heartbeat(v));
+        let hb = shown.and_then(|v| app.hub.heartbeat(v));
         slots.push(serde_json::json!({
             "id": s.id,
             "role": s.role,
