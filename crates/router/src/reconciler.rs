@@ -455,11 +455,16 @@ pub async fn build_snapshot(app: &SharedApp) -> anyhow::Result<Snapshot> {
             }
             let idle_since = {
                 let last_req = app.traffic.snapshot(slot.id).last_request;
-                match last_req {
-                    t if t > 0 => Some(chrono::DateTime::from_timestamp(t, 0).unwrap_or_default()),
-                    // Nach Warmup zählt die Idle-Uhr ab Healthy, nicht ab Miete
-                    // (sonst stoppt eine 50-min-Warmup-Box 29 s nach dem Flip).
-                    _ => row.healthy_since.as_deref().and_then(crate::db::parse_iso),
+                let last_req = (last_req > 0)
+                    .then(|| chrono::DateTime::from_timestamp(last_req, 0).unwrap_or_default());
+                let healthy = row.healthy_since.as_deref().and_then(crate::db::parse_iso);
+                // Hot-Swap: eine frisch geflippte Box darf nicht die Idle-Uhr der
+                // VORHERIGEN Box erben (Stopp 33 s nach dem Flip, weil der letzte
+                // Request noch gegen den Vorgänger lief). Idle zählt ab dem
+                // Maximum aus letztem Request und eigenem Healthy-Zeitpunkt.
+                match (last_req, healthy) {
+                    (Some(lr), Some(h)) => Some(lr.max(h)),
+                    (lr, h) => lr.or(h),
                 }
             };
             instances.push(InstanceSnapshot {
@@ -549,6 +554,23 @@ pub async fn apply_action(app: &SharedApp, action: &Action) -> anyhow::Result<()
             if !pending.is_empty() {
                 tracing::debug!(slot_id, "create skipped: backer already warming");
                 return Ok(());
+            }
+            // Snapshot-Race: "wake"/"preempted: replace" wurden geplant, als der
+            // Slot noch ohne brauchbare Instanz war. Wenn bis zur Ausführung ein
+            // Ersatz bereits healthy geflippt ist, ist die Aktion überholt —
+            // sonst mieten wir redundant (10:17-07-Box neben der Flip-Box).
+            // Kostoptimierungs-Creates (bid pressure/optimiere Kosten) laufen
+            // bewusst MIT gesundem Active und sind hier nicht erfasst.
+            if reason.starts_with("wake") || reason.starts_with("preempted: replace") {
+                let healthy_active = app
+                    .db
+                    .instances(false)
+                    .into_iter()
+                    .any(|r| r.slot_id == *slot_id && r.healthy && r.destroyed_at.is_none());
+                if healthy_active {
+                    tracing::info!(slot_id, %reason, "create skipped: snapshot-Race, bereits healthy aktiv");
+                    return Ok(());
+                }
             }
             let offers = search_slot_offers(app, *slot_id, true).await?;
             let Some(offer) = offers.into_iter().find(|o| o.id == *offer_id) else {

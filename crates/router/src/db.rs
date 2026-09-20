@@ -392,7 +392,9 @@ impl Db {
                 stopped_since=CASE WHEN ?2='stopped' AND stopped_since IS NULL THEN ?3 ELSE stopped_since END,
                 stopped_since=CASE WHEN ?2!='stopped' THEN NULL ELSE stopped_since END,
                 healthy_since=CASE WHEN ?2='healthy' AND healthy_since IS NULL THEN ?3 ELSE healthy_since END,
-                healthy_since=CASE WHEN ?2!='healthy' THEN NULL ELSE healthy_since END
+                healthy_since=CASE WHEN ?2!='healthy' THEN NULL ELSE healthy_since END,
+                healthy=CASE WHEN ?2='healthy' THEN 1 ELSE 0 END,
+                busy=CASE WHEN ?2 IN ('stopped','preempted','unreachable','destroyed') THEN 0 ELSE busy END
              WHERE vast_id=?1",
             params![vast_id, state, now_iso()],
         )?;
