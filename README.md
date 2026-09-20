@@ -44,10 +44,11 @@ Entrypoint — sonst enrolls Vast unter Container-ID).
 | 7 | VPS-Umzug | compose ist host-unabhängig |
 
 ### Offene Punkte (nächste Session)
-- **machine_id-Blacklist**: drei 3090-Hosts sind hintereinander vast-seitig gestorben (`exited`/loading-Preempt); Wake-Replace mietet auf dem nächstbilligen (= schlechtesten) Host. Mindestens `reliability2`-Gewichtung im Score, Blacklist nach 2 Fails, Acceptance-Ergebnis (tok/s, TTS-Latenz) via `/api/v1/node/reports`.
-- **False-Preempt-Schutz**: vast meldet für frische Instanzen mitunter `cur_state=stopped` während `actual=loading` → nicht als PREEMPTED werten (nur wenn actual definitiv tot ist).
-- **Unreachable-Watchdog vs. gestoppte Box**: Wake startet die gestoppte Instanz nur bei Budget-Freiheit; sonst (nach 3 min) `unreachable` → teurer Ersatzneubau. `resume_fallback_fresh` sollte die alte Box zerstören.
-- **LLM-Image bauen** (fork-llama hat alle Fixes committed; CUDA-Build uncached ≈ 30-60 min) + LLB-Slot live testen.
+- **Machine-Blacklist** ✅ 20.09. live: `machine_stats` zählt Fails (preempt während warmup, instance_gone im Warmup, warmup-timeout, agent >3 min still), Auto-Blacklist nach `vast.blacklist_after_fails` (Default 2), `best_candidate` filtert blacklisted Hosts, Offer-Score durch `reliability2` geteilt. Erster Live-Fang: Host 32560 + 144003 je Fail #1 in der ersten Stunde. Dashboard `/offers` zeigt Host-Bilanz + Blacklist-Knöpfe; API `GET /api/v1/machines`, `POST /api/v1/machines/:id/blacklist|unblacklist`.
+- **False-Preempt-Schutz** ✅ 20.09.: `cur_state=stopped` zählt nicht mehr als tot, solange `actual` noch loading/created ist; echte Preempts (actual=exited) weiterhin erkannt.
+- Alert-Dedupe (30 min/Art — budget_80 spamte alle 30 s), Audit-Trail `slot_desired` (wer setzt desired), Reconciler-Loop entkoppelt Offer-Refresh (blockierendes tick() verzog jede Wake-Reaktion), Connector dialt preempted Boxen nicht mehr.
+- **Unreachable-Stopper**: Box mit vast=running + Agent >5 min tot wird gestoppt (Disk warm, kein GPU-Geld-Brennen); `resume_fallback_fresh` zerstört die alte Box nach 3× fehlgeschlagenem Start (blockiert sonst den Wake-Pfad).
+- **LLM-Image bauen** (CUDA-Build ≈ 30-60 min) + Slot-1-Test.
 - Praxis-Session-Hook (wake bei Session-Start), GpuRouterClient (X-Router-Wait/Job-Id), Browser-Test Dashboard.
 
 ## Crates
@@ -75,7 +76,20 @@ Ports (alle an `bind_ip` = NetBird-IP gebunden, kein EXPOSE im Image):
 ## Praxis-Anbindung
 
 `settings.llama_base_url`/`comfyui_base_url`/`voice_vosk_url` auf die
-Router-NetBird-IP zeigen lassen — Ports bleiben gleich. Optional:
+Router-NetBird-IP zeigen lassen — Ports bleiben gleich. In Praxis (live,
+pro Kontext):
+
+```
+/context set settings.comfyui_base_url=http://100.105.6.69:8188
+/context set settings.voice_vosk_url=ws://100.105.6.69:2700/de
+```
+
+(STT läuft router-lokal als Sidecar; Sprachsuffix `/de`|`/fr`|`/ja` wie bisher —
+die Routen `/`, `/ws`, `/ws/{lang}`, `/{lang}` existieren alle.)
+
+LLM: Praxis erreicht llama.cpp über `LLAMACPP_API_BASE` (env, Standard
+`http://localhost:11434`) → im aktiven Install auf
+`http://100.105.6.69:11434` setzen (`.env` des Praxis-Release). Optional:
 `X-Router-Wait: <sek>` hält Requests auf kaltem Slot bis healthy
 (impliziter Wake), `X-Router-Job-Id` hält den Slot busy (Batches),
 `X-Router-Priority: critical` für on-demand-Wünsche.
