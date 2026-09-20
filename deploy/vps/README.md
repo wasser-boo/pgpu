@@ -58,12 +58,30 @@ GPU-Boxen (vast) ──NetBird──► router :8080 (Call-home/WS) ◄── Ro
 
 ## Voraussetzungen
 
-- VPS ≥ 8 GB RAM / 2 vCPU (STT-Modelle de+ja ≈ 6 GB geladen; z. B.
-  Hetzner CX32/CPX31), Debian 12/Ubuntu 24.04, Docker + Compose v2.
+- VPS ≥ 8 GB RAM / 2–4 vCPU (STT-Modelle de+ja ≈ 6 GB geladen),
+  Debian 12/Ubuntu 24.04, Docker + Compose v2.
 - Auf tgrid: **reusable Setup-Key** für den Peer `praxis-vps` mit den
   Gruppen `test` und `servers` minten (NetBird-UI → Setup Keys → neu,
   Typ *reusable*; der Router mintet Keys für GPU-Boxen später selbst
-  per `NB_API_TOKEN`).
+  per `NB_API_TOKEN`). Der NetBird-**Management-Server bleibt, wo er
+  ist** (tgrid) — der VPS enrollt nur als Peer.
+
+### DigitalOcean (empfohlene Variante)
+
+- **Droplet:** `s-4vcpu-8gb` (≈ 48 $/Mon, 8 GB RAM) — kleiner geht nur
+  mit `STT_LANGUAGES=de` (de-Modell ≈ 4,5 GB) und dann knapper 6 GB.
+- **Region:** `nyc1/nyc2/nyc3` — die Vast-GPU-Angebote (3090/5070 Ti)
+  stehen überwiegend in den USA; mit dem VPS in NYC laufen LLM-Stream,
+  Comfy-Downloads und Agent-Dial regional statt transatlantisch.
+  Wer Voice-Priorität hat (Mikrofon→STT aus DE): `fra1` — sonst gleiche
+  Funktion, nur andere Latenzverteilung.
+- **KVM → `/dev/net/tun`** ist vorhanden (`ls /dev/net/tun` prüfen).
+- **DO-Cloud-Firewall:** inbound nur SSH erlauben — der Stack published
+  keine Ports; alles läuft über das NetBird-Overlay.
+- Ersteinrichtung: Ubuntu 24.04 + `apt install docker.io docker-compose-v2`
+  (bzw. Dockers offizielles Repo), SSH-Key-only, dann „Einrichtung“ unten.
+- GPU-Boxen ↔ VPS: Overlay via tgrid (Relay/Direct wie gehabt) — der
+  Standort des Managements ist dafür egal.
 - Images auf Docker Hub: `vayayo/praxis-gpu-router`, `vayayo/praxis-stt`,
   `vayayo/praxis` (bauen/pushen: `bash deploy/build.sh --push` im
   jeweiligen Repo, Praxis: `bash deploy/build.sh --push`).
