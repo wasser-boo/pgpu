@@ -25,10 +25,13 @@ als Fallback (`PRAXIS_AGENT_CALL_HOME=1`, lokal/wo Outbound geht).
 
 **NetBird-ACL (tgrid):** Boxen werden via Mint in `Gpuserver` **und**
 `servers` engerollt — ohne `servers` greift `developers→servers` nicht und
-Router/wasser erreichen die Boxen nicht. Policy „praxis gpu router":
-`Gpuserver→test:8080` (Call-home) + `test→Gpuserver:8188,2700,9100,11434-36`
-(Dial). Boxen heißen `gpu-<role>-<tok8>` (netbird up --hostname im Fork-
-Entrypoint — sonst enrolls Vast unter Container-ID).
+Router/wasser erreichen die Boxen nicht. Policies:
+- „praxis gpu router": `Gpuserver→test:8080` (Call-home/WS)
+- „praxis to gpu router" (20.09. neu): `Gpuaccess→test:8080,8188,2700,11434-36`
+  — ohne die war Praxis (pagent) vom Router komplett abgeschnitten
+  (LLM-Fail „temporarily unavailable ×5"). Achtung NetBird-API: Regeln mit
+  gleicher ID in einem PUT werden verworfen → separate Policy pro Regel.
+Boxen heißen `gpu-<role>-<tok8>` (netbird up --hostname im Fork-Entrypoint).
 
 ## Bauplan-Status (v2)
 
