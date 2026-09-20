@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 # Baut das Router-Image (inkl. gpu-agent aus dem praxis-gpu-agent-Repo).
 # Usage: IMAGE_TAG=vayayo/praxis-gpu-router:0.2 bash deploy/build.sh
+#
+# Multi-Arch (Vast-Boxen=amd64, NAS=arm64) bauen+pushen — Builder einmalig:
+#   docker buildx create --name multiarch --driver docker-container --use
+# dann aus dem Repo-Root (TAG/Version anheben):
+#   docker buildx build --platform linux/amd64,linux/arm64 -f deploy/Dockerfile \
+#     --build-context agent=../praxis-gpu-agent \
+#     -t vayayo/praxis-gpu-router:0.15 -t vayayo/praxis-gpu-router:latest \
+#     --provenance=false --push .
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

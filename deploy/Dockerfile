@@ -5,13 +5,19 @@
 # Askama-Templates werden einkompiliert; static/ liegt im Image.
 
 FROM rust:1-bookworm AS agent-builder
-RUN rustup target add x86_64-unknown-linux-musl && \
-    apt-get update && apt-get install -y --no-install-recommends musl-tools && rm -rf /var/lib/apt/lists/*
+# TARGETPLATFORM (nur mit BuildKit/buildx gesetzt): Agent als musl-Binary pro
+# Plattform — amd64 läuft auf den Vast-Boxen, arm64 fürs NAS (Multi-Arch).
+# Ohne buildx (plain docker build) bleibt x86_64-musl wie bisher.
+ARG TARGETPLATFORM
+RUN T=$([ "${TARGETPLATFORM:-linux/amd64}" = "linux/arm64" ] && echo aarch64-unknown-linux-musl || echo x86_64-unknown-linux-musl) && \
+    rustup target add "$T" && \
+    apt-get update && apt-get install -y --no-install-recommends musl-tools && rm -rf /var/lib/apt/lists/* && \
+    echo "$T" > /rusttarget
 WORKDIR /agent
 COPY --from=agent Cargo.toml ./
 COPY --from=agent src ./src
-RUN cargo build --release --target x86_64-unknown-linux-musl && \
-    cp target/x86_64-unknown-linux-musl/release/praxis-gpu-agent /gpu-agent
+RUN T=$(cat /rusttarget) && cargo build --release --target "$T" && \
+    cp "target/$T/release/praxis-gpu-agent" /gpu-agent
 
 FROM rust:1-bookworm AS router-builder
 WORKDIR /build
