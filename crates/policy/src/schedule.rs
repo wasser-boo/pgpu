@@ -28,9 +28,14 @@ impl Window {
     }
 
     /// Minute, ab der Prewarm gestartet werden soll (start - prewarm_min),
-    /// falls das vor Fensterbeginn liegt und der Tag passt.
-    pub fn prewarm_start(&self, prewarm_min: u32) -> Option<u32> {
-        self.start_min.checked_sub(prewarm_min).map(|m| m).filter(|_| prewarm_min > 0)
+    /// NUR an einem Fenstertag — sonst hätte z. B. ein So-12:00-Poll den
+    /// Prewarm-Arm belegt und den "Fenster zu → Stop" verschluckt (der
+    /// Sunday-Stop kam bislang nur versehentlich über den Idle-Pfad).
+    pub fn prewarm_start(&self, prewarm_min: u32, weekday: u8) -> Option<u32> {
+        if prewarm_min == 0 || !self.days.contains(&weekday) {
+            return None;
+        }
+        self.start_min.checked_sub(prewarm_min)
     }
 }
 
@@ -135,9 +140,12 @@ mod tests {
     #[test]
     fn prewarm() {
         let w = parse_window("Mo-Fr 09:00-18:00").unwrap();
-        assert_eq!(w.prewarm_start(20), Some(520));
-        assert_eq!(w.prewarm_start(0), None);
-        assert_eq!(w.prewarm_start(600), None); // würde Vortag betreffen → None
+        assert_eq!(w.prewarm_start(20, 1), Some(520));
+        assert_eq!(w.prewarm_start(0, 1), None);
+        assert_eq!(w.prewarm_start(600, 1), None); // würde Vortag betreffen → None
+        // Fensterfreier Tag: kein Prewarm — der Stop-Arm muss greifen können.
+        assert_eq!(w.prewarm_start(20, 7), None);
+        assert_eq!(w.prewarm_start(20, 6), None);
     }
 
     #[test]

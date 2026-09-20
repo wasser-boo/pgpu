@@ -455,11 +455,11 @@ pub async fn build_snapshot(app: &SharedApp) -> anyhow::Result<Snapshot> {
             }
             let idle_since = {
                 let last_req = app.traffic.snapshot(slot.id).last_request;
-                let created = crate::db::parse_iso(&row.created_at);
-                match (last_req, created) {
-                    (t, Some(c)) if t > 0 => Some(chrono::DateTime::from_timestamp(t, 0).unwrap_or(c)),
-                    (_, Some(c)) => Some(c), // frische Box: Idle zählt ab Creation
-                    _ => None,
+                match last_req {
+                    t if t > 0 => Some(chrono::DateTime::from_timestamp(t, 0).unwrap_or_default()),
+                    // Nach Warmup zählt die Idle-Uhr ab Healthy, nicht ab Miete
+                    // (sonst stoppt eine 50-min-Warmup-Box 29 s nach dem Flip).
+                    _ => row.healthy_since.as_deref().and_then(crate::db::parse_iso),
                 }
             };
             instances.push(InstanceSnapshot {
@@ -827,6 +827,7 @@ pub async fn create_instance(
         dph_total: offer.dph_total,
         storage_usd_h,
         created_at: crate::db::now_iso(),
+        healthy_since: None,
         stopped_since: None,
         destroyed_at: None,
         label: format!("praxis-{}-s{}", slot.role, slot_id),

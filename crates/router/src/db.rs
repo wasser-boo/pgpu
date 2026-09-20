@@ -44,6 +44,8 @@ pub struct InstanceRow {
     pub dph_total: f64,
     pub storage_usd_h: f64,
     pub created_at: String,
+    /// Wann die Box zuletzt Healthy wurde (Idle-Uhr-Basis nach Warmup).
+    pub healthy_since: Option<String>,
     pub stopped_since: Option<String>,
     pub destroyed_at: Option<String>,
     pub label: String,
@@ -178,6 +180,10 @@ impl Db {
             CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY, v TEXT NOT NULL);
             "#,
         )?;
+        // Nachtragsspalten (ALTER schlägt fehl wenn vorhanden — ignorieren):
+        // healthy_since: Idle-Uhr ab Healthy, nicht ab Miete — sonst stoppt
+        // eine Box mit 50-min-Warmup 29 s nach dem ersten Healthy (20.09.).
+        let _ = conn.execute_batch("ALTER TABLE instances ADD COLUMN healthy_since TEXT;");
         Ok(())
     }
 
@@ -330,10 +336,15 @@ impl Db {
         // Sekunden weiter und würde sonst "preempted → booting" zurücksetzen
         // (beobachtet 2026-09-20: 2 PREEMPTED-Events + Doppel-Fail für dieselbe
         // Instanz, Blacklist feuerte dadurch nach EINEM echten Vorfall).
+        // healthy_since: Idle-Uhr-Basis — nur beim echten Übergang setzen.
         conn.execute(
-            "UPDATE instances SET nb_ip=COALESCE(?2, nb_ip), healthy=?3, state=?4
+            "UPDATE instances SET nb_ip=COALESCE(?2, nb_ip), healthy=?3, state=?4,
+                healthy_since=CASE
+                    WHEN ?4='healthy' AND healthy_since IS NULL THEN ?5
+                    WHEN ?4!='healthy' THEN NULL
+                    ELSE healthy_since END
              WHERE vast_id=?1 AND state IN ('requested','provisioning','booting','agent_connected','healthy','unreachable')",
-            params![vast_id, nb_ip, healthy as i64, state],
+            params![vast_id, nb_ip, healthy as i64, state, now_iso()],
         )?;
         Ok(())
     }
@@ -379,7 +390,9 @@ impl Db {
         conn.execute(
             "UPDATE instances SET state=?2,
                 stopped_since=CASE WHEN ?2='stopped' AND stopped_since IS NULL THEN ?3 ELSE stopped_since END,
-                stopped_since=CASE WHEN ?2!='stopped' THEN NULL ELSE stopped_since END
+                stopped_since=CASE WHEN ?2!='stopped' THEN NULL ELSE stopped_since END,
+                healthy_since=CASE WHEN ?2='healthy' AND healthy_since IS NULL THEN ?3 ELSE healthy_since END,
+                healthy_since=CASE WHEN ?2!='healthy' THEN NULL ELSE healthy_since END
              WHERE vast_id=?1",
             params![vast_id, state, now_iso()],
         )?;
@@ -461,6 +474,7 @@ impl Db {
             dph_total: r.get("dph_total")?,
             storage_usd_h: r.get("storage_usd_h")?,
             created_at: r.get("created_at")?,
+            healthy_since: r.get("healthy_since")?,
             stopped_since: r.get("stopped_since")?,
             destroyed_at: r.get("destroyed_at")?,
             label: r.get("label")?,

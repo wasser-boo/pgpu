@@ -458,6 +458,24 @@ fn preempted_after_healthy_is_kept() {
 }
 
 #[test]
+fn fresh_healthy_box_is_not_instantly_stopped_after_long_warmup() {
+    // Regression 2026-09-20: Box mit 50-min-Warmup wurde 29 s nach dem Flip
+    // gestoppt — Idle zählte ab Creation statt ab Healthy. Erwartung:
+    // healthy ohne idle_since (nie Traffic) → NICHT stoppen.
+    let a = inst(41, 1, Role::Llm, InstanceState::Healthy);
+    let mut s = snap(vec![slot(1, Role::Llm, vec![a], Some(41))]);
+    s.slots[0].instances[0].idle_since = None; // frisch geflippt, kein Traffic
+    let actions = decide(&s, &cfg());
+    assert!(!actions.iter().any(|x| matches!(x, Action::Stop { .. })), "{actions:?}");
+
+    // Nach stop_after ab Healthy → Stop ist korrekt.
+    let mut s2 = s.clone();
+    s2.slots[0].instances[0].idle_since = Some(now() - chrono::Duration::seconds(1000));
+    let actions2 = decide(&s2, &cfg());
+    assert!(actions2.iter().any(|x| matches!(x, Action::Stop { instance_id: 41, .. })), "{actions2:?}");
+}
+
+#[test]
 fn fresh_box_after_midnight_is_not_hard_stopped() {
     // Regressions-Test: frisch gemietete 0.12 $/h-Box kurz nach Mitternacht.
     // Alte Semantik rechnete bis Mitternacht (23.6 h × 0.12 = 2.83 ≥ 2.59

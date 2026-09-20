@@ -510,23 +510,25 @@ pub fn decide(snap: &Snapshot, cfg: &PolicyConfig) -> Vec<Action> {
             // Bei laufendem Ersatz-Swap kein Idle-Stop: die alte Instanz
             // haelt den Slot warm, bis das Replacement healthy ist.
             if !pinned && !replacement_queued && inst.state == InstanceState::Healthy && !inst.busy && slot.in_flight == 0 {
-                // idle_since None = noch kein Traffic: Idle zählt ab Creation.
-                let idle_base = inst.idle_since.unwrap_or(inst.created_at);
-                let idle_secs = (snap.now - idle_base).num_seconds();
-                let stop_after = match &inst.lifecycle {
-                    praxis_common::Lifecycle::Sleep { stop_after_idle_s, .. } => *stop_after_idle_s,
-                    _ => scfg.idle.stop_after_s,
-                };
-                let over_soft_idle = snap.spent_today_usd >= soft_usd && idle_secs > 0;
-                if idle_secs >= stop_after || over_soft_idle {
-                    actions.push(Action::Stop {
-                        instance_id: inst.vast_id,
-                        reason: if over_soft_idle {
-                            format!("idle + budget soft cap: stop sofort ({idle_secs}s idle)")
-                        } else {
-                            format!("idle seit {idle_secs}s (stop_after {stop_after}s)")
-                        },
-                    });
+                // Idle-Uhr: letzter Traffic ODER Healthy-Werden — ohne beides
+                // (frisch geflippt, noch nie Traffic) läuft sie noch nicht.
+                if let Some(idle_base) = inst.idle_since {
+                    let idle_secs = (snap.now - idle_base).num_seconds();
+                    let stop_after = match &inst.lifecycle {
+                        praxis_common::Lifecycle::Sleep { stop_after_idle_s, .. } => *stop_after_idle_s,
+                        _ => scfg.idle.stop_after_s,
+                    };
+                    let over_soft_idle = snap.spent_today_usd >= soft_usd && idle_secs > 0;
+                    if idle_secs >= stop_after || over_soft_idle {
+                        actions.push(Action::Stop {
+                            instance_id: inst.vast_id,
+                            reason: if over_soft_idle {
+                                format!("idle + budget soft cap: stop sofort ({idle_secs}s idle)")
+                            } else {
+                                format!("idle seit {idle_secs}s (stop_after {stop_after}s)")
+                            },
+                        });
+                    }
                 }
             }
         }
@@ -600,7 +602,7 @@ pub fn decide(snap: &Snapshot, cfg: &PolicyConfig) -> Vec<Action> {
                                     reason: format!("schedule {spec}: Fenster aktiv"),
                                 });
                             }
-                        } else if let Some(prewarm_min) = win.prewarm_start((*prewarm_s / 60).max(1) as u32) {
+                        } else if let Some(prewarm_min) = win.prewarm_start((*prewarm_s / 60).max(1) as u32, slot.local_weekday) {
                             if inst.state == InstanceState::Stopped
                                 && slot.local_minutes_of_day >= prewarm_min
                             {
