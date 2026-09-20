@@ -125,7 +125,7 @@ Was dazukam:
   durch, statt 5× zu failen).
 - ~~Budget zurück auf 2.0/2.4~~ ✅ — Slot 1 bleibt `on_demand`
   (Interruptible-Churn kostete den halben Tag, s. „Stand 20.09. mittags").
-- ~~pagent: Passwort/GATEWAY_API_KEY~~ ✅ 20.09. abends rotiert.
+- ~~pagent: Passwort/GATEWAY_API_KEY~~ ✅ 20.09. abends: SSH-Login + `GATEWAY_API_KEY` rotiert (altes Login gesperrt; neue Werte sicher notieren). Master-Passwort (`secrets.enc2`) bleibt bis zur Migration — es entfällt beim Compose-Umstieg (neuer Key via `gen-secrets.sh`) bzw. ist über `praxis onboard --interactive` → „Re-encrypt secrets with new password?" rotierbar.
 - **Media-TTS-E2E auf warmer Box**: Die frisch gemietete Media-Box hing
   ~3 h im Vast-Image-Pull (16,8 GB) und wurde vom Auto-Miete-Test-Stop
   beendet — der sprechende Pfad (TTS → X-Router-Job-Id → busy → WAV)
