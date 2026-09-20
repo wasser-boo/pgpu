@@ -325,8 +325,14 @@ impl Db {
 
     pub fn update_instance_agent(&self, vast_id: i64, nb_ip: Option<&str>, healthy: bool, state: &str) -> anyhow::Result<()> {
         let conn = self.0.lock().unwrap();
+        // Heartbeats dürfen nur aktive Zustände verschieben: Ein PREEMPTED/STOPPED/
+        // DESTROYED bleibt terminal — der Agent meldet nach dem Vast-Tod oft noch
+        // Sekunden weiter und würde sonst "preempted → booting" zurücksetzen
+        // (beobachtet 2026-09-20: 2 PREEMPTED-Events + Doppel-Fail für dieselbe
+        // Instanz, Blacklist feuerte dadurch nach EINEM echten Vorfall).
         conn.execute(
-            "UPDATE instances SET nb_ip=COALESCE(?2, nb_ip), healthy=?3, state=?4 WHERE vast_id=?1",
+            "UPDATE instances SET nb_ip=COALESCE(?2, nb_ip), healthy=?3, state=?4
+             WHERE vast_id=?1 AND state IN ('requested','provisioning','booting','agent_connected','healthy','unreachable')",
             params![vast_id, nb_ip, healthy as i64, state],
         )?;
         Ok(())
