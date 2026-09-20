@@ -213,14 +213,35 @@ impl Vast {
         }
         q["type"] = if interruptible { "bid".into() } else { "on-demand".into() };
         let url = format!("{BASE}/bundles/");
-        let resp = self
-            .http
-            .post(url)
-            .bearer_auth(&self.key)
-            .json(&q)
-            .send()
-            .await
-            .context("POST bundles")?;
+        // Wie alle anderen Calls durch den Throttle + 429-Retry — sonst wirft
+        // der Reconciler-Burst (2 Slots × 2 Modi) die Suche gegen das
+        // Vast-Ratelimit (5 req/s) und Create-Actions sterben an 429.
+        let mut resp = None;
+        for attempt in 0..3 {
+            self.throttle().await;
+            let r = self
+                .http
+                .post(url.clone())
+                .bearer_auth(&self.key)
+                .json(&q)
+                .send()
+                .await
+                .context("POST bundles")?;
+            if r.status().as_u16() == 429 && attempt < 2 {
+                let ra: f64 = r
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+                    .and_then(|v| v.get("retry_after").and_then(|x| x.as_f64()))
+                    .unwrap_or(3.0);
+                tracing::warn!(ra, "vast search 429 — warte und retry");
+                self.wait_429(ra).await;
+                continue;
+            }
+            resp = Some(r);
+            break;
+        }
+        let resp = resp.ok_or_else(|| anyhow!("vast search: zu viele Versuche"))?;
         let b: Bundles = self.parse(resp, "/bundles/").await?;
         Ok(b.offers)
     }
