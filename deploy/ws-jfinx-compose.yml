@@ -1,0 +1,36 @@
+# Workstation (wasser/Heimserver): jfinx-Zugang per Host-Netz-Container.
+#
+# Warum Host-Netz: wt1 landet im HOST-Namespace → Browser/curl/ssh auf
+# dieser Maschine erreichen die jfinx-Overlay-IPs direkt (100.110.x.y) —
+# GPU-Stack (Router :8080, Praxis :1337, Gateway :3537, ComfyUI :8188,
+# STT :2700, llama :11434-36). Die native tgrid-Instanz (wt0) läuft weiter
+# unberührt; Konfliktfreiheit regelt deploy/netbird-wt1.sh (Interface wt1,
+# WG-Port 51821, kein DNS).
+#
+# Start:  docker compose -f ws-jfinx-compose.yml up -d
+# Status: docker compose -f ws-jfinx-compose.yml exec jfinx netbird status
+#         ip a show wt1
+# Nie beide Instanzen ohne den Wrapper starten (wt0-Kollision im Host-NS).
+
+name: ws-jfinx
+
+services:
+  jfinx:
+    image: netbirdio/netbird:latest
+    container_name: ws-netbird-jfinx
+    network_mode: host
+    cap_add: [NET_ADMIN]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      NB_MANAGEMENT_URL: https://***REMOVED***
+      NB_SETUP_KEY: ***REMOVED*** # reusable operators-nas-workstation
+      NB_HOSTNAME: wasser-jfinx
+      NETBIRD_BIN: /usr/local/bin/netbird-wt1
+    volumes:
+      - ws-jfinx-config:/etc/netbird # Peer-Identität — nicht löschen!
+      - ./netbird-wt1.sh:/usr/local/bin/netbird-wt1:ro
+    restart: unless-stopped
+
+volumes:
+  ws-jfinx-config:
