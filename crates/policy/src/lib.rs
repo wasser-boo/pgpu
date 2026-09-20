@@ -531,6 +531,18 @@ pub fn decide(snap: &Snapshot, cfg: &PolicyConfig) -> Vec<Action> {
             }
         }
 
+        // --- Preempted-Aufräumen: nie healthy gewordene Boxen sind Müll
+        // (Vast hat sie beendet; Storage läuft bis destroy weiter). Healthy
+        // gewesene bleiben für Restart-Präferenz/manuelle Entscheidung.
+        for inst in &slot.instances {
+            if inst.state == InstanceState::Preempted && !inst.healthy && !inst.pinned {
+                actions.push(Action::Destroy {
+                    instance_id: inst.vast_id,
+                    reason: "preempted vor healthy — aufräumen (kein Warmhaltewert)".into(),
+                });
+            }
+        }
+
         // --- Destroy nach Stoppen (Storage-Kosten).
         for inst in &slot.instances {
             if inst.state == InstanceState::Stopped && !inst.pinned {
@@ -702,7 +714,17 @@ fn plan_create(
     if over_soft || over_monthly {
         return None;
     }
-    let slot_count = slot.instances.iter().filter(|i| i.state != InstanceState::Destroyed).count() as i64;
+    let slot_count = slot
+        .instances
+        .iter()
+        // Tote Instanzen belegen keinen Miet-Slot: preempted/failed sind
+        // weg (Vast GC't sie ggf. erst später), destroyed erst recht nicht.
+        // Sonst blockieren Zombies aus dem Wake-Churn jedes neue Create
+        // (beobachtet 2026-09-20: 2 preempted Warmup-Tode stoppten den Loop).
+        .filter(|i| {
+            !matches!(i.state, InstanceState::Preempted | InstanceState::Failed | InstanceState::Destroyed)
+        })
+        .count() as i64;
     if slot_count >= cfg.limits.max_per_slot {
         return None;
     }

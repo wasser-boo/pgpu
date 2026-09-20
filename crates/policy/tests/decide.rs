@@ -431,6 +431,33 @@ fn offer_score_weights_reliability2() {
     assert!((terrible.score(60, 0.0, 4.0) - 0.100 / 0.5).abs() < 1e-9);
 }
 #[test]
+fn preempted_warmup_death_is_destroyed_and_frees_slot_quota() {
+    // Wake-Churn 2026-09-20: zwei preempted Warmup-Todes blockierten via
+    // max_per_slot jedes neue Create. Erwartung: aufräumen + neu mieten.
+    let mut z1 = inst(31, 1, Role::Llm, InstanceState::Preempted);
+    z1.healthy = false;
+    z1.actual_status = "exited".into();
+    let mut z2 = inst(32, 1, Role::Llm, InstanceState::Preempted);
+    z2.healthy = false;
+    z2.actual_status = "exited".into();
+    let mut s = snap(vec![slot(1, Role::Llm, vec![z1, z2], None)]);
+    s.slots[0].desired_running = true;
+    let actions = decide(&s, &cfg());
+    assert!(actions.iter().any(|x| matches!(x, Action::Destroy { instance_id: 31, .. })), "{actions:?}");
+    assert!(actions.iter().any(|x| matches!(x, Action::Create { slot_id: 1, .. })), "{actions:?}");
+}
+
+#[test]
+fn preempted_after_healthy_is_kept() {
+    // Healthy-gewesene Box wird NICHT aufgeräumt (Restart-Präferenz).
+    let mut h = inst(33, 1, Role::Llm, InstanceState::Preempted);
+    h.healthy = true;
+    let s = snap(vec![slot(1, Role::Llm, vec![h], Some(33))]);
+    let actions = decide(&s, &cfg());
+    assert!(!actions.iter().any(|x| matches!(x, Action::Destroy { .. })), "{actions:?}");
+}
+
+#[test]
 fn fresh_box_after_midnight_is_not_hard_stopped() {
     // Regressions-Test: frisch gemietete 0.12 $/h-Box kurz nach Mitternacht.
     // Alte Semantik rechnete bis Mitternacht (23.6 h × 0.12 = 2.83 ≥ 2.59
