@@ -331,12 +331,13 @@ pub async fn passthrough(
     proxy_to_target(&app, &client, &target, Some(slot_id), req, path).await
 }
 
-/// `/gpu/<slot>/<svc>/...`
+/// `/gpu/<slot>/<svc>/...` — Präfix strippen, Rest als Pfad an den Service.
 pub async fn gpu_path(
     app: AppCtx,
     Path((slot_id, service)): Path<(i64, String)>,
     req: Request,
 ) -> Response {
+    let req = strip_path_segments(req, 3); // "/gpu/<slot>/<svc>"
     passthrough(app.0, slot_id, service, req).await
 }
 
@@ -346,6 +347,7 @@ pub async fn inst_path(
     Path((vast_id, service)): Path<(i64, String)>,
     req: Request,
 ) -> Response {
+    let req = strip_path_segments(req, 3); // "/inst/<id>/<svc>"
     let Some(inst) = app.db.instance(vast_id) else {
         return service_unavailable(vast_id, "unknown_instance");
     };
@@ -369,6 +371,32 @@ pub async fn inst_path(
     let client = http_client();
     let req = Request::from_parts(parts, body);
     proxy_to_target(&app.0, &client, &target, Some(inst.slot_id), req, path).await
+}
+
+/// Entfernt die ersten `n` Pfad-Segmente (plus führenden Slash) aus der
+/// Request-URI — für `/gpu/<slot>/<svc>/…` und `/inst/<id>/<svc>/…`, damit der
+/// Upstream nur den Rest sieht (sonst 404 im Backend).
+fn strip_path_segments(req: Request, n: usize) -> Request {
+    let (mut parts, body) = req.into_parts();
+    if let Some(pq) = parts.uri.path_and_query() {
+        let raw_path = pq.path();
+        let query = pq.query().map(|q| q.to_string());
+        let rest = raw_path
+            .splitn(n + 2, '/')
+            .skip(n + 1)
+            .next()
+            .unwrap_or("")
+            .trim_end_matches('/');
+        let new_path = if rest.is_empty() { "/".to_string() } else { format!("/{rest}") };
+        let new_uri = match query {
+            Some(q) => format!("{new_path}?{q}"),
+            None => new_path,
+        };
+        if let Ok(uri) = new_uri.parse::<axum::http::Uri>() {
+            parts.uri = uri;
+        }
+    }
+    Request::from_parts(parts, body)
 }
 
 /// STT im Router-Compose (mode=local). WS-Sessions zählen fürs Dashboard.

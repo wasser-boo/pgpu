@@ -440,11 +440,18 @@ pub async fn instance_cmd(app: AppCtx, Path((vast_id, cmd)): Path<(i64, String)>
     let body = axum::body::to_bytes(req.into_body(), 64 * 1024).await.unwrap_or_default();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
     let service = payload.get("service").and_then(|s| s.as_str()).unwrap_or("llama-chat").to_string();
+    // sync_assets: Router PUSHt (Outbound-Pull der Boxen ist auf Vast
+    // unzuverlässig) — gleichet Primitiv wie nach Session-Aufbau.
+    if cmd == "sync_assets" {
+        return match crate::assets::push_assets(&app.0, vast_id).await {
+            Ok(v) => Json(v).into_response(),
+            Err(e) => (StatusCode::BAD_GATEWAY, format!("{e}")).into_response(),
+        };
+    }
     let command = match cmd.as_str() {
         "restart" => praxis_common::node::Command::RestartService { service },
         "stop" => praxis_common::node::Command::StopService { service },
         "start" => praxis_common::node::Command::StartService { service },
-        "sync_assets" => praxis_common::node::Command::SyncAssets,
         "run_acceptance" => praxis_common::node::Command::RunAcceptance,
         "nvidia-smi" => praxis_common::node::Command::Exec {
             argv: vec!["nvidia-smi".into()],

@@ -109,6 +109,11 @@ pub struct NetbirdCfg {
     pub setup_key: String,
     #[serde(default = "d_group")]
     pub group: String,
+    /// Auto-Gruppen für gemintete Setup-Keys (Namen ODER IDs). Boxen müssen in
+    /// der Zugriffs-Gruppe der Router-/Dev-Policy sein (z. B. "servers", damit
+    /// developers→servers greift) UND in der GPU-Gruppe für gpu→router:8080.
+    #[serde(default)]
+    pub groups: Vec<String>,
     /// NetBird-IP des Router-Hosts (wie Agents ihn erreichen).
     #[serde(default)]
     pub router_nb_ip: String,

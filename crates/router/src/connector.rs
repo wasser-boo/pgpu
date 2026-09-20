@@ -11,7 +11,6 @@ use crate::state::SharedApp;
 use anyhow::Result;
 use futures::{SinkExt, StreamExt};
 use praxis_common::node::NodeMessage;
-use praxis_common::node::RouterCommand;
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -49,7 +48,17 @@ async fn tick(app: &SharedApp) -> Result<()> {
             continue;
         }
         let hostname = format!("gpu-{}-{}", crate::api::role_str(inst.role), &inst.node_token[..8]);
-        let Some(ip) = peers.iter().find(|(n, _)| n == &hostname).map(|(_, ip)| ip.clone()) else {
+        // Peer über Name ODER hostname-Feld ODER dns_label finden: --hostname
+        // setzt `name`, aber ältere Enrollments/umbenannte Peers können auch
+        // nur in einem der Felder auftauchen (dns_label ggf. mit -xx-yy-Suffix
+        // dedupliziert). Vast-Boxen ohne den Fork-Patch enrollen unter
+        // Container-ID → dann bleibt nur der nb_ip-Fallback.
+        let ip = peers
+            .iter()
+            .find(|p| p.matches(&hostname))
+            .map(|p| p.ip.clone())
+            .or_else(|| inst.nb_ip.clone());
+        let Some(ip) = ip else {
             continue;
         };
         if inst.nb_ip.as_deref() != Some(ip.as_str()) {
@@ -71,8 +80,30 @@ async fn tick(app: &SharedApp) -> Result<()> {
     Ok(())
 }
 
-/// NetBird-Peers via Management-API (name → ip).
-async fn fetch_peers(app: &SharedApp) -> Result<Vec<(String, String)>> {
+/// NetBird-Peers via Management-API (name/hostname/dns_label → ip).
+#[derive(Debug, Clone)]
+struct PeerInfo {
+    name: String,
+    hostname: String,
+    dns_label: String,
+    ip: String,
+}
+
+impl PeerInfo {
+    /// Entspricht der erwarteten Router-seitigen Hostname-Konvention
+    /// `gpu-<role>-<tok8>` in jedem der drei Namensfelder.
+    fn matches(&self, expected: &str) -> bool {
+        let exp = expected.to_ascii_lowercase();
+        if self.name.eq_ignore_ascii_case(expected) || self.hostname.eq_ignore_ascii_case(expected) {
+            return true;
+        }
+        // dns_label ist lowercased; Suffixe: ".<domain>" oder dedup "-xx-yy".
+        let dl = self.dns_label.as_str();
+        dl == exp || dl.starts_with(&format!("{exp}.")) || dl.starts_with(&format!("{exp}-"))
+    }
+}
+
+async fn fetch_peers(app: &SharedApp) -> Result<Vec<PeerInfo>> {
     let token = app.cfg.netbird.api_token.clone();
     if token.is_empty() {
         return Ok(vec![]);
@@ -88,9 +119,11 @@ async fn fetch_peers(app: &SharedApp) -> Result<Vec<(String, String)>> {
     Ok(peers
         .iter()
         .filter_map(|p| {
-            let name = p.get("name").and_then(|n| n.as_str())?.to_string();
-            let ip = p.get("ip").and_then(|i| i.as_str())?.to_string();
-            Some((name, ip))
+            let name = p.get("name").and_then(|n| n.as_str())?;
+            let ip = p.get("ip").and_then(|i| i.as_str())?;
+            let hostname = p.get("hostname").and_then(|h| h.as_str()).unwrap_or("");
+            let dns_label = p.get("dns_label").and_then(|d| d.as_str()).unwrap_or("");
+            Some(PeerInfo { name: name.to_string(), hostname: hostname.to_string(), dns_label: dns_label.to_string(), ip: ip.to_string() })
         })
         .collect())
 }
@@ -131,6 +164,17 @@ async fn dial_session(app: &SharedApp, ip: &str, expect_token: &str) -> Result<(
     let _ = app.db.update_instance_agent(vast_id, nb_ip.as_deref(), false, "agent_connected");
     let mut rx = app.hub.register(vast_id, inst.slot_id, nb_ip.clone(), services.clone());
     app.reconcile_now.notify_one();
+
+    // Asset-Push nach Hello (Outbound-Pull der Boxen ist auf Vast unzuverlässlich
+    // — der Router schiebt Manifest + Bytes über genau diese Session).
+    {
+        let app2 = app.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::assets::push_assets(&app2, vast_id).await {
+                tracing::warn!(%e, vast_id, "asset-push fehlgeschlagen");
+            }
+        });
+    }
 
     let mut last_health: Option<serde_json::Value> = None;
     loop {

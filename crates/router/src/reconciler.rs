@@ -122,7 +122,7 @@ async fn sync_vast(app: &SharedApp, list: &[praxis_vast::Instance]) -> anyhow::R
 
         // Preemption: wir WOLLEN running, Vast sagt nein.
         let intended_run = v.intended_or("").is_empty() || v.intended_or("") == "running" || row.intended_status == "running";
-        let actually_dead = matches!(v.actual_or("").as_str(), "stopped" | "error" | "deleted")
+        let actually_dead = matches!(v.actual_or("").as_str(), "stopped" | "exited" | "error" | "deleted")
             || v.cur_state.as_deref() == Some("stopped");
         if intended_run && actually_dead && !matches!(row.state.as_str(), "preempted" | "stopped" | "destroyed" | "draining" | "failed") {
             let _ = app.db.set_instance_state(row.vast_id, "preempted");
@@ -132,8 +132,8 @@ async fn sync_vast(app: &SharedApp, list: &[praxis_vast::Instance]) -> anyhow::R
                 Some(row.slot_id),
                 Some(row.vast_id),
                 &format!(
-                    "Instanz {} ({}) von Vast weggebrochen: actual={} intended={} min_bid={:.4} bid={:.4}",
-                    row.vast_id, row.gpu_name, v.actual_or("?"), v.intended_or("?"), v.min_bid.unwrap_or(0.0), row.bid_usd_h
+                    "Instanz {} ({}) von Vast weggebrochen: actual={} cur_state={:?} intended={} min_bid={:.4} bid={:.4}",
+                    row.vast_id, row.gpu_name, v.actual_or("?"), v.cur_state, v.intended_or("?"), v.min_bid.unwrap_or(0.0), row.bid_usd_h
                 ),
                 &serde_json::json!({"min_bid": v.min_bid.unwrap_or(0.0), "bid": row.bid_usd_h}),
             );
@@ -566,10 +566,17 @@ async fn mint_netbird_key(app: &SharedApp, name: &str) -> anyhow::Result<String>
     let client = reqwest::Client::new();
     let base = app.cfg.netbird.api_url.trim_end_matches('/').to_string();
 
-    // Gruppennamen (Config) → Management-ID auflösen (auto_groups will IDs).
-    let group_cfg = app.cfg.netbird.group.clone();
-    let group_id: String = if group_cfg.is_empty() {
-        String::new()
+    // Gruppennamen (Config) → Management-IDs auflösen (auto_groups will IDs).
+    // `groups` (Liste) schlägt das Legacy-Feld `group` (String).
+    let mut wanted: Vec<String> = app.cfg.netbird.groups.clone();
+    if wanted.is_empty() {
+        let legacy = app.cfg.netbird.group.clone();
+        if !legacy.is_empty() {
+            wanted.push(legacy);
+        }
+    }
+    let group_ids: Vec<String> = if wanted.is_empty() {
+        vec![]
     } else {
         let resp = client
             .get(format!("{base}/api/groups"))
@@ -580,14 +587,19 @@ async fn mint_netbird_key(app: &SharedApp, name: &str) -> anyhow::Result<String>
         match resp {
             Ok(r) if r.status().is_success() => {
                 let groups: Vec<serde_json::Value> = r.json().await.unwrap_or_default();
-                groups
+                wanted
                     .iter()
-                    .find(|g| g.get("name").and_then(|n| n.as_str()) == Some(group_cfg.as_str()))
-                    .and_then(|g| g.get("id").and_then(|i| i.as_str()))
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| group_cfg.clone()) // evtl. direkt ID konfiguriert
+                    .map(|w| {
+                        groups
+                            .iter()
+                            .find(|g| g.get("name").and_then(|n| n.as_str()) == Some(w.as_str()))
+                            .and_then(|g| g.get("id").and_then(|i| i.as_str()))
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| w.clone()) // evtl. direkt ID konfiguriert
+                    })
+                    .collect()
             }
-            _ => group_cfg.clone(),
+            _ => wanted,
         }
     };
 
@@ -601,8 +613,8 @@ async fn mint_netbird_key(app: &SharedApp, name: &str) -> anyhow::Result<String>
         "usage_limit": 1,
         "expires_in": 3600,
     });
-    if !group_id.is_empty() {
-        body["auto_groups"] = serde_json::json!([group_id]);
+    if !group_ids.is_empty() {
+        body["auto_groups"] = serde_json::json!(group_ids);
     }
     let resp = client
         .post(format!("{base}/api/setup-keys"))
@@ -803,6 +815,7 @@ pub async fn destroy_instance(app: &SharedApp, vast_id: i64, reason: &str) -> an
     app.events.emit(&app.db, "instance_destroyed", Some(inst.slot_id), Some(vast_id), reason, &serde_json::json!({}));
     let app2 = app.clone();
     let vast_id2 = vast_id;
+    let hostname2 = format!("gpu-{}-{}", crate::api::role_str(inst.role), &inst.node_token[..8]);
     tokio::spawn(async move {
         let vast_client = app2.vast.lock().unwrap().clone();
         if let Some(vast) = vast_client {
@@ -810,6 +823,60 @@ pub async fn destroy_instance(app: &SharedApp, vast_id: i64, reason: &str) -> an
                 tracing::warn!(%e, vast_id = vast_id2, "vast destroy failed (ggf. schon weg)");
             }
         }
+        // NetBird-Peer der Box aufräumen (nicht-ephemeral → bleibt sonst als
+        // Leiche: IP reserviert, Peer-Rauschen in tgrid).
+        if let Err(e) = netbird_delete_peer(&app2, &hostname2).await {
+            tracing::warn!(%e, vast_id = vast_id2, %hostname2, "netbird peer cleanup fehlgeschlagen");
+        }
     });
+    Ok(())
+}
+
+/// NetBird-Peer nach Hostname (gpu-<role>-<tok8>) suchen und löschen.
+/// Match wie im Connector: name ODER hostname-Feld ODER dns_label-Präfix.
+async fn netbird_delete_peer(app: &SharedApp, hostname: &str) -> anyhow::Result<()> {
+    let token = app.cfg.netbird.api_token.clone();
+    if token.is_empty() {
+        return Ok(());
+    }
+    let base = app.cfg.netbird.api_url.trim_end_matches('/');
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/api/peers"))
+        .bearer_auth(&token)
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await?;
+    let peers: Vec<serde_json::Value> = resp.json().await.unwrap_or_default();
+    let exp = hostname.to_ascii_lowercase();
+    let peer_id = peers.iter().find_map(|p| {
+        let name = p.get("name").and_then(|n| n.as_str())?;
+        let ip = p.get("ip").and_then(|i| i.as_str())?;
+        let hostname_f = p.get("hostname").and_then(|h| h.as_str()).unwrap_or("");
+        let dns = p.get("dns_label").and_then(|d| d.as_str()).unwrap_or("");
+        let hit = name.eq_ignore_ascii_case(hostname)
+            || hostname_f.eq_ignore_ascii_case(hostname)
+            || dns.starts_with(&format!("{exp}."))
+            || dns.starts_with(&format!("{exp}-"));
+        if hit {
+            p.get("id").and_then(|i| i.as_str()).map(|s| (s.to_string(), ip.to_string()))
+        } else {
+            None
+        }
+    });
+    let Some((peer_id, ip)) = peer_id else {
+        tracing::debug!(%hostname, "kein NetBird-Peer zum Löschen gefunden");
+        return Ok(());
+    };
+    let resp = reqwest::Client::new()
+        .delete(format!("{base}/api/peers/{peer_id}"))
+        .bearer_auth(&token)
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await?;
+    if resp.status().is_success() {
+        tracing::info!(%hostname, %ip, "NetBird-Peer gelöscht (destroy-Hygiene)");
+    } else {
+        anyhow::bail!("netbird peer delete {}: {}", peer_id, resp.status());
+    }
     Ok(())
 }

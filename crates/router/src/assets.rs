@@ -10,9 +10,124 @@ use axum::extract::{Path, Request};
 use axum::http::{header, StatusCode};
 use axum::http::HeaderValue;
 use axum::response::{IntoResponse, Response};
-use praxis_common::node::{AssetEntry, AssetManifest};
+use praxis_common::node::{AssetEntry, AssetManifest, Command, RouterCommand};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::{Path as StdPath, PathBuf};
+
+/// Assets über die Agent-WS-Session PUSHEN — der HTTP-Pull der Boxen ist auf
+/// Vast blockiert (Outbound bräuchte eBPF). Ablauf: Manifest schicken →
+/// Agent antwortet mit fehlenden IDs → Bytes Base64 (kleine Dateien ≤ 48 MB;
+/// große Caches bleiben bewusst außen vor). Idempotent, aufrufbar nach
+/// Session-Aufbau und nach Dashboard-Uploads.
+pub async fn push_assets(app: &SharedApp, vast_id: i64) -> anyhow::Result<serde_json::Value> {
+    let Some(inst) = app.db.instance(vast_id) else {
+        anyhow::bail!("Instanz {vast_id} unbekannt");
+    };
+    let role = crate::api::role_str(inst.role);
+    let manifest = manifest_for_role(app, &role);
+    if manifest.assets.is_empty() {
+        return Ok(serde_json::json!({"pushed": 0, "note": "keine Assets konfiguriert"}));
+    }
+
+    // Dateipfade parallel zu den Manifest-IDs (id = "<gruppenlabel>:<name>").
+    let mut paths: HashMap<String, PathBuf> = HashMap::new();
+    for dir in dirs_for_role(app, &role) {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            let Some(name) = p.file_name().and_then(|n| n.to_str()) else { continue };
+            if name.ends_with(".meta.toml") {
+                continue;
+            }
+            paths.insert(format!("{}:{}", dir_relative_label(&p, app), name), p);
+        }
+    }
+
+    // 1. Manifest pushen → Agent prüft lokal (size+sha) und nennt Fehlendes.
+    let data = app
+        .hub
+        .command(vast_id, |id| RouterCommand::Cmd {
+            id,
+            command: Command::PushAssetsManifest { manifest: manifest.assets.clone() },
+        })
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let needed: Vec<String> = data
+        .get("needed")
+        .and_then(|n| serde_json::from_value(n.clone()).ok())
+        .unwrap_or_default();
+    let required_missing: Vec<String> = data
+        .get("required_missing")
+        .and_then(|n| serde_json::from_value(n.clone()).ok())
+        .unwrap_or_default();
+
+    // 2. Fehlende Dateien einzeln pushen (Base64 über WS).
+    let mut pushed = 0usize;
+    let mut failed: Vec<String> = Vec::new();
+    for id in &needed {
+        let Some(entry) = manifest.assets.iter().find(|a| &a.id == id) else {
+            failed.push(format!("{id}: nicht im Manifest"));
+            continue;
+        };
+        let Some(path) = paths.get(id) else {
+            failed.push(format!("{id}: Datei fehlt im Router-Volume"));
+            continue;
+        };
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                failed.push(format!("{id}: lesen fehlgeschlagen: {e}"));
+                continue;
+            }
+        };
+        if bytes.len() > 48 * 1024 * 1024 {
+            failed.push(format!("{id}: {} MB — zu groß für WS-Push (bleibt lokal/HTTP)", bytes.len() / 1_048_576));
+            continue;
+        }
+        let data_b64 = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(&bytes)
+        };
+        let res = app
+            .hub
+            .command(vast_id, |cid| RouterCommand::Cmd {
+                id: cid,
+                command: Command::PushAssetData { entry: entry.clone(), data_b64 },
+            })
+            .await;
+        match res {
+            Ok(v) => {
+                pushed += 1;
+                tracing::info!(id, target = v.get("target").and_then(|t| t.as_str()).unwrap_or(""), "asset gepusht");
+            }
+            Err(e) => failed.push(format!("{id}: {e}")),
+        }
+    }
+
+    let summary = serde_json::json!({
+        "pushed": pushed,
+        "needed": needed.len(),
+        "required_missing": required_missing,
+        "failed": failed,
+    });
+    app.events.emit(
+        &app.db,
+        "assets_pushed",
+        Some(inst.slot_id),
+        Some(vast_id),
+        &format!(
+            "Assets gepusht: {pushed} geschrieben, {} übersprungen, {} fehlgeschlagen",
+            needed.len().saturating_sub(pushed),
+            failed.len()
+        ),
+        &summary,
+    );
+    if !failed.is_empty() || !required_missing.is_empty() {
+        anyhow::bail!("Asset-Push unvollständig: {} fehlgeschlagen, {} Pflicht-Assets fehlen", failed.len(), required_missing.len());
+    }
+    Ok(summary)
+}
 
 const ALL: &str = "all";
 

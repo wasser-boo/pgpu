@@ -70,6 +70,16 @@ async fn node_session(app: SharedApp, socket: WebSocket) {
     rx = Some(app.hub.register(vast_id, inst.slot_id, nb_ip.clone(), services));
     app.reconcile_now.notify_one();
 
+    // Asset-Push (Call-home-Pfad: gleiche Session, Router schiebt).
+    {
+        let app2 = app.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::assets::push_assets(&app2, vast_id).await {
+                tracing::warn!(%e, vast_id, "asset-push fehlgeschlagen");
+            }
+        });
+    }
+
     let mut last_health: Option<serde_json::Value> = None;
     loop {
         tokio::select! {

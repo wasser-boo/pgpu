@@ -120,6 +120,13 @@ pub enum Command {
     /// Interaktive bash-Session (Pipes, kein vty) für das Dashboard-Terminal.
     TermOpen { cols: u16, rows: u16 },
     SyncAssets,
+    /// Push über die WS-Session (Outbound der Boxen ist auf Vast tot):
+    /// Router schickt das Manifest; der Agent prüft lokal und antwortet
+    /// (cmd_result) mit den fehlenden IDs.
+    PushAssetsManifest { manifest: Vec<AssetEntry> },
+    /// Push: Asset-Bytes Base64 (kleine Dateien; große Caches bleiben
+    /// lokal/HTTP). Agent schreibt, prüft SHA, chmod, restartet Service.
+    PushAssetData { entry: AssetEntry, data_b64: String },
     RunAcceptance,
     /// Busy-Flag am Agent setzen (Router meint: Drain/Fertig).
     Drain,

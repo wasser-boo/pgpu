@@ -366,9 +366,14 @@ pub fn decide(snap: &Snapshot, cfg: &PolicyConfig) -> Vec<Action> {
         }
 
         // --- Wake: Slot soll laufen, aber kein Backer da.
+        // Warming-Gate: Existiert bereits eine Instanz in aktivem Zustand
+        // (booting/healthy/connecting/draining — auch unabgeflipte), ist ein
+        // Backer unterwegs → NICHT erneut mieten. Sonst mietet der Wake-Zweig
+        // direkt nach dem Flip (active noch None) eine Zweitbox.
         if slot.desired_running && !slot_pinned {
             let running = active.map(|a| a.is_running()).unwrap_or(false);
-            if !running {
+            let warming = slot.instances.iter().any(|i| i.state.is_active());
+            if !running && !warming {
                 if let Some(stopped) = slot
                     .instances
                     .iter()

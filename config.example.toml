@@ -24,6 +24,10 @@ offer_poll_s = 60
 # management_url = "https://api.netbird.io"  # PEER-Enrollment-Ziel (NB_MANAGEMENT_URL auf den Boxen)!
 setup_key = ""
 group = "gpu"
+# Auto-Gruppen der geminteten Keys (Namen oder IDs). Die Boxen MÜSSEN in der
+# Gruppe sein, die eure Router-/Entwicklungs-Policy erlaubt (z. B. "servers"
+# für developers→servers) — sonst findet der Router-Dial die :9100 nicht.
+groups = ["gpu", "servers"]
 router_nb_ip = "100.64.0.1"  # NetBird-IP des Router-Hosts (Agents callen home)
 router_nb_port = 8080
 

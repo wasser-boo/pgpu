@@ -128,7 +128,7 @@ async fn async_main() -> Result<()> {
         .route("/api/v1/instances", post(api::instance_create))
         .route("/api/v1/instances/:id/:action", post(api::instance_action))
         .route("/api/v1/instances/:id/logs", get(api::instance_logs))
-        .route("/api/v1/instances/:id/cmd", post(api::instance_cmd))
+        .route("/api/v1/instances/:id/cmd/:cmd", post(api::instance_cmd))
         .route("/api/v1/instances/:id/ws/term", get(api::term_ws))
         .route("/gpu/:slot/:svc/*path", any_of_proxy())
         .route("/gpu/:slot/:svc", any_of_proxy())
