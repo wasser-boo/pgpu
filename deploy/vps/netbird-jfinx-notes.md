@@ -36,15 +36,33 @@ Start keine Offers/Instances sieht: /api/v0→/api/v1 in crates/vast
 (BASE-Konstante) prüfen. Vast-Konto hat aktuell 0 Instanzen.
 
 Offen nach NAS-Start:
-1. tgrid aufräumen: tote GPU-Peers/-Keys, toten praxis-vps-Peer
-   (***REMOVED***) löschen — tgrid-PAT liegt als NB_API_TOKEN in deploy/.env.
-2. Budget in deploy/nas/vps/config.toml nach Stabilisierung auf 2.0/2.4
+1. Budget in deploy/nas/vps/config.toml nach Stabilisierung auf 2.0/2.4
    (Achtung: blockiert evtl. den ersten kompletten Pool-Refill, s. Kommentar).
-3. Optional Heimserver-Daten übernehmen (alpine-tar pro Volume):
+2. Optional Heimserver-Daten übernehmen (alpine-tar pro Volume):
    praxis-data (Chats), router-data (Metering+Host-Blacklist), stt-models.
-4. Workstation dual-enroll für jfinx (Operators-Key), wenn Browser-Zugriff
-   vom Arbeitsplatz gewünscht — das NAS bringt sein eigenes jfinx-Access-
-   NetBird mit.
+
+Erledigt (21.09. nachts): ✅ toter tgrid-`praxis-vps`-Peer (***REMOVED***,
+alter Heimserver) per API gelöscht; ✅ Workstation dual-enroll
+(`deploy/ws-jfinx-compose.yml`: jfinx als Host-Netz-Container, wt1/WG-51821/
+no-DNS via `netbird-wt1.sh`, live bewiesen: Router/Praxis/Gateway von der
+Workstation erreichbar); ✅ Multi-Arch-Images (router 0.15, praxis 0.5,
+stt 0.2 mit libatomic1-Fix — NAS=arm64 läuft); ✅ STT-Provisioning mit
+wget-Resume/Retries.
+
+## Stack-Bein in tgrid (21.09. nachts) — Router AUS tgrid erreichbar
+`deploy/nas/docker-compose.yml` hat den Service `netbird-tgrid`: ZWEITER
+NetBird im Stack-Netns (network_mode: service:netbird) mit Interface wt1,
+WG-Port 51821, DNS aus (alles regelt `deploy/nas/netbird-wt1.sh`, gleiche
+Wrapper-Datei wie Workstation). Peer-Name „praxis-vps", Gruppen servers+test,
+reusable Key „praxis-vps-nas" `***REMOVED***`
+(bis 20.09.2027; tgrid-API: expires_in in SEKUNDEN!). Damit greifen die
+tgrid-ACLs: developers→servers:ALLE (volle Nutzung von allen dev-
+Maschinen) + Gpuaccess→test:8080,8188,2700,11434-36 (Legacy). Muster live
+getestet (Testpair mit Dummy-HTTP: aus beiden Netzen HTTP 200 auf dieselbe
+Netns-IP; Test-Peers danach gelöscht). Router bleibt parallel via jfinx
+erreichbar (wt0) — Boxen/Agents laufen NUR über jfinx.
+⚠️ Sicherheit: Das tgrid-Bein umgeht die jfinx-ACLs für tgrid-devs
+(entwurfsgemäß gewollt — Nutzer-Entscheidung 21.09.).
 
 ## NAS: fertig ✅ (20.09. abends II) — zwei Artefakte
 1. `deploy/nas-compose.yml` — NUR die beiden Access-NetBirds (Bridge-Netns,
