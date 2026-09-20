@@ -1,0 +1,66 @@
+# NAS — Dual-NetBird: ein Peer in tgrid, ein Peer in jfinx (GPU-Netz).
+#
+# Zero-Config: Setup-Keys + Management-URLs sind eingebacken — nur
+# `docker compose -f nas-compose.yml up -d` starten. Voraussetzungen auf
+# dem NAS: Docker + Compose v2, /dev/net/tun (haben die anderen NetBird-
+# Stacks schon: jellyfin/immich/… laufen nach demselben Muster).
+#
+# Was hier enrollt:
+#   * netbird-tgrid → https://***REMOVED***, Peer "nas", Gruppen developers+servers
+#     (reusable Key "nas-dual", gemintet 20.09.2026, gültig bis 20.09.2027)
+#   * netbird-jfinx → https://***REMOVED***, Peer "nas", Gruppe operators
+#     (reusable Key "operators-nas-workstation") — Zugriff auf den GPU-Stack:
+#     Router-Dashboard :8080, Praxis :1337, Gateway :3537, ComfyUI :8188,
+#     STT :2700, llama :11434-36 (sobald der Router in jfinx migriert ist).
+#
+# Betrieb:
+#   Status:   docker compose -f nas-compose.yml exec tgrid netbird status
+#             docker compose -f nas-compose.yml exec jfinx netbird status
+#   Logs:     docker compose -f nas-compose.yml logs -f tgrid   (bzw. jfinx)
+#   Update:   docker compose -f nas-compose.yml pull && \
+#             docker compose -f nas-compose.yml up -d
+#
+# ⚠️ Die Volumes tgrid-config/jfinx-config enthalten die Peer-Identitäten
+#    (WireGuard-Keys) — NICHT löschen, sonst enrollt der Peer neu (neue IP).
+#    Backup: docker run --rm -v nas-netbird_tgrid-config:/d -v $PWD:/b \
+#              alpine tar czf /b/nb-tgrid-config.tgz -C /d .
+#    (analog nas-netbird_jfinx-config)
+#
+# Später einen NAS-Service an eins der Netze hängen (Sidecar-Muster wie im
+# Heim-Stack): Service bekommt  network_mode: "service:tgrid"  (bzw. jfinx)
+# und erreicht Peers über deren Overlay-IP; /etc/netbird-Volumes bleiben solo.
+
+name: nas-netbird
+
+services:
+  tgrid:
+    image: netbirdio/netbird:latest
+    container_name: netbird-tgrid
+    cap_add: [NET_ADMIN]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      NB_MANAGEMENT_URL: https://***REMOVED***
+      NB_SETUP_KEY: ***REMOVED***
+      NB_HOSTNAME: nas
+    volumes:
+      - tgrid-config:/etc/netbird
+    restart: unless-stopped
+
+  jfinx:
+    image: netbirdio/netbird:latest
+    container_name: netbird-jfinx
+    cap_add: [NET_ADMIN]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      NB_MANAGEMENT_URL: https://***REMOVED***
+      NB_SETUP_KEY: ***REMOVED***
+      NB_HOSTNAME: nas
+    volumes:
+      - jfinx-config:/etc/netbird
+    restart: unless-stopped
+
+volumes:
+  tgrid-config:
+  jfinx-config:
