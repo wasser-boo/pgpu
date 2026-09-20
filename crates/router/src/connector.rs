@@ -34,8 +34,10 @@ async fn tick(app: &SharedApp) -> Result<()> {
         .filter(|r| {
             matches!(
                 r.state.as_str(),
-                "requested" | "provisioning" | "booting" | "agent_connected" | "healthy" | "unreachable" | "preempted"
+                "requested" | "provisioning" | "booting" | "agent_connected" | "healthy" | "unreachable"
             )
+            // preempted = Vast hat die Box beendet — kein Dial-Ziel mehr
+            // (sonst 10-s-Dial-Rauschen auf toten Peern).
         })
         .collect();
     if active.is_empty() {

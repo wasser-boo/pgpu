@@ -505,6 +505,18 @@ impl Db {
         .unwrap_or_default()
     }
 
+    /// Zeitstempel des jüngsten Events dieser Art (Alert-Dedupe).
+    pub fn last_event_of_kind(&self, kind: &str) -> Option<DateTime<Utc>> {
+        let conn = self.0.lock().unwrap();
+        conn.query_row(
+            "SELECT ts FROM events WHERE kind=?1 ORDER BY id DESC LIMIT 1",
+            params![kind],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|s| parse_iso(&s))
+    }
+
     // ------------------------------------------------------------ Metering
 
     pub fn meter(&self, date: &str, instance_id: i64, metered_usd: f64, storage_usd: f64) -> anyhow::Result<()> {

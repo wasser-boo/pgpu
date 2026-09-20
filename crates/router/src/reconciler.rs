@@ -619,6 +619,16 @@ pub async fn apply_action(app: &SharedApp, action: &Action) -> anyhow::Result<()
             }
         }
         Action::Alert { kind, message } => {
+            // Alert-Dedupe: gleiche Art höchstens alle 30 min — sonst spammt
+            // budget_80 (Projektion über 80 %) jeden 30-s-Tick ins Event-Log.
+            let recent = app
+                .db
+                .last_event_of_kind(kind)
+                .map(|t| (chrono::Utc::now() - t).num_seconds() < 1800)
+                .unwrap_or(false);
+            if recent {
+                return Ok(());
+            }
             app.events.emit(&app.db, kind, None, None, message, &serde_json::json!({}));
             let url = &app.cfg.alerts.webhook_url;
             if !url.is_empty() {
