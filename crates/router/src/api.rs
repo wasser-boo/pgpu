@@ -147,13 +147,14 @@ pub async fn slot_action(app: AppCtx, Path((slot_id, action)): Path<(i64, String
 
     match action.as_str() {
         "wake" => {
-            let _ = app.db.set_slot_desired(slot_id, true);
+            let _ = app.db.set_slot_desired_audited(slot_id, true, "api: wake");
             app.events.emit(&app.db, "wake", Some(slot_id), None, &reason, &payload);
             app.reconcile_now.notify_one();
             (StatusCode::OK, "waking").into_response()
         }
         "sleep" | "stop" => {
-            let _ = app.db.set_slot_desired(slot_id, false);
+            let _ = app.db.set_slot_desired_audited(slot_id, false, "api: sleep")
+                .map_err(|e| tracing::warn!(%e, "audit write"));
             if let Some(active) = app.db.active_instance(slot_id) {
                 let _ = crate::reconciler::stop_instance(&app.0, active, &reason);
             }
@@ -167,13 +168,15 @@ pub async fn slot_action(app: AppCtx, Path((slot_id, action)): Path<(i64, String
         }
         "start" => {
             if let Some(active) = app.db.active_instance(slot_id) {
-                let _ = app.db.set_slot_desired(slot_id, true);
+                let _ = app.db.set_slot_desired_audited(slot_id, true, "api: slot start")
+                    .map_err(|e| tracing::warn!(%e, "audit write"));
                 let _ = crate::reconciler::start_instance(&app.0, active, &reason);
             }
             (StatusCode::OK, "starting").into_response()
         }
         "swap" => {
-            let _ = app.db.set_slot_desired(slot_id, true);
+            let _ = app.db.set_slot_desired_audited(slot_id, true, "api: swap")
+                .map_err(|e| tracing::warn!(%e, "audit write"));
             app.reconcile_now.notify_one();
             (StatusCode::OK, "swap requested").into_response()
         }
@@ -299,7 +302,8 @@ pub async fn instance_action(app: AppCtx, Path((vast_id, action)): Path<(i64, St
             Err(e) => (StatusCode::BAD_GATEWAY, format!("{e}")).into_response(),
         },
         "start" => {
-            let _ = app.db.set_slot_desired(app.db.instance(vast_id).map(|i| i.slot_id).unwrap_or(1), true);
+            let _ = app.db.set_slot_desired_audited(app.db.instance(vast_id).map(|i| i.slot_id).unwrap_or(1), true, "api: instance start")
+                .map_err(|e| tracing::warn!(%e, "audit write"));
             match crate::reconciler::start_instance(&app.0, vast_id, &reason).await {
                 Ok(_) => (StatusCode::OK, "starting").into_response(),
                 Err(e) => (StatusCode::BAD_GATEWAY, format!("{e}")).into_response(),

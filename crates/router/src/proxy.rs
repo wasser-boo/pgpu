@@ -274,7 +274,8 @@ async fn resolve_slot_target(
         }
         // Kalt-Request = impliziter Wake.
         if !app.db.slot_desired(slot_id) {
-            let _ = app.db.set_slot_desired(slot_id, true);
+            let _ = app.db.set_slot_desired_audited(slot_id, true, "proxy: impliziter Wake")
+                .map_err(|e| tracing::warn!(%e, "audit write"));
             app.reconcile_now.notify_one();
         }
         tokio::time::sleep(Duration::from_secs(2)).await;

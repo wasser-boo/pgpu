@@ -201,6 +201,18 @@ impl Db {
         Ok(())
     }
 
+    /// Wie `set_slot_desired`, aber mit Audit-Event (wer hat's gesetzt?).
+    /// Mystery vom 20.09.: desired flippte ohne sichtbaren Verursacher zurück
+    /// auf true — ohne Trail ist das nicht debuggbar.
+    pub fn set_slot_desired_audited(&self, slot_id: i64, desired: bool, source: &str) -> anyhow::Result<()> {
+        let old = self.slot_desired(slot_id);
+        self.set_slot_desired(slot_id, desired)?;
+        if old != desired {
+            self.add_event("slot_desired", Some(slot_id), None, &format!("desired {old} → {desired} ({source})"), &serde_json::json!({"desired": desired, "source": source}))?;
+        }
+        Ok(())
+    }
+
     pub fn slot_desired(&self, slot_id: i64) -> bool {
         let conn = self.0.lock().unwrap();
         conn.query_row("SELECT desired_running FROM slots WHERE id=?1", params![slot_id], |r| {

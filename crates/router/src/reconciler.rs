@@ -822,7 +822,7 @@ pub async fn create_instance(
         label: format!("praxis-{}-s{}", slot.role, slot_id),
     };
     app.db.insert_instance(&row)?;
-    let _ = app.db.set_slot_desired(slot_id, true);
+    let _ = app.db.set_slot_desired_audited(slot_id, true, "create_instance");
     app.events.emit(
         &app.db,
         "instance_created",
@@ -845,7 +845,7 @@ pub fn stop_instance(app: &SharedApp, vast_id: i64, reason: &str) -> anyhow::Res
     }
     let _ = app.db.set_instance_intended(vast_id, "stopped");
     let _ = app.db.set_instance_state(vast_id, "stopped");
-    let _ = app.db.set_slot_desired(inst.slot_id, false);
+    let _ = app.db.set_slot_desired_audited(inst.slot_id, false, "stop_instance");
     app.events.emit(&app.db, "instance_stopped", Some(inst.slot_id), Some(vast_id), reason, &serde_json::json!({}));
     let app2 = app.clone();
     let vast_id2 = vast_id;
@@ -896,7 +896,7 @@ pub async fn start_instance(app: &SharedApp, vast_id: i64, reason: &str) -> anyh
     }
     let _ = app.db.set_instance_intended(vast_id, "running");
     let _ = app.db.set_instance_state(vast_id, "booting");
-    let _ = app.db.set_slot_desired(inst.slot_id, true);
+    let _ = app.db.set_slot_desired_audited(inst.slot_id, true, "start_instance");
     app.events.emit(&app.db, "instance_started", Some(inst.slot_id), Some(vast_id), reason, &serde_json::json!({}));
     Ok(())
 }
