@@ -86,6 +86,53 @@ GPU-Boxen (vast) ──NetBird──► router :8080 (Call-home/WS) ◄── Ro
   `vayayo/praxis` (bauen/pushen: `bash deploy/build.sh --push` im
   jeweiligen Repo, Praxis: `bash deploy/build.sh --push`).
 
+## Eigenes NetBird-Netzwerk (statt tgrid) — empfohlen
+
+Für den GPU-Stack ein **dediziertes NetBird** betreiben: GPU-Boxen, VPS-Stack
+und dein Arbeitsrechner bilden ein eigenes Overlay — komplett getrennt vom
+Rest-Netz (forgejo, pagent, …). Ein Kompromittieren/Lerken einer GPU-Box
+kann nichts außer dem GPU-Netz sehen.
+
+**Hosting:** Die offizielle NetBird-Selfhost-Compose
+(`netbird getting-started`, ~7 Container: management, signal, relay,
+coturn, dashboard, Zitadel-IdP, Caddy) braucht:
+
+- eine Domain, die du per DNS steuerst — je ein A-Record auf die Instanz:
+  `netbird.<domain>`, `dashboard.<domain>`, `api.<domain>`, `signal.<domain>`,
+  `relay.<domain>`, `coturn.<domain>`, plus `*.coturn.<domain>` (Turn-Port-Range)
+- offene Ports: 80/443 (tcp), 3478 (udp/tcp), 49152-65535/udp optional
+  (Relay-Fallback), 33073 (signal, tcp — oder hinter dem Proxy)
+- ~2–4 GB RAM — passt auf ein eigenes kleines Droplet (z. B.
+  `s-2vcpu-4gb`, 24 $/Mon) neben dem 8-GB-Praxis-Droplet, oder auf
+  jeden anderen kleinen Host, den du hast.
+
+### Checkliste: frisches Netzwerk einrichten (Admin, einmalig)
+
+1. **Gruppen anlegen:** `gpu` (GPU-Boxen), `praxis-stack` (VPS-Stack),
+   `workstation` (dein Rechner).
+2. **Policies anlegen** (Quelle → Ziel, tcp):
+   - `gpu` → `praxis-stack`: **8080** — Call-home/Asset-Push der Agents
+     (Router wählt sich ein, Boxen melden sich).
+   - `praxis-stack` → `gpu`: **9100, 8188, 2700, 11434-11436** —
+     Agent-Dial + Service-Proxy (ComfyUI/Vosk/llama-Ports der Boxen).
+   - `workstation` → `praxis-stack`: **8080, 1337, 3537** — Router-,
+     Praxis- und Gateway-Dashboard.
+3. **PAT für den Router** (Setup Keys → API tokens): kommt als
+   `NB_API_TOKEN` in die `.env` — der Router mintet damit pro GPU-Box
+   einen ephemeren One-Off-Key (Gruppe `gpu`).
+4. **Reusable Setup-Key** für den Peer `praxis-vps`
+   (Gruppen: `praxis-stack`) → `NB_SETUP_KEY` in die `.env`.
+5. **pgpu-Config** (`vps/config.toml`, `[netbird]`): `api_url` und
+   `management_url` auf die neue Instanz setzen, `groups = ["gpu"]`
+   (statt Gpuserver/servers) — die Boxen-enrollen dann ins neue Netz.
+6. **Arbeitsreutzer:** netbird unterstützt mehrere parallele Netze —
+   `netbird up --management-url https://netbird.<domain>` (separate Config,
+   Service läuft zusätzlich zum tgrid-NetBird). Setup-Key für
+   `workstation`-Gruppe separat minten.
+
+NetBird-Management läuft dann auf dieser Instanz — der GPU-Stack
+(`vps-compose.yml`) braucht nur `NB_MANAGEMENT_URL` + den Key aus Schritt 4.
+
 ## Einrichtung
 
 ### Variante A: Frischer Start (Standard — headless, kein Prompt)
