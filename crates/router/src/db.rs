@@ -254,6 +254,17 @@ impl Db {
         Ok(())
     }
 
+    /// Active-Austrag OHNE last_swap_at — Invariante-Heilung (zerstörte
+    /// Instanz steht noch als Active), kein echter Hot-Swap.
+    pub fn clear_active_instance(&self, slot_id: i64, vast_id: i64) -> anyhow::Result<()> {
+        let conn = self.0.lock().unwrap();
+        conn.execute(
+            "UPDATE slots SET active_instance=NULL WHERE id=?1 AND active_instance=?2",
+            params![slot_id, vast_id],
+        )?;
+        Ok(())
+    }
+
     pub fn active_instance(&self, slot_id: i64) -> Option<i64> {
         let conn = self.0.lock().unwrap();
         conn.query_row("SELECT active_instance FROM slots WHERE id=?1", params![slot_id], |r| {
@@ -412,8 +423,16 @@ impl Db {
 
     pub fn mark_destroyed(&self, vast_id: i64) -> anyhow::Result<()> {
         let conn = self.0.lock().unwrap();
+        // Active-Instanz sofort freimachen: sonst bleibt der Proxy bis zum
+        // nächsten Flip auf der toten Box hängen und 502t statt 503+Wake zu
+        // antworten (20.09.: instance_gone ließ active=51735121 stehen).
         conn.execute(
-            "UPDATE instances SET state='destroyed', destroyed_at=?2, intended_status='deleted' WHERE vast_id=?1",
+            "UPDATE slots SET active_instance=NULL WHERE active_instance=?1",
+            params![vast_id],
+        )?;
+        conn.execute(
+            "UPDATE instances SET state='destroyed', destroyed_at=?2, intended_status='deleted',
+                healthy=0, busy=0, busy_reason='' WHERE vast_id=?1",
             params![vast_id, now_iso()],
         )?;
         Ok(())
@@ -719,6 +738,16 @@ impl Db {
             params![k, v],
         )?;
         Ok(())
+    }
+
+    /// Auto-Miete-Schalter (Default an): aus = Policy erzeugt keine
+    /// Create/Start-Aktionen mehr; Proxy-Wake antwortet sofort 503.
+    pub fn auto_rent_enabled(&self) -> bool {
+        self.setting("auto_rent").map(|v| v != "0").unwrap_or(true)
+    }
+
+    pub fn set_auto_rent(&self, enabled: bool) -> anyhow::Result<()> {
+        self.set_setting("auto_rent", if enabled { "1" } else { "0" })
     }
 
     pub fn asset_hash(&self, path: &str) -> Option<String> {

@@ -63,6 +63,42 @@ impl Drop for InFlightGuard {
     }
 }
 
+/// `X-Router-Job-Id`-Batches (Bauplan §3.3): Praxis markiert zusammen-
+/// hängende Requests (TTS-Sätze eines Antwortblocks) mit derselben Job-ID.
+/// Der Slot gilt bis WINDOW_S nach dem LETZTEN Request des Jobs als busy —
+/// Lücken zwischen den Sätzen lösen keinen Idle-Stop aus.
+#[derive(Default)]
+pub struct JobBatches(pub Mutex<HashMap<String, (i64, i64)>>);
+
+impl JobBatches {
+    pub const WINDOW_S: i64 = 300;
+
+    pub fn touch(&self, slot_id: i64, job: &str) {
+        if job.is_empty() || job.len() > 128 {
+            return;
+        }
+        let expires = chrono::Utc::now().timestamp() + Self::WINDOW_S;
+        self.0
+            .lock()
+            .unwrap()
+            .insert(job.to_string(), (slot_id, expires));
+    }
+
+    /// Aktiver Batch für den Slot ( Bereinigung abgelaufener Einträge
+    /// inklusive). Reason für compute_busy.
+    pub fn active(&self, slot_id: i64) -> Option<String> {
+        let now = chrono::Utc::now().timestamp();
+        let mut map = self.0.lock().unwrap();
+        map.retain(|_, (_, expires)| *expires > now);
+        map.iter()
+            .find(|(_, (slot, _))| *slot == slot_id)
+            .map(|(job, _)| {
+                let short: String = job.chars().take(8).collect();
+                format!("batch {short}")
+            })
+    }
+}
+
 /// Schnellcache: aktives Ziel pro Slot (hot für jeden Proxy-Request).
 /// slot_id -> (vast_id, nb_ip, healthy)
 #[derive(Default)]
@@ -85,6 +121,7 @@ pub struct App {
     pub db: Db,
     pub events: EventBus,
     pub traffic: Traffic,
+    pub jobs: JobBatches,
     pub targets: ActiveTargets,
     pub hub: Hub,
     pub vast: Arc<Mutex<Option<Vast>>>,

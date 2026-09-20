@@ -166,6 +166,8 @@ pub struct IndexTpl {
     pub budget: BudgetView,
     pub events: Vec<EventView>,
     pub stt_sessions: u32,
+    /// Auto-Miete-Schalter: aus = Router mietet/startet nie automatisch.
+    pub auto_rent: bool,
 }
 
 pub struct EventView {
@@ -329,6 +331,7 @@ pub fn state_json(app: &SharedApp) -> serde_json::Value {
         "slots": slots,
         "budget": crate::api::budget_json(app),
         "stt_sessions": app.stt_sessions.load(std::sync::atomic::Ordering::Relaxed),
+        "auto_rent": app.db.auto_rent_enabled(),
     })
 }
 
@@ -426,6 +429,7 @@ pub async fn index(app: AppCtx, req: Request) -> Response {
         budget: budget_view(&app.0),
         events,
         stt_sessions: app.stt_sessions.load(std::sync::atomic::Ordering::Relaxed),
+        auto_rent: app.db.auto_rent_enabled(),
     };
     Html(tpl.render().unwrap_or_default()).into_response()
 }
@@ -650,6 +654,15 @@ async fn api_slot(app: &SharedApp, slot_id: i64, action: &str) {
 pub async fn do_slot_action(app: AppCtx, Path((slot_id, action)): Path<(i64, String)>, headers: axum::http::HeaderMap) -> Response {
     page_guard!(app, ReqOf(&headers));
     api_slot(&app.0, slot_id, &action).await;
+    Redirect::to("/").into_response()
+}
+
+/// Dashboard-Toggle „Auto-Miete AN/AUS“ (Overview-Karte): aus = keine
+/// automatischen Mieten/Starts, laufende Boxen stoppen (s. set_auto_rent).
+pub async fn do_auto_rent(app: AppCtx, headers: axum::http::HeaderMap) -> Response {
+    page_guard!(app, ReqOf(&headers));
+    let enabled = !app.db.auto_rent_enabled();
+    crate::reconciler::set_auto_rent(&app.0, enabled, "dashboard").await;
     Redirect::to("/").into_response()
 }
 

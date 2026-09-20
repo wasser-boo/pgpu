@@ -258,6 +258,12 @@ async fn resolve_slot_target(
         .unwrap_or(0)
         .min(app.cfg.router.wait_for_backend_max_s);
 
+    // Auto-Miete aus: kein impliziter Wake, kein Hold — Praxis/Cloud-Fallback
+    // greift sofort statt X-Router-Wait-Sekunden zu verschwenden.
+    if !app.db.auto_rent_enabled() {
+        return Err(service_unavailable(slot_id, "auto_rent_off"));
+    }
+
     let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_s.max(1));
     loop {
         match app.targets.get(slot_id) {
@@ -283,26 +289,66 @@ async fn resolve_slot_target(
 }
 
 fn describe_slot_state(app: &SharedApp, slot_id: i64) -> String {
-    match app.targets.get(slot_id) {
-        Some((vast_id, _, _)) => {
-            let hb = app.hub.heartbeat(vast_id);
-            if let Some(hb) = hb {
-                let health = hb.health_json.as_str().unwrap_or("");
-                if health == "downloading" {
-                    let pct = hb
-                        .progress_json
-                        .get("pct")
-                        .and_then(|p| p.as_f64())
-                        .map(|p| format!("downloading {p:.0}%"))
-                        .unwrap_or_else(|| "downloading".into());
-                    return pct;
-                }
-                return health.to_string();
+    let target = app.targets.get(slot_id);
+    // Herzstück: lebendige Progress-/Health-Daten des aktiven Agents, wenn
+    // das Target auch wirklich healthy ist. Bei !healthy (z. B. frisch
+    // gestoppte Box) ist der letzte Heartbeat STALE — dann DB-State melden.
+    if let Some((vast_id, _, true)) = target {
+        if let Some(hb) = app.hub.heartbeat(vast_id) {
+            let health = hb.health_json.as_str().unwrap_or("");
+            if health == "downloading" {
+                let pct = hb
+                    .progress_json
+                    .get("pct")
+                    .and_then(|p| p.as_f64())
+                    .map(|p| format!("downloading {p:.0}%"))
+                    .unwrap_or_else(|| "downloading".into());
+                return pct;
             }
-            "warming".to_string()
+            return health.to_string();
         }
-        None => "cold".into(),
+        return "warming".to_string();
     }
+    // Kein brauchbares Target (keins / ungesund): aber es kann eine wärmende
+    // oder gestoppte Box im Slot geben — Praxis soll im X-Router-State sehen,
+    // ob ein Wake wartet (warming/progress) oder eine Kalt-Stop-Sequenz
+    // durchlaufen wird (stopped), statt pauschal "cold".
+    let mut best: Option<(String, i64)> = None;
+    for row in app.db.instances(false).into_iter().filter(|r| r.slot_id == slot_id) {
+        let label = match row.state.as_str() {
+            "requested" | "provisioning" | "booting" | "agent_connected" => {
+                let hb = app.hub.heartbeat(row.vast_id);
+                if let Some(hb) = hb {
+                    let health = hb.health_json.as_str().unwrap_or("");
+                    if health == "downloading" {
+                        hb.progress_json
+                            .get("pct")
+                            .and_then(|p| p.as_f64())
+                            .map(|p| format!("downloading {p:.0}%"))
+                            .unwrap_or_else(|| "downloading".into())
+                    } else {
+                        health.to_string()
+                    }
+                } else {
+                    "warming".to_string()
+                }
+            }
+            "healthy" => "warming".to_string(),
+            "stopped" => "stopped".to_string(),
+            "preempted" => "preempted".to_string(),
+            "unreachable" => "unreachable".to_string(),
+            _ => continue,
+        };
+        // Warming-Meldungen sind informativer als stopped; erster Treffer genügt.
+        let is_stopped = label == "stopped";
+        if best.is_none() || !is_stopped {
+            best = Some((label, row.vast_id));
+            if !is_stopped {
+                break;
+            }
+        }
+    }
+    best.map(|(label, _)| label).unwrap_or_else(|| "cold".into())
 }
 
 /// Passthrough-Handler für Slot-Ports (8188/2700/11434/11435/11436).
@@ -317,6 +363,12 @@ pub async fn passthrough(
 
     let (parts, body) = req.into_parts();
     let path = parts.uri.path_and_query().map(|p| p.as_str().to_string()).unwrap_or_else(|| "/".into());
+
+    // X-Router-Job-Id: Batch-Registrierung (Lücken zwischen Sätzen halten
+    // den Slot busy, s. JobBatches::WINDOW_S).
+    if let Some(job) = parts.headers.get("x-router-job-id").and_then(|v| v.to_str().ok()) {
+        app.jobs.touch(slot_id, job);
+    }
 
     // STT lokal: Sidecar statt media-Slot.
     if service == "stt" && app.cfg.stt.mode == "local" {

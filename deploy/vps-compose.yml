@@ -1,0 +1,106 @@
+# Praxis-VPS — NetBird + GPU-Router + STT + Praxis in einem Compose-Stack.
+#
+# Sicherheitsmodell: Alle Dienste teilen den Netzwerk-Namespace des
+# NetBird-Containers (`network_mode: "service:netbird"`). Damit gilt:
+#   * Untereinander erreichen sich Router/STT/Praxis über 127.0.0.1
+#     (kein Overlay-Hop, keine ACL nötig).
+#   * Nach außen ist NUR das NetBird-Overlay (wt0) offen — es gibt kein
+#     Port-Publishing, die öffentliche VPS-IP exponiert KEINEN dieser Dienste.
+#   * Erreichbarkeit über das Overlay regeln allein die NetBird-ACLs (tgrid):
+#       - Gpuserver→praxis-vps:8080        (GPU-Boxen, Call-home/WS)
+#       - Gpuaccess→praxis-vps:8080,8188,2700,11434-36  (Praxis-Host)
+#       - developers→praxis-vps:*          (Arbeitsplatz: Dashboards)
+#     → der Peer praxis-vps braucht die Gruppen: test, servers.
+#
+# Setup (Details: deploy/vps/README.md):
+#   1. Reusable NetBird-Setup-Key auf tgrid münzen (Gruppen test+servers)
+#   2. cp vps/config.example.toml vps/config.toml, .env.example .env
+#   3. docker compose -f vps-compose.yml up -d netbird
+#      → docker compose -f vps-compose.yml exec netbird netbird status --detail
+#      → NetBird-IP in vps/praxis.env (PRAXIS_NB_IP) eintragen
+#   4. docker compose -f vps-compose.yml up -d
+
+name: praxis-vps
+
+services:
+  netbird:
+    image: netbirdio/netbird:latest
+    container_name: praxis-netbird
+    cap_add: [NET_ADMIN]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      NB_SETUP_KEY: ${NB_SETUP_KEY:?NB_SETUP_KEY setzen (tgrid, reusable, Gruppen test+servers)}
+      NB_MANAGEMENT_URL: https://***REMOVED***
+      NB_HOSTNAME: praxis-vps
+    volumes:
+      - netbird-config:/etc/netbird
+    restart: unless-stopped
+
+  stt:
+    image: vayayo/praxis-stt:latest
+    container_name: praxis-stt
+    network_mode: "service:netbird"
+    environment:
+      STT_LANGUAGES: ${STT_LANGUAGES:-de,ja}
+      VOSK_BIND: 127.0.0.1 # nur im Namespace erreichbar, nicht übers Overlay
+    volumes:
+      - stt-models:/data/vosk
+    restart: unless-stopped
+    depends_on: [netbird]
+    deploy:
+      resources:
+        limits:
+          memory: 8g # de≈4,5 GB + ja≈1,5 GB RAM geladen
+
+  router:
+    image: vayayo/praxis-gpu-router:latest
+    container_name: praxis-router
+    network_mode: "service:netbird"
+    user: "10001:10001" # Image-User pgpu, besitzt /data
+    volumes:
+      - router-data:/data
+      - ./vps/config.toml:/data/config.toml:ro
+    environment:
+      ROUTER_TOKEN: ${ROUTER_TOKEN:?ROUTER_TOKEN setzen}
+      VAST_API_KEY: ${VAST_API_KEY:-}
+      RUST_LOG: info
+    restart: unless-stopped
+    depends_on: [netbird]
+
+  praxis:
+    image: vayayo/praxis:latest
+    container_name: praxis-app
+    network_mode: "service:netbird"
+    # Kein user:-Directive: Der Entrypoint startet als root (liest den
+    # root-owneden Master-Key, kopiert ihn auf tmpfs 0400) und droppt per
+    # setpriv auf uid 1000 — so kann die Agent-Shell (shared VM-mode) den
+    # Key und damit den Secret-Store NIE lesen.
+    volumes:
+      - praxis-data:/opt/praxis/data
+      - praxis-contexts:/opt/praxis/contexts
+      # Secret-Store (secrets.enc2 + .secrets_salt) auf einem Bind — First
+      # boot legt Praxis hier selbst an, Migration kopiert Dateien rein.
+      - ./vps/praxis-state:/opt/praxis/state
+    env_file: ./vps/praxis.env
+    environment:
+      # Zustellung nur als root-lesbare Datei (gen-secrets.sh erzeugt
+      # vps/master_key mit 0600; für Agent-Unlesbarkeit root:root lassen).
+      # Praxis liest+löscht die tmpfs-Kopie beim Start — nie in env/argv.
+      MASTER_KEY_FILE: /run/secrets/master_key
+      SECRETS_DIR: /opt/praxis/state
+    secrets:
+      - master_key
+    restart: unless-stopped
+    depends_on: [netbird, router, stt]
+
+secrets:
+  master_key:
+    file: ./vps/master_key
+
+volumes:
+  netbird-config:
+  router-data:
+  stt-models:
+  praxis-data:
+  praxis-contexts:

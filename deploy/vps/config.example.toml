@@ -1,0 +1,133 @@
+# pgpu — Router-Konfiguration für den VPS (vps-compose.yml).
+# Kopieren nach vps/config.toml. Unterschied zum Host-Deploy:
+#   * bind_ip = "auto"  → Router erkennt seine NetBird-IP am wt0 selbst
+#     (die IP steht erst nach dem NetBird-Enroll fest — kein Huhn-Ei mehr).
+#   * stt.url zeigt auf 127.0.0.1:2700: STT-Sidecar teilt den Netzwerk-
+#     Namespace (VOSK_BIND=127.0.0.1), kein Host-Port-Mapping nötig.
+# VAST_API_KEY/ROUTER_TOKEN/NB_API_TOKEN kommen aus der .env (Compose).
+
+[router]
+# 0.0.0.0 ist im Compose-Namespace sicher (kein Port-Publishing, kein
+# öffentliches Interface im Namespace, Overlay per NetBird-ACL geschützt):
+# Router/STT/Praxis erreichen sich über 127.0.0.1, Peers über die Overlay-IP.
+# "auto" (nur NetBird-IP binden) passt, wenn Praxis NICHT im selben
+# Namespace läuft.
+bind_ip = "0.0.0.0"
+dashboard_port = 8080
+data_dir = "/data"
+token = ""                    # env ROUTER_TOKEN überschreibt
+tz = "Europe/Berlin"
+wait_for_backend_max_s = 600
+
+[vast]
+poll_interval_s = 30
+offer_poll_s = 60
+api_key = ""                  # env VAST_API_KEY
+blacklist_after_fails = 2
+unreachable_stop_after_s = 300
+
+[netbird]
+# auto = gleiche automatisch erkannte NetBird-IP wie bind_ip (Call-home-URL
+# für die Agents). PAT nur nötig, weil der Router pro GPU-Box ephemere
+# Setup-Keys mintet.
+api_token = ""                # env NB_API_TOKEN (nbp_...)
+api_url = "https://***REMOVED***"
+management_url = "https://***REMOVED***"
+setup_key = ""
+groups = ["Gpuserver", "servers"]
+router_nb_ip = "auto"
+router_nb_port = 8080
+
+[stt]
+mode = "local"
+url = "http://127.0.0.1:2700" # gleicher Netzwerk-Namespace wie das Sidecar
+
+[budget]
+daily_soft_eur = 2.0
+daily_hard_eur = 2.4
+monthly_eur = 50.0
+usd_per_eur = 1.08
+
+[limits]
+max_instances = 3
+max_per_slot = 2
+max_total_rate_usd_h = 0.60
+
+[alerts]
+# webhook_url = "https://***REMOVED***"
+
+# ------------------------------------------------------------- Slot 1: LLM
+
+[[slots]]
+id = 1
+role = "llm"
+name = "LLM (fork-llama)"
+image = "vayayo/praxis-llamap-gs-gpu:latest"
+mode = "on_demand"
+disk_gb = 120
+traffic_gb = 21.0
+search_query = 'gpu_ram>=15 cpu_ram>=62 disk_space>=120 inet_down>=800 disk_bw>=1500 reliability2>=0.95'
+passthrough = { 11434 = "api", 11435 = "webui", 11436 = "embed" }
+
+[slots.services]
+api = { port = 11434, health = "/health", busy = "inflight" }
+webui = { port = 11435, busy = "inflight" }
+embed = { port = 11436, health = "/health", busy = "inflight" }
+agent = { port = 9100, busy = "none" }
+
+[slots.bid]
+margin = 0.15
+ceiling_usd_h = 0.50
+defend_when_busy = true
+
+[slots.idle]
+stop_after_s = 900
+destroy_after_stopped_s = 172800
+
+[slots.swap]
+on_preempt = true
+on_bid_pressure = true
+optimize_cost = false
+max_warmup_s = 3600
+keep_warm_window_s = 1800
+
+[slots.env]
+LLAMA_MODEL = "qwen3.6-35b-a3b"
+LLAMA_DOWNLOAD_MODELS = "1"
+PRAXIS_AGENT_MODEL_TOTAL_BYTES = "20693856128"
+
+# ----------------------------------------------------------- Slot 2: Media
+
+[[slots]]
+id = 2
+role = "media"
+name = "Media (fork-comfyui)"
+image = "vayayo/praxis-comfyui-gpu:latest"
+disk_gb = 60
+search_query = 'gpu_ram>=23 gpu_name="RTX 3090" disk_space>=60 inet_down>=300 reliability2>=0.95'
+passthrough = { 8188 = "comfy" }
+
+[slots.services]
+comfy = { port = 8188, health = "/object_info/PraxisQwen3TTS", busy = "comfy_queue" }
+stt = { port = 2700, health = "/health", busy = "ws_sessions" }
+agent = { port = 9100, busy = "none" }
+
+[slots.bid]
+margin = 0.30
+ceiling_usd_h = 0.20
+defend_when_busy = true
+
+[slots.idle]
+stop_after_s = 600
+destroy_after_stopped_s = 3600
+
+[slots.swap]
+on_preempt = true
+on_bid_pressure = true
+optimize_cost = true
+min_savings_pct = 25
+max_warmup_s = 2700
+min_swap_interval_s = 3600
+
+[slots.env]
+PRAXIS_QWEN_TTS_DOWNLOAD = "1"

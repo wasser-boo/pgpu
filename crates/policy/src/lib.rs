@@ -261,9 +261,20 @@ pub struct Snapshot {
     /// Laufender Stundenpreis (running) inkl. Storage gestoppter.
     pub running_rate_usd_h: f64,
     pub storage_rate_usd_h: f64,
+    /// Auto-Miete-Schalter (Dashboard/API): `false` = der Router mietet und
+    /// startet NIE automatisch (keine Wake-/Replace-/Schnäppchen-Miete).
+    /// Stop/Destroy/Idle laufen weiter — die sparen Geld. Manuelle API-Aktionen
+    /// des Nutzers bleiben erlaubt (der Schalter heißt „auto“, nicht „alles“).
+    pub auto_rent_enabled: bool,
 }
 
 impl Snapshot {
+    /// Test-/Reconciler-Helfer: Auto-Miete-Schalter setzen.
+    pub fn with_auto_rent(mut self, enabled: bool) -> Self {
+        self.auto_rent_enabled = enabled;
+        self
+    }
+
     /// Projektion bis Tagesende (nur für Alerts/Berichte: „wenn die Box
     /// durchläuft, kostet sie X bis Mitternacht").
     pub fn projected(&self, extra_rate_usd_h: f64, removed_rate_usd_h: f64, extra_one_off_usd: f64) -> f64 {
@@ -667,6 +678,16 @@ pub fn decide(snap: &Snapshot, cfg: &PolicyConfig) -> Vec<Action> {
                 praxis_common::Lifecycle::Auto => {}
             }
         }
+    }
+
+    // Auto-Miete-Aus (Dashboard-Schalter): keine Creates/Starts mehr — weder
+    // Wake-Ersatz noch Preempt-Replace noch Schnäppchen-Optimierung. Stop/
+    // Destroy/Idle/Budget laufen weiter (die reduzieren Kosten). Der
+    // Toggle-Handler stoppt laufende Boxen zusätzlich sofort.
+    if !snap.auto_rent_enabled {
+        actions.retain(|a| {
+            !matches!(a, Action::Create { .. } | Action::Start { .. })
+        });
     }
 
     actions

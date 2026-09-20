@@ -43,8 +43,51 @@ Boxen heißen `gpu-<role>-<tok8>` (netbird up --hostname im Fork-Entrypoint).
 | 3 | Proxy | ✅ live bewiesen (Passthrough, Pfad-Strip, /inst, STT-Sidecar, X-GPU-*-Header) |
 | 4 | Reconciler + Policy live | ✅ erprobt: Wake, Idle-Stop, PREEMPTED→Auto-Replace, Budget-Alerts + budget-geblockter Start, Warming-Gate gegen Doppel-Miete |
 | 5 | Dashboard | ✅ gebaut, alle Seiten rendern 200; Host-Bilanz + Blacklist-Knöpfe auf `/offers`; Klick-Fluss im Browser noch offen |
-| 6 | Praxis-Integration | ✅ **2026-09-20 mittags bewiesen**: Praxis (pagent) → Router → llama-server, `HTTP 200`, Chat + Folge-Turn mit Verlauf („ok“-Test ×2). Ursprünglicher 500er war kein Router-Problem: Qwen3.6-GGUF-Template wirft „System message must be at the beginning“, Praxis injiziert System-Notizen mitten im Verlauf → Fix im Praxis-llamacpp-Adapter (alle system-Messages an Position 0 mergen, `testing` 0f149a6, auf pagent deployed als Daemon). Details s. „Stand 20.09. mittags“ |
-| 7 | VPS-Umzug | compose ist host-unabhängig |
+| 6 | Praxis-Integration | ✅ **2026-09-20 mittags bewiesen**: Praxis (pagent) → Router → llama-server, `HTTP 200`, Chat + Folge-Turn mit Verlauf („ok“-Test ×2). Ursprünglicher 500er war kein Router-Problem: Qwen3.6-GGUF-Template wirft „System message must be at the beginning“, Praxis injiziert System-Notizen mitten im Verlauf → Fix im Praxis-llamacpp-Adapter (alle system-Messages an Position 0 mergen, `testing` 0f149a6, auf pagent deployed als Daemon). **20.09. abends**: GpuRouterClient (X-Router-Wait/Wake/Job-Id/Cold-503) live, s. „Stand 20.09. abends“ |
+| 7 | VPS-Umzug | ✅ **Compose fertig + live getestet** (20.09. abends, auf dem Heim-Server als eigener NetBird-Peer `praxis-vps`): `deploy/vps-compose.yml` + `deploy/vps/README.md` — NetBird+Router+STT+Praxis in einem Namespace, Praxis-Image `vayayo/praxis`, Master-Key-Zustellung ohne env/argv, Env-only-Config, Auto-Miete-Toggle. Später zieht dieselbe Compose 1:1 auf den VPS um |
+
+## Stand 20.09. abends — GpuRouterClient live, Auto-Miete-Toggle, VPS-Compose
+
+**Praxis ↔ Router komplett verdrahtet** (Bauplan §12.4, praxis `testing`
+f793f58+): `GpuRouterClient` (Env `GPU_ROUTER_URL`/`GPU_ROUTER_TOKEN`/
+`GPU_ROUTER_WAIT_S`, ohne URL No-Op) mit:
+- **X-Router-Wait im llamacpp-Adapter** — live bewiesen: erster Chat nach
+  Kaltstart hielt die Verbindung („proxy: impliziter Wake“), die gestoppte
+  Box wurde gestartet; war sie vast-seitig tot (PREEMPTED): Auto-Replace
+  mietete frisch, Download-Progress lief, nach Healthy-Flip kam der zweite
+  Chat sofort mit `HTTP 200 „ok“` durch. Ohne den Header failte der erste
+  Chat 5× am Retry-Backoff (20.09. Vormittag) — damit erledigt.
+- **Comfy-503 = typisierter `RouterCold`**: „GPU-Slot warming (Router 503)
+  — Wake angestoßen; kein Job übermittelt“ statt irreführendem „job may
+  have executed“. Live im pagent-Log gesehen.
+- **X-Router-Job-Id**: Router zählt Batches (JobBatches, 300-s-Fenster nach
+  letztem Request) als busy — kein Idle-Stop zwischen TTS-Sätzen.
+- **Media-Prewarm** beim Chat-Turn, wenn die Antwort per ComfyUI gesprochen
+  wird (nur wenn reply_tts_enabled für den Kanal) — Wake während das LLM
+  generiert.
+- **Auto-Miete-Schalter** (Dashboard-Overview-Knopf +
+  `POST /api/v1/settings/auto_rent`): AUS = Policy mietet/startet nichts,
+  laufende Boxen stoppen („aus ist aus“, Pinned ausgenommen), Proxy
+  antwortet sofort `503 x-router-state: auto_rent_off` (kein Hold),
+  Wake-API 409. Live getestet: Der Schalter stoppte auch eine seit 3 h im
+  Vast-Image-Pull hängende Media-Box sofort. Persistiert in
+  settings-Tabelle, überlebt Restarts.
+- **Router-Fixes**: `mark_destroyed` räumt jetzt `active_instance` ab +
+  Reconciler heilt die Active-Invariante (Box zerstört + Active stehen
+  geblieben → Proxy 502te auf die tote Box statt 503+Wake zu antworten
+  — live reproduziert und gefixt); `describe_slot_state` meldet
+  warming/stopped/preempted aus DB statt stale Heartbeat.
+- **VPS-Deploy fertig** (`deploy/vps-compose.yml` + `deploy/vps/`):
+  NetBird-Container + Router + STT + Praxis in EINEM Netzwerk-Namespace
+  (kein Port-Publishing, öffentliche IP exponiert nichts, ACLs regeln),
+  Praxis-Image `vayayo/praxis` (Binary+Node+POML-Bundle), Master-Key-
+  Zustellung per Root-Entrypoint→tmpfs→lesen+löschen (nie in env/argv,
+  Agent-Shell kann Store nie lesen, shared VM-mode genügt), Erststart
+  legt leeren verschlüsselten Store an, Secrets via Dashboard.
+  Live auf dem Heim-Server getestet (Peer `praxis-vps` 100.105.184.160,
+  loopback-Kette Praxis→Router✓, Overlay von wasser✓) — gleiche Compose
+  zieht später 1:1 auf den VPS um. Details: `deploy/vps/README.md`.
+- Budget zurück auf 2.0/2.4 (testweise 4.6/5.0 für den E2E-Tag).
 
 ## Stand 20.09. mittags — Kette komplett live
 
@@ -77,17 +120,22 @@ Was dazukam:
   Build auf pagent: `~/praxis` (branch `testing`, warmes target, ~5 min).
 
 ### Offene Punkte (nächste Session)
-- **GpuRouterClient in Praxis** (Bauplan §12.4): 503+Retry-After des Routers
-  behandeln (kalter Slot nach Idle-Stop), Wake bei Session-Start,
-  X-Router-Job-Id für Batches. Bis dahin: erster Chat nach 15-min-Idle-Stopp
-  failt 5× (Praxis-Cooldown < Restart-Dauer), zweiter geht durch (Box warm,
-  Restart ~1–2 min).
-- Budget zurück auf 2.0/2.4 (heute testweise 4.0/4.4) — und Entscheidung,
-  ob Slot 1 im Interruptible-Schnäppchen-Modus bleibt (Optimum) oder
-  on_demand (Stabilität, ~0.23–0.29 $/h).
-- pagent: Passwort `marvin1015` ändern, `GATEWAY_API_KEY` echtes Secret.
-- Dashboard-Kosmetik: `active_instance` zeigt bis zum Flip die alte Box.
-- Browser-Test Dashboard-Klick-Fluss (Blacklist-Knöpfe etc.).
+- ~~GpuRouterClient~~ ✅ 20.09. abends live (s. o. — X-Router-Wait bewies
+  die Kette inkl. Auto-Replace; erster Chat nach Idle-Stopp geht jetzt
+  durch, statt 5× zu failen).
+- ~~Budget zurück auf 2.0/2.4~~ ✅ — Slot 1 bleibt `on_demand`
+  (Interruptible-Churn kostete den halben Tag, s. „Stand 20.09. mittags").
+- ~~pagent: Passwort/GATEWAY_API_KEY~~ ✅ 20.09. abends rotiert.
+- **Media-TTS-E2E auf warmer Box**: Die frisch gemietete Media-Box hing
+  ~3 h im Vast-Image-Pull (16,8 GB) und wurde vom Auto-Miete-Test-Stop
+  beendet — der sprechende Pfad (TTS → X-Router-Job-Id → busy → WAV)
+  braucht einmal eine warme Box zum Bestätigen (Spike bewies die Kette
+  grundsätzlich; Comfy-503-Handling ist live gesehen worden).
+- Dashboard-Kosmetik: `active_instance` zeigt bis zum Flip die alte Box
+  (das eigentliche 502-Problem ist mit der Active-Invarianten-Heilung
+  gefixt; reine Anzeige-Sache).
+- Browser-Test Dashboard-Klick-Fluss (Blacklist-Knöpfe, Auto-Miete-Toggle
+  wurde per API/browser-äquivalent getestet, HTMX-Klicks fehlen noch).
 - **Machine-Blacklist** ✅ 20.09. live: `machine_stats` zählt Fails (preempt während warmup, instance_gone im Warmup, warmup-timeout, agent >3 min still), Auto-Blacklist nach `vast.blacklist_after_fails` (Default 2), `best_candidate` filtert blacklisted Hosts, Offer-Score durch `reliability2` geteilt. Erster Live-Fang: Host 32560 + 144003 je Fail #1 in der ersten Stunde. Dashboard `/offers` zeigt Host-Bilanz + Blacklist-Knöpfe; API `GET /api/v1/machines`, `POST /api/v1/machines/:id/blacklist|unblacklist`.
 - **False-Preempt-Schutz** ✅ 20.09.: `cur_state=stopped` zählt nicht mehr als tot, solange `actual` noch loading/created ist; echte Preempts (actual=exited) weiterhin erkannt.
 - Alert-Dedupe (30 min/Art — budget_80 spamte alle 30 s), Audit-Trail `slot_desired` (wer setzt desired), Reconciler-Loop entkoppelt Offer-Refresh (blockierendes tick() verzog jede Wake-Reaktion), Connector dialt preempted Boxen nicht mehr.

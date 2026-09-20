@@ -147,6 +147,21 @@ pub async fn slot_action(app: AppCtx, Path((slot_id, action)): Path<(i64, String
 
     match action.as_str() {
         "wake" => {
+            if !app.db.auto_rent_enabled() {
+                app.events.emit(
+                    &app.db,
+                    "wake_blocked",
+                    Some(slot_id),
+                    None,
+                    "Auto-Miete ist ausgeschaltet — Wake ignoriert (Dashboard-Schalter)",
+                    &serde_json::json!({}),
+                );
+                return (
+                    StatusCode::CONFLICT,
+                    "auto_rent disabled — wake ignored",
+                )
+                    .into_response();
+            }
             let _ = app.db.set_slot_desired_audited(slot_id, true, "api: wake");
             app.events.emit(&app.db, "wake", Some(slot_id), None, &reason, &payload);
             app.reconcile_now.notify_one();
@@ -515,4 +530,30 @@ pub fn role_str(r: Role) -> &'static str {
         Role::Llm => "llm",
         Role::Media => "media",
     }
+}
+/// `POST /api/v1/settings/auto_rent` — Auto-Miete-Schalter (Dashboard-Toggle).
+/// Body: `{"enabled": true|false}`. OFF = keine automatischen Mieten/Starts,
+/// laufende Boxen werden gestoppt („aus ist aus“), Proxy antwortet kalt mit
+/// `auto_rent_off`. ON = Schalter zurück (weckt nichts von selbst).
+pub async fn auto_rent_set(app: AppCtx, req: Request) -> Response {
+    guarded!(app, req);
+    let body = axum::body::to_bytes(req.into_body(), 64 * 1024).await.unwrap_or_default();
+    let payload: serde_json::Value =
+        serde_json::from_slice(&body).unwrap_or(serde_json::json!({}));
+    let Some(enabled) = payload.get("enabled").and_then(|v| v.as_bool()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "body: {\"enabled\": true|false}",
+        )
+            .into_response();
+    };
+    crate::reconciler::set_auto_rent(&app.0, enabled, "api").await;
+    (
+        StatusCode::OK,
+        format!(
+            "auto_rent {}",
+            if enabled { "enabled" } else { "disabled" }
+        ),
+    )
+        .into_response()
 }

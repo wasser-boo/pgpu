@@ -133,7 +133,40 @@ fn snap(slots: Vec<SlotSnapshot>) -> Snapshot {
         instance_count,
         running_rate_usd_h: running_rate,
         storage_rate_usd_h: storage,
+        auto_rent_enabled: true,
     }
+}
+
+#[test]
+fn auto_rent_off_blocks_wake_create_and_start() {
+    // Schalter aus + kalter, gewünschter Slot: KEIN Miete-Create —
+    // „wenn ich die GPUs nicht verwende, mietet der Router nichts“.
+    let mut s = snap(vec![slot(1, Role::Llm, vec![], None)]).with_auto_rent(false);
+    s.slots[0].desired_running = true;
+    let actions = decide(&s, &cfg());
+    assert!(actions.iter().all(|a| !matches!(a, Action::Create { .. })), "{actions:?}");
+}
+
+#[test]
+fn auto_rent_off_blocks_preempt_replace_but_keeps_stops() {
+    // Schalter aus: preemptete Box wird NICHT ersetzt (kein Create), aber
+    // Idle-/Budget-Stops laufen weiter — die sparen ja Geld.
+    let a = inst(11, 1, Role::Llm, InstanceState::Preempted);
+    let mut b = inst(12, 1, Role::Llm, InstanceState::Healthy);
+    b.idle_since = Some(now() - chrono::Duration::seconds(1000));
+    let s = snap(vec![slot(1, Role::Llm, vec![a, b], Some(12))]).with_auto_rent(false);
+    let actions = decide(&s, &cfg());
+    assert!(actions.iter().all(|a| !matches!(a, Action::Create { .. } | Action::Start { .. })), "{actions:?}");
+    assert!(actions.iter().any(|x| matches!(x, Action::Stop { instance_id: 12, .. })), "{actions:?}");
+}
+
+#[test]
+fn auto_rent_on_rent_unchanged() {
+    // Kontrolle: Schalter an → Wake-Create bleibt (gewünschtes Verhalten).
+    let mut s = snap(vec![slot(1, Role::Llm, vec![], None)]);
+    s.slots[0].desired_running = true;
+    let actions = decide(&s, &cfg());
+    assert!(actions.iter().any(|a| matches!(a, Action::Create { .. })), "{actions:?}");
 }
 
 #[test]

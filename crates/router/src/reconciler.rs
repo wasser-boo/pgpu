@@ -95,7 +95,20 @@ pub async fn tick(app: &SharedApp) -> anyhow::Result<()> {
 
     // 4. Targets-Cache aktualisieren (hot fürs Proxy).
     for slot in &app.cfg.slots {
-        let active = app.db.active_instance(slot.id);
+        // Invariante heilen: Active darf nie auf eine zerstörte Instanz
+        // zeigen. Alte mark_destroyed-Pfade (vor 20.09.-Fix) ließen sie
+        // stehen → Proxy 502t auf die tote Box statt 503+Wake zu antworten.
+        let active = match app.db.active_instance(slot.id) {
+            Some(id) => match app.db.instance(id) {
+                Some(inst) if inst.destroyed_at.is_none() => Some(id),
+                _ => {
+                    let _ = app.db.clear_active_instance(slot.id, id);
+                    tracing::info!(slot_id = slot.id, vast_id = id, "Active-Invariante geheilt: zerstörte Instanz ausgetragen");
+                    None
+                }
+            },
+            None => None,
+        };
         let mut target: Option<(i64, Option<String>, bool)> = None;
         if let Some(vast_id) = active {
             if let Some(inst) = app.db.instance(vast_id) {
@@ -221,6 +234,11 @@ async fn compute_busy(app: &SharedApp, inst: &crate::db::InstanceRow) -> (bool, 
     let in_flight = traffic.in_flight;
     if in_flight > 0 {
         return (true, format!("{in_flight} in-flight"));
+    }
+    // X-Router-Job-Id-Batch: Praxis hält den Slot für zusammenhängende
+    // Sätze busy — kein Idle-Stop zwischen den Requests eines Jobs.
+    if let Some(reason) = app.jobs.active(inst.slot_id) {
+        return (true, reason);
     }
     if let Some(hb) = app.hub.heartbeat(inst.vast_id) {
         if hb.busy {
@@ -532,6 +550,7 @@ pub async fn build_snapshot(app: &SharedApp) -> anyhow::Result<Snapshot> {
         instance_count,
         running_rate_usd_h: running_rate,
         storage_rate_usd_h: storage_rate,
+        auto_rent_enabled: app.db.auto_rent_enabled(),
     })
 }
 
@@ -678,6 +697,61 @@ pub async fn apply_action(app: &SharedApp, action: &Action) -> anyhow::Result<()
 }
 
 // ---------------------------------------------------------------- Instanz-Op
+
+/// Auto-Miete-Schalter (Dashboard/API): `false` = die Policy mietet und
+/// startet nichts mehr (Create/Start werden gefiltert). Zusätzlich gilt beim
+/// Ausschalten „aus ist aus“: gewünschte Zustände runternehmen und laufende,
+/// nicht gepinnte Boxen stoppen (Disk bleibt warm; die Zerstörung übernimmt
+/// danach die Idle-Regel). Einschalten mietet NICHT — der Nutzer weckt selbst.
+pub async fn set_auto_rent(app: &SharedApp, enabled: bool, source: &str) {
+    let was = app.db.auto_rent_enabled();
+    if enabled == was {
+        return;
+    }
+    if let Err(e) = app.db.set_auto_rent(enabled) {
+        tracing::warn!(%e, "auto_rent persist fehlgeschlagen");
+        return;
+    }
+    if enabled {
+        app.events.emit(
+            &app.db,
+            "auto_rent_enabled",
+            None,
+            None,
+            &format!("Auto-Miete angeschaltet ({source})"),
+            &serde_json::json!({}),
+        );
+        app.reconcile_now.notify_one();
+        return;
+    }
+    for slot in &app.cfg.slots {
+        let _ = app.db.set_slot_desired_audited(slot.id, false, "auto_rent off");
+    }
+    for inst in app.db.instances(false) {
+        if inst.pinned {
+            continue;
+        }
+        let runningish = matches!(
+            inst.state.as_str(),
+            "requested" | "provisioning" | "booting" | "agent_connected" | "healthy" | "draining"
+        );
+        if runningish && inst.destroyed_at.is_none() {
+            let _ = stop_instance(
+                app,
+                inst.vast_id,
+                "auto-rent aus: Box gestoppt (Disk bleibt, Zerstörung übernimmt die Idle-Regel)",
+            );
+        }
+    }
+    app.events.emit(
+        &app.db,
+        "auto_rent_disabled",
+        None,
+        None,
+        &format!("Auto-Miete ausgeschaltet ({source}) — laufende Boxen gestoppt, Wake/Proxy-Anfragen bleiben kalt"),
+        &serde_json::json!({}),
+    );
+}
 
 pub fn mint_node_token() -> String {
     let mut bytes = [0u8; 24];
