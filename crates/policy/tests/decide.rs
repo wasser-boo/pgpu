@@ -4,7 +4,7 @@ use chrono::{TimeZone, Utc};
 use praxis_common::{Action, InstanceState, Mode, Role};
 use praxis_policy::{
     decide, BidConfig, BudgetConfig, IdleConfig, InstanceSnapshot, LimitsConfig, OfferSnapshot,
-    PolicyConfig, SlotPolicyCfg, SlotSnapshot, Snapshot, SwapConfig,
+    PolicyConfig, SlotMode, SlotPolicyCfg, SlotSnapshot, Snapshot, SwapConfig,
 };
 use std::collections::HashMap;
 
@@ -15,6 +15,7 @@ fn cfg() -> PolicyConfig {
         SlotPolicyCfg {
             bid: BidConfig { margin: 0.15, ceiling_usd_h: 0.30, defend_when_busy: true },
             idle: IdleConfig { stop_after_s: 900, destroy_after_stopped_s: 172_800 },
+            mode: Default::default(),
             swap: SwapConfig {
                 on_preempt: true,
                 on_bid_pressure: true,
@@ -31,6 +32,7 @@ fn cfg() -> PolicyConfig {
         SlotPolicyCfg {
             bid: BidConfig { margin: 0.10, ceiling_usd_h: 0.20, defend_when_busy: true },
             idle: IdleConfig { stop_after_s: 600, destroy_after_stopped_s: 3600 },
+            mode: Default::default(),
             swap: SwapConfig {
                 on_preempt: true,
                 on_bid_pressure: true,
@@ -168,6 +170,39 @@ fn wake_creates_when_no_instance() {
         }
         other => panic!("kein Create: {other:?} in {actions:?}"),
     }
+}
+
+#[test]
+fn on_demand_slot_creates_at_dph_total() {
+    // on_demand-Modus: Create zum Listenpreis (dph_total), Mode OnDemand,
+    // kein Outbid-Risiko (2026-09-20: H200-Schnäppchen 0.0153 $/h war
+    // Minuten nach Miete outbid — User wollte eine stabile Box).
+    let mut c = cfg();
+    c.slots.get_mut(&1).unwrap().mode = SlotMode::OnDemand;
+    let mut s = snap(vec![slot(1, Role::Llm, vec![], None)]);
+    s.slots[0].desired_running = true;
+    let actions = decide(&s, &c);
+    match actions.iter().find(|x| matches!(x, Action::Create { slot_id: 1, .. })) {
+        Some(Action::Create { mode: Mode::OnDemand, price_usd_h, .. }) => {
+            // Preis = dph_total des Kandidaten (0.22), nicht min_bid*1.15
+            let p = price_usd_h.unwrap();
+            assert!((p - 0.22).abs() < 1e-9, "{p}");
+        }
+        other => panic!("kein On-Demand-Create: {other:?} in {actions:?}"),
+    }
+}
+
+#[test]
+fn on_demand_slot_never_cost_optimizes() {
+    // Kosten-Optimierung darf einen on_demand-Slot nicht zurück in den
+    // Interruptible-Churn schicken (billigeres min_bid-Angebot lockt).
+    let mut c = cfg();
+    c.slots.get_mut(&1).unwrap().mode = SlotMode::OnDemand;
+    c.slots.get_mut(&1).unwrap().swap.optimize_cost = true;
+    let a = inst(11, 1, Role::Llm, InstanceState::Healthy);
+    let mut s = snap(vec![slot(1, Role::Llm, vec![a], Some(11))]);
+    let actions = decide(&s, &c);
+    assert!(!actions.iter().any(|x| matches!(x, Action::Create { .. })), "{actions:?}");
 }
 
 #[test]

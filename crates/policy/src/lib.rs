@@ -106,6 +106,20 @@ pub struct SlotPolicyCfg {
     pub idle: IdleConfig,
     #[serde(default)]
     pub swap: SwapConfig,
+    /// Miet-Modus: interruptible (Schnäppchen, outbid-bar) oder
+    /// on_demand (stabil, dph_total als Preis).
+    #[serde(default)]
+    pub mode: SlotMode,
+}
+
+/// Slot-weiter Mietmodus. `on_demand` mietet zum listenpreis (dph_total):
+/// kein Outbid-Risiko — für stabile Tests/Produktion statt Churn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SlotMode {
+    #[default]
+    Interruptible,
+    OnDemand,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -487,7 +501,9 @@ pub fn decide(snap: &Snapshot, cfg: &PolicyConfig) -> Vec<Action> {
             }
 
             // --- Kosten-Optimierung (Trigger C, für llm per Default aus).
-            if scfg.swap.optimize_cost && !pinned && inst.is_running() {
+            // On-Demand-Slots mieten bewusst stabil — kein Churn zurück
+            // in den Interruptible-Markt.
+            if scfg.swap.optimize_cost && scfg.mode != SlotMode::OnDemand && !pinned && inst.is_running() {
                 let rate = inst.rate_usd_h();
                 let swap_recent = slot
                     .last_swap
@@ -734,16 +750,40 @@ fn plan_create(
         return None;
     }
     let scfg = slot_cfg(cfg, slot);
-    let bid = (offer.min_bid * (1.0 + scfg.bid.margin)).min(scfg.bid.ceiling_usd_h);
-    if bid < offer.min_bid {
-        return Some(Action::Alert {
-            kind: "bid_ceiling".into(),
-            message: format!(
-                "Slot {}: Ceiling {:.4} $/h unter min_bid {:.4} $/h — kein Create.",
-                slot.id, scfg.bid.ceiling_usd_h, offer.min_bid
-            ),
-        });
-    }
+    // Miet-Modus: on_demand zahlt Listenpreis (dph_total) und ist outbid-sicher;
+    // interruptible biedet min_bid + Margin (Schnäppchen mit Verdrängungsrisiko).
+    let (mode, price) = match scfg.mode {
+        SlotMode::OnDemand => {
+            let dph = offer.dph_total;
+            if dph <= 0.0 {
+                return None;
+            }
+            if dph > scfg.bid.ceiling_usd_h {
+                return Some(Action::Alert {
+                    kind: "bid_ceiling".into(),
+                    message: format!(
+                        "Slot {}: On-Demand dph {:.4} über Ceiling {:.4} $/h — kein Create.",
+                        slot.id, dph, scfg.bid.ceiling_usd_h
+                    ),
+                });
+            }
+            (Mode::OnDemand, dph)
+        }
+        SlotMode::Interruptible => {
+            let bid = (offer.min_bid * (1.0 + scfg.bid.margin)).min(scfg.bid.ceiling_usd_h);
+            if bid < offer.min_bid {
+                return Some(Action::Alert {
+                    kind: "bid_ceiling".into(),
+                    message: format!(
+                        "Slot {}: Ceiling {:.4} $/h unter min_bid {:.4} $/h — kein Create.",
+                        slot.id, scfg.bid.ceiling_usd_h, offer.min_bid
+                    ),
+                });
+            }
+            (Mode::Interruptible, bid)
+        }
+    };
+    let bid = price;
     let projected = snap.projected_30m(bid, replaced_rate.unwrap_or(0.0), 0.0);
     let soft_usd = cfg.budget.daily_soft_eur * cfg.budget.usd_per_eur;
     let monthly_usd = cfg.budget.monthly_eur * cfg.budget.usd_per_eur;
@@ -763,10 +803,13 @@ fn plan_create(
     Some(Action::Create {
         slot_id: slot.id,
         offer_id: offer.id,
-        mode: Mode::Interruptible,
+        mode,
         price_usd_h: Some(bid),
         disk_gb: None,
-        reason: format!("{why}: min_bid {:.4} + margin → bid {bid:.4}", offer.min_bid),
+        reason: match mode {
+            Mode::OnDemand => format!("{why}: on-demand dph {bid:.4}"),
+            _ => format!("{why}: min_bid {:.4} + margin → bid {bid:.4}", offer.min_bid),
+        },
     })
 }
 

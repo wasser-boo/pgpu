@@ -383,6 +383,7 @@ fn best_candidate(app: &SharedApp, slot_id: i64) -> Option<OfferSnapshot> {
     let (_, json) = app.db.cached_offers(slot_id)?;
     let offers: Vec<OfferSnapshot> = serde_json::from_str(&json).ok()?;
     let slot = app.cfg.slot(slot_id)?;
+    let on_demand = slot.policy().mode == praxis_policy::SlotMode::OnDemand;
     // Blacklist: Hosts mit ≥ blacklist_after_fails Fails werden nie mehr
     // automatisch gemietet (machine_id 0 = unbekannt/alter Cache → neutral).
     let blacklisted: std::collections::HashSet<i64> = app
@@ -394,8 +395,19 @@ fn best_candidate(app: &SharedApp, slot_id: i64) -> Option<OfferSnapshot> {
         .collect();
     offers
         .into_iter()
-        .filter(|o| o.min_bid > 0.0)
+        // On-Demand: dph_total ist der Preis (reine OD-Angebote haben min_bid=0);
+        // Interruptible: min_bid (OD-only-Angebote raus, dph wäre Fehl-Ranking).
+        .filter(|o| if on_demand { o.dph_total > 0.0 } else { o.min_bid > 0.0 })
         .filter(|o| o.machine_id == 0 || !blacklisted.contains(&o.machine_id))
+        // On-Demand-Ranking über dph_total: min_bid nullen, damit score()
+        // auf dph_total zurückfällt (merged Angebote tragen sonst min_bid).
+        .map(|o| {
+            if on_demand && o.min_bid > 0.0 {
+                OfferSnapshot { min_bid: 0.0, ..o }
+            } else {
+                o
+            }
+        })
         .min_by(|a, b| {
             a.score(slot.disk_gb, slot.traffic_gb, 4.0)
                 .partial_cmp(&b.score(slot.disk_gb, slot.traffic_gb, 4.0))

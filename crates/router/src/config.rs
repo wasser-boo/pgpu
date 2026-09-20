@@ -198,6 +198,9 @@ pub struct SlotCfg {
     pub image: String,
     #[serde(default = "d_disk")]
     pub disk_gb: i64,
+    /// Mietmodus: "interruptible" (Default) oder "on_demand".
+    #[serde(default)]
+    pub mode: String,
     /// Vast-Suchpredicate (bundles q=) für den Slot.
     #[serde(default)]
     pub search_query: String,
@@ -257,6 +260,10 @@ impl SlotCfg {
             bid: self.bid.clone(),
             idle: self.idle_cfg(self.role),
             swap: self.swap.clone(),
+            mode: match self.mode.trim().to_ascii_lowercase().as_str() {
+                "on_demand" | "on-demand" | "ondemand" => praxis_policy::SlotMode::OnDemand,
+                _ => praxis_policy::SlotMode::Interruptible,
+            },
         }
     }
 }
