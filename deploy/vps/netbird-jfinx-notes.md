@@ -102,3 +102,13 @@ wt1) — volle Operators-Rechte inkl. Praxis :1337/:3537. Nutzer-Entscheidung
 tgrid-Bein (nur Router-Ports), das reicht. Datei bleibt als Muster im Repo;
 auf dem NAS ware es sinnlos (NAS hat sein eigenes jfinx-Access-NetBird, der
 Stack selbst sitzt ohnehin in jfinx).
+
+## Praxis 0.6 (21.09. nachts): repair-assets im Entrypoint ✅
+Der Handoff-TODO „praxis repair-assets in den Erststart" ist erledigt: Assets
+(static/, Workflows, Skills) liegen EINGEKOMPIELIERT in der Binary, nicht im
+Image — ohne Ausschreiben ist ein frischer Container dashboard-blind
+(/static/app.js + /logo.png → 404; live auf dem NAS gesehen, „keine Bilder").
+Entrypoint ruft jetzt `praxis repair-assets --directory /opt/praxis` bei
+jedem Start (idempotent, offline, 93 created am Frischstart). Verifiziert
+an vayayo/praxis:0.6 (amd64+arm64 gepusht): VORHER 404/404 → automatisch
+repariert → 200/200. NAS: docker compose pull && up -d.
