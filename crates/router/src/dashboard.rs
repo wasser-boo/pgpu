@@ -182,11 +182,15 @@ pub struct OffersTpl {
     pub mode: String,
     pub offers: Vec<OfferRow>,
     pub default_disk_gb: i64,
+    pub machines: Vec<crate::db::MachineStatRow>,
     pub error: Option<String>,
 }
 
 pub struct OfferRow {
     pub id: i64,
+    pub machine_id: i64,
+    pub machine_fails: i64,
+    pub blacklisted: bool,
     pub gpu_name: String,
     pub cpu_ram_gb: f64,
     pub disk_gb: f64,
@@ -425,19 +429,28 @@ pub async fn offers_page(app: AppCtx, Query(q): Query<HashMap<String, String>>, 
         Ok(o) => (o, None),
         Err(e) => (vec![], Some(format!("{e}"))),
     };
+    let machines = app.db.machine_stats();
+    let stats: std::collections::HashMap<i64, crate::db::MachineStatRow> =
+        machines.iter().map(|m| (m.machine_id, m.clone())).collect();
     let rows: Vec<OfferRow> = offers
         .iter()
         .take(30)
-        .map(|o| OfferRow {
-            id: o.id,
-            gpu_name: o.gpu_name.clone(),
-            cpu_ram_gb: o.cpu_ram_gb,
-            disk_gb: o.disk_gb,
-            inet_down: o.inet_down,
-            reliability2: o.reliability2,
-            min_bid: o.min_bid,
-            dph_total: o.dph_total,
-            storage_cost: o.storage_cost,
+        .map(|o| {
+            let stat = stats.get(&o.machine_id);
+            OfferRow {
+                id: o.id,
+                machine_id: o.machine_id,
+                machine_fails: stat.map(|s| s.fails).unwrap_or(0),
+                blacklisted: stat.map(|s| s.blacklisted).unwrap_or(false),
+                gpu_name: o.gpu_name.clone(),
+                cpu_ram_gb: o.cpu_ram_gb,
+                disk_gb: o.disk_gb,
+                inet_down: o.inet_down,
+                reliability2: o.reliability2,
+                min_bid: o.min_bid,
+                dph_total: o.dph_total,
+                storage_cost: o.storage_cost,
+            }
         })
         .collect();
     let slot_names = app.cfg.slots.iter().map(|s| (s.id, s.name.clone())).collect();
@@ -447,9 +460,33 @@ pub async fn offers_page(app: AppCtx, Query(q): Query<HashMap<String, String>>, 
         mode,
         offers: rows,
         default_disk_gb: app.cfg.slot(slot_id).map(|s| s.disk_gb).unwrap_or(60),
+        machines: machines.into_iter().take(12).collect(),
         error,
     };
     Html(tpl.render().unwrap_or_default()).into_response()
+}
+
+/// Blacklist-Knopf aus dem Dashboard: `/do/machines/:id/:action`.
+pub async fn do_machine_action(app: AppCtx, Path((machine_id, action)): Path<(i64, String)>, headers: axum::http::HeaderMap) -> Response {
+    page_guard!(app, ReqOf(&headers));
+    let (set, note) = match action.as_str() {
+        "blacklist" => (true, "manuell blacklisted (Dashboard)"),
+        "unblacklist" => (false, ""),
+        _ => return (StatusCode::BAD_REQUEST, "unknown action").into_response(),
+    };
+    if app.db.machine_stat(machine_id).is_none() && !set {
+        return (StatusCode::NOT_FOUND, "Maschine unbekannt").into_response();
+    }
+    let _ = app.db.set_machine_blacklist(machine_id, set, note);
+    app.events.emit(
+        &app.0.db,
+        if set { "machine_blacklisted" } else { "machine_unblacklisted" },
+        None,
+        None,
+        &format!("Host {machine_id} {} (Dashboard)", if set { "blacklisted" } else { "von Blacklist entfernt" }),
+        &serde_json::json!({"machine_id": machine_id}),
+    );
+    Redirect::to("/offers").into_response()
 }
 
 fn inst_view(app: &SharedApp, row: &crate::db::InstanceRow) -> InstView {

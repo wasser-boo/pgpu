@@ -94,6 +94,7 @@ fn slot(id: i64, role: Role, instances: Vec<InstanceSnapshot>, active: Option<i6
         last_swap: None,
         candidate_offer: Some(OfferSnapshot {
             id: 50349013,
+            machine_id: 3754,
             gpu_name: "RTX 4060 Ti".into(),
             min_bid: 0.105,
             dph_total: 0.22,
@@ -311,6 +312,7 @@ fn cost_optimization_only_when_enabled_and_cheap_enough() {
     // candidate 0.105 → Ersparnis 47.5 % ≥ 25 %
     s.slots[0].candidate_offer = Some(OfferSnapshot {
         id: 999,
+        machine_id: 4242,
         gpu_name: "RTX 3090".into(),
         min_bid: 0.105,
         dph_total: 0.25,
@@ -392,17 +394,41 @@ fn limits_block_create() {
 #[test]
 fn offer_score_prefers_cheap_rate_with_storage() {
     let o1 = OfferSnapshot {
-        id: 1, gpu_name: "A".into(), min_bid: 0.10, dph_total: 0.0,
+        id: 1, machine_id: 0, gpu_name: "A".into(), min_bid: 0.10, dph_total: 0.0,
         storage_cost: 0.30, inet_down_cost: 0.005,
         cpu_ram_gb: 0.0, gpu_ram_gb: 0.0, disk_gb: 0.0, inet_down: 0.0, reliability2: 0.0, disk_bw: 0.0,
     };
     let o2 = OfferSnapshot {
-        id: 2, gpu_name: "B".into(), min_bid: 0.11, dph_total: 0.0,
+        id: 2, machine_id: 0, gpu_name: "B".into(), min_bid: 0.11, dph_total: 0.0,
         storage_cost: 0.05, inet_down_cost: 0.001,
         cpu_ram_gb: 0.0, gpu_ram_gb: 0.0, disk_gb: 0.0, inet_down: 0.0, reliability2: 0.0, disk_bw: 0.0,
     };
     // 120 GB Disk, 20 GB Traffic, 4 h erwartet:
     assert!(o2.score(120, 20.0, 4.0) < o1.score(120, 20.0, 4.0));
+}
+
+#[test]
+fn offer_score_weights_reliability2() {
+    // Spike-Lektion: billigster Host (0.95) stirbt reihenweise, solider
+    // Nachbar (0.99) kostet 4 % mehr — effektive Kosten drehen das um.
+    let flaky = OfferSnapshot {
+        id: 1, machine_id: 10, gpu_name: "3090 wackelig".into(), min_bid: 0.100, dph_total: 0.0,
+        storage_cost: 0.0, inet_down_cost: 0.0,
+        cpu_ram_gb: 0.0, gpu_ram_gb: 0.0, disk_gb: 0.0, inet_down: 0.0, reliability2: 0.95, disk_bw: 0.0,
+    };
+    let solid = OfferSnapshot {
+        id: 2, machine_id: 11, gpu_name: "3090 solide".into(), min_bid: 0.104, dph_total: 0.0,
+        storage_cost: 0.0, inet_down_cost: 0.0,
+        cpu_ram_gb: 0.0, gpu_ram_gb: 0.0, disk_gb: 0.0, inet_down: 0.0, reliability2: 0.99, disk_bw: 0.0,
+    };
+    // flaky: 0.100/0.95 = 0.10526 — solid: 0.104/0.99 = 0.10505 → solid gewinnt.
+    assert!(solid.score(60, 0.0, 4.0) < flaky.score(60, 0.0, 4.0));
+    // Fehlende reliability2 (0.0) → neutral 0.95, kein absurd hoher Score.
+    let unknown = OfferSnapshot { reliability2: 0.0, ..flaky.clone() };
+    assert!((unknown.score(60, 0.0, 4.0) - 0.100 / 0.95).abs() < 1e-9);
+    // Extreme untere Klemme: 0.5 halbiert nicht den Score ins Bodenlose.
+    let terrible = OfferSnapshot { reliability2: 0.1, ..flaky.clone() };
+    assert!((terrible.score(60, 0.0, 4.0) - 0.100 / 0.5).abs() < 1e-9);
 }
 #[test]
 fn fresh_box_after_midnight_is_not_hard_stopped() {

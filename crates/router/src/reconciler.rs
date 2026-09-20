@@ -12,7 +12,8 @@ use std::collections::HashMap;
 
 pub async fn run(app: SharedApp) {
     let poll = std::time::Duration::from_secs(app.cfg.vast.poll_interval_s.max(5));
-    let mut offer_timer = tokio::time::interval(std::time::Duration::from_secs(app.cfg.vast.offer_poll_s.max(15)));
+    let offer_every = std::time::Duration::from_secs(app.cfg.vast.offer_poll_s.max(15));
+    let mut offer_due = tokio::time::Instant::now();
     let mut meter_hour = tokio::time::Instant::now() + std::time::Duration::from_secs(3600);
     loop {
         tokio::select! {
@@ -21,15 +22,17 @@ pub async fn run(app: SharedApp) {
                 // kleines Antibounce, damit Events nicht 100 % CPU fressen
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
+            // Offer-Refresh entkoppelt: blockierendes interval.tick() hätte
+            // jede Wake-Reaktion um bis zu offer_poll_s verzögert.
+            _ = tokio::time::sleep_until(offer_due) => {
+                for slot in app.cfg.slots.clone() {
+                    let _ = search_slot_offers(&app, slot.id, true).await;
+                }
+                offer_due = tokio::time::Instant::now() + offer_every;
+            }
         }
         if let Err(e) = tick(&app).await {
             tracing::warn!(error = format!("{e:#}"), "reconcile tick failed");
-        }
-        offer_timer.tick().await;
-        {
-            for slot in app.cfg.slots.clone() {
-                let _ = search_slot_offers(&app, slot.id, true).await;
-            }
         }
         if tokio::time::Instant::now() >= meter_hour {
             meter_hour = tokio::time::Instant::now() + std::time::Duration::from_secs(3600);
@@ -49,19 +52,32 @@ pub async fn tick(app: &SharedApp) -> anyhow::Result<()> {
         sync_vast(app, list).await?;
     }
 
-    // 2. Agent-Liveness: unreachable-Erkennung.
+    // 2. Agent-Liveness: unreachable-Erkennung + Host-Fail-Buchung.
+    //    Ein Fail = eine Transition — Reconnects zählen neu, Blips nicht
+    //    (Connector flickt die in ~10 s, bevor 3 min Stille ansteht).
+    let now_ts = chrono::Utc::now().timestamp();
     for inst in app.db.instances(false) {
-        if inst.state == "healthy" || inst.state == "agent_connected" || inst.state == "booting" {
-            let seen = app.hub.last_seen(inst.vast_id);
-            match seen {
-                Some(seen) if chrono::Utc::now().timestamp() - seen > 180 => {
+        if matches!(inst.state.as_str(), "healthy" | "agent_connected" | "booting") {
+            if let Some(seen) = app.hub.last_seen(inst.vast_id) {
+                if now_ts - seen > 180 {
                     let _ = app.db.set_instance_state(inst.vast_id, "unreachable");
+                    record_machine_fail(app, inst.slot_id, inst.vast_id, inst.machine_id, "agent >3 min still (unreachable)");
                     app.events.emit(&app.db, "unreachable", Some(inst.slot_id), Some(inst.vast_id), "Agent >3 min still", &serde_json::json!({}));
                 }
-                None if inst.state != "booting" && inst.actual_status == "running" => {
-                    // kein Agent, aber Vast läuft: Booting bleibt bis Agent kommt
-                }
-                _ => {}
+            }
+        }
+        // 2b. Unreachable-Stopper: Vast sagt running (= GPU-Geld brennt),
+        //     Agent bleibt tot → stoppen (Disk bleibt warm), damit die Box
+        //     nicht unmetered weiterläuft. Fail wurde beim Übergang gezählt.
+        if inst.state == "unreachable" && inst.actual_status == "running" {
+            let connected = app.hub.heartbeat(inst.vast_id).is_some();
+            let silence = app.hub.last_seen(inst.vast_id).map(|s| now_ts - s).unwrap_or(i64::MAX);
+            if !connected && silence > app.cfg.vast.unreachable_stop_after_s.max(180) {
+                let _ = stop_instance(
+                    app,
+                    inst.vast_id,
+                    "unreachable: Vast running, Agent tot — gestoppt, Disk bleibt (Wake startet neu)",
+                );
             }
         }
     }
@@ -113,19 +129,40 @@ async fn sync_vast(app: &SharedApp, list: &[praxis_vast::Instance]) -> anyhow::R
         let Some(v) = by_id.get(&row.vast_id) else {
             // Vast kennt sie nicht mehr → destroyed markieren.
             if row.state != "destroyed" {
+                // Warmup-Box, die Vast komplett verschluckt = Host-Desaster
+                // (kein normaler GC eines exited Interruptible) → Fail zählen.
+                if matches!(row.state.as_str(), "requested" | "provisioning" | "booting" | "agent_connected") {
+                    record_machine_fail(app, row.slot_id, row.vast_id, row.machine_id, "instance_gone während warmup");
+                }
                 let _ = app.db.mark_destroyed(row.vast_id);
                 app.events.emit(&app.db, "instance_gone", Some(row.slot_id), Some(row.vast_id), "nicht mehr in Vast-Liste", &serde_json::json!({}));
             }
             continue;
         };
-        let _ = app.db.update_instance_vast(row.vast_id, &v.actual_or("loading"), v.min_bid.unwrap_or(0.0), v.dph_total.unwrap_or(0.0), v.machine_id.unwrap_or(0), v.gpu_or(""));
+        // machine_id nicht wischen, wenn Vast ihn diesmal nicht liefert.
+        let machine_id = v.machine_id.unwrap_or(row.machine_id);
+        let _ = app.db.update_instance_vast(row.vast_id, &v.actual_or("loading"), v.min_bid.unwrap_or(0.0), v.dph_total.unwrap_or(0.0), machine_id, v.gpu_or(""));
 
         // Preemption: wir WOLLEN running, Vast sagt nein.
         let intended_run = v.intended_or("").is_empty() || v.intended_or("") == "running" || row.intended_status == "running";
-        let actually_dead = matches!(v.actual_or("").as_str(), "stopped" | "exited" | "error" | "deleted")
-            || v.cur_state.as_deref() == Some("stopped");
+        let actual = v.actual_or("");
+        // False-Preempt-Schutz (Spike-Lektion): frische Instanzen melden
+        // mitunter cur_state="stopped", während actual noch "loading"/
+        // "created" ist (Container startet gleich) — KEIN Preempt.
+        // cur_state zählt nur, wenn actual definitiv tot ist ODER die
+        // Box schon mal lief (actual=running + Container weg = echtes Ende).
+        let warming = matches!(actual.as_str(), "" | "loading" | "created" | "provisioning");
+        let actually_dead = matches!(actual.as_str(), "stopped" | "exited" | "error" | "deleted")
+            || (v.cur_state.as_deref() == Some("stopped") && !warming);
         if intended_run && actually_dead && !matches!(row.state.as_str(), "preempted" | "stopped" | "destroyed" | "draining" | "failed") {
             let _ = app.db.set_instance_state(row.vast_id, "preempted");
+            // Host-Fail, wenn die Box nie healthy wurde: gestorben auf dem
+            // Weg hoch = wackliger Host (Spike: 3× 3090 hintereinander),
+            // kein normaler Outbid einer laufenden Instanz.
+            // Von unreachable kommend wurde die Episode schon gezählt.
+            if !row.healthy && row.state != "unreachable" {
+                record_machine_fail(app, row.slot_id, row.vast_id, machine_id, "preempt während warmup");
+            }
             app.events.emit(
                 &app.db,
                 "PREEMPTED",
@@ -142,6 +179,40 @@ async fn sync_vast(app: &SharedApp, list: &[praxis_vast::Instance]) -> anyhow::R
         }
     }
     Ok(())
+}
+
+/// Maschinen-Fail buchen + Auto-Blacklist nach `vast.blacklist_after_fails`.
+/// Spike-Lektion: Wake-Replace mietet sonst immer auf dem nächstbilligen
+//  (= wackligsten) Host; drei 3090-Hosts starben reihenweise vast-seitig.
+fn record_machine_fail(app: &SharedApp, slot_id: i64, instance_id: i64, machine_id: i64, kind: &str) {
+    if machine_id == 0 {
+        return; // ohne machine_id nicht attribuierbar
+    }
+    let Ok(fails) = app.db.record_machine_fail(machine_id, kind) else {
+        return;
+    };
+    let threshold = app.cfg.vast.blacklist_after_fails;
+    let already = app.db.machine_stat(machine_id).map(|m| m.blacklisted).unwrap_or(false);
+    if threshold >= 1 && !already && fails >= threshold {
+        let _ = app.db.set_machine_blacklist(machine_id, true, kind);
+        app.events.emit(
+            &app.db,
+            "machine_blacklisted",
+            Some(slot_id),
+            Some(instance_id),
+            &format!("Host {machine_id} nach {fails} Fails blacklisted ({kind}) — Wake-Replace mietet ihn nicht mehr"),
+            &serde_json::json!({"machine_id": machine_id, "fails": fails}),
+        );
+    } else {
+        app.events.emit(
+            &app.db,
+            "machine_fail",
+            Some(slot_id),
+            Some(instance_id),
+            &format!("Host {machine_id}: Fail #{fails} ({kind})"),
+            &serde_json::json!({"machine_id": machine_id, "fails": fails}),
+        );
+    }
 }
 
 /// Busy: Agent-Meldung, Service-HTTP-Probe (ComfyUI-Queue), Router-In-flight.
@@ -200,7 +271,7 @@ async fn meter(app: &SharedApp) {
         if dt_h <= 0.0 {
             continue;
         }
-        let running = inst.actual_status == "running" && matches!(inst.state.as_str(), "healthy" | "agent_connected" | "booting" | "provisioning" | "draining");
+        let running = inst.actual_status == "running" && matches!(inst.state.as_str(), "healthy" | "agent_connected" | "booting" | "provisioning" | "draining" | "unreachable");
         let rate = match inst.mode {
             Mode::Interruptible => inst.bid_usd_h,
             _ => inst.dph_total,
@@ -277,6 +348,7 @@ pub async fn search_slot_offers(
     let mut by_id: std::collections::HashMap<i64, OfferSnapshot> = std::collections::HashMap::new();
     let snap_from = |o: &praxis_vast::Offer, min_bid: f64, dph: f64| OfferSnapshot {
         id: o.id,
+        machine_id: o.machine_id,
         gpu_name: o.gpu_name.clone(),
         min_bid,
         dph_total: dph,
@@ -311,9 +383,19 @@ fn best_candidate(app: &SharedApp, slot_id: i64) -> Option<OfferSnapshot> {
     let (_, json) = app.db.cached_offers(slot_id)?;
     let offers: Vec<OfferSnapshot> = serde_json::from_str(&json).ok()?;
     let slot = app.cfg.slot(slot_id)?;
+    // Blacklist: Hosts mit ≥ blacklist_after_fails Fails werden nie mehr
+    // automatisch gemietet (machine_id 0 = unbekannt/alter Cache → neutral).
+    let blacklisted: std::collections::HashSet<i64> = app
+        .db
+        .machine_stats()
+        .into_iter()
+        .filter(|m| m.blacklisted)
+        .map(|m| m.machine_id)
+        .collect();
     offers
         .into_iter()
         .filter(|o| o.min_bid > 0.0)
+        .filter(|o| o.machine_id == 0 || !blacklisted.contains(&o.machine_id))
         .min_by(|a, b| {
             a.score(slot.disk_gb, slot.traffic_gb, 4.0)
                 .partial_cmp(&b.score(slot.disk_gb, slot.traffic_gb, 4.0))
@@ -488,6 +570,12 @@ pub async fn apply_action(app: &SharedApp, action: &Action) -> anyhow::Result<()
             Ok(())
         }
         Action::Destroy { instance_id, reason } => {
+            // Warmup-Timeout = Host zu langsam/hängend fürs Hochziehen → Fail.
+            if reason.contains("warmup timeout") || reason.contains("swap_failed") {
+                if let Some(inst) = app.db.instance(*instance_id) {
+                    record_machine_fail(app, inst.slot_id, *instance_id, inst.machine_id, "warmup timeout");
+                }
+            }
             destroy_instance(app, *instance_id, reason).await?;
             Ok(())
         }
@@ -790,7 +878,16 @@ pub async fn start_instance(app: &SharedApp, vast_id: i64, reason: &str) -> anyh
             Err(e) => {
                 attempt += 1;
                 if attempt >= 3 {
-                    app.events.emit(&app.db, "resume_fallback_fresh", Some(inst.slot_id), Some(vast_id), &format!("start fehlgeschlagen ({e}), RESUME_FALLBACK_FRESH"), &serde_json::json!({}));
+                    app.events.emit(&app.db, "resume_fallback_fresh", Some(inst.slot_id), Some(vast_id), &format!("start 3× fehlgeschlagen ({e}) — alte Box zerstört, Wake mietet frisch"), &serde_json::json!({}));
+                    // README-Entscheid: die unstartbare Box zerstören — sonst
+                    // blockiert sie den Wake-Pfad (Policy bevorzugt sie immer
+                    // wieder fürs Starten) und läuft Storage-Kosten auf.
+                    destroy_instance(
+                        app,
+                        vast_id,
+                        "resume_fallback_fresh: start 3× fehlgeschlagen",
+                    )
+                    .await?;
                     anyhow::bail!("start failed: {e}");
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(15 * attempt as u64)).await;

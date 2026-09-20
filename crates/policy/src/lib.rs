@@ -120,6 +120,9 @@ pub struct PolicyConfig {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OfferSnapshot {
     pub id: i64,
+    /// Vast-Maschine (Blacklist-Key); 0 = unbekannt (alte Caches).
+    #[serde(default)]
+    pub machine_id: i64,
     pub gpu_name: String,
     pub min_bid: f64,
     pub dph_total: f64,
@@ -141,12 +144,22 @@ pub struct OfferSnapshot {
 }
 
 impl OfferSnapshot {
-    /// Score nach Bauplan 4.6: Rate + Storage + anteiliger Traffic-Kosten.
+    /// Score nach Bauplan 4.6: Rate + Storage + anteiliger Traffic-Kosten,
+    /// **gewichtet mit reliability2** — erwartete nutzbare Stunden pro gemieteter
+    /// Stunde = reliability2, daher effektive Kosten = Basis / reliability.
+    /// Spike-Lektion: die billigsten Hosts (0.95) starben reihenweise vast-seitig;
+    /// ohne Gewichtung mietet Wake-Replace immer auf den wackligsten Host.
+    /// Fehlende reliability2 (0.0, alte Caches) → neutral 0.95 annehmen.
     pub fn score(&self, disk_gb: i64, traffic_gb: f64, expected_hours: f64) -> f64 {
         let storage = self.storage_cost * disk_gb as f64 / 30.0 / 24.0;
         let traffic = self.inet_down_cost * traffic_gb;
         let rate = if self.min_bid > 0.0 { self.min_bid } else { self.dph_total };
-        rate + storage + traffic / expected_hours.max(0.5)
+        let reliability = if self.reliability2 > 0.0 {
+            self.reliability2.clamp(0.5, 1.0)
+        } else {
+            0.95
+        };
+        (rate + storage + traffic / expected_hours.max(0.5)) / reliability
     }
 }
 

@@ -83,6 +83,14 @@ pub struct VastCfg {
     pub poll_interval_s: u64,
     #[serde(default = "d_offer_poll")]
     pub offer_poll_s: u64,
+    /// Machine-Blacklist: Host nach N Fails (Warmup-Tod/unreachable/
+    /// Warmup-Timeout) automatisch blacklisten. 0/1 = aus (Spike: 2).
+    #[serde(default = "d_blacklist_fails")]
+    pub blacklist_after_fails: i64,
+    /// Wie lange ein unreachable-Host läuft, bevor der Router ihn stoppt
+    /// (GPU-Geld brennt, Agent >3 min still; Disk bleibt erhalten).
+    #[serde(default = "d_unreachable_stop_s")]
+    pub unreachable_stop_after_s: i64,
 }
 
 fn d_poll() -> u64 {
@@ -90,6 +98,12 @@ fn d_poll() -> u64 {
 }
 fn d_offer_poll() -> u64 {
     60
+}
+fn d_blacklist_fails() -> i64 {
+    2
+}
+fn d_unreachable_stop_s() -> i64 {
+    300
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

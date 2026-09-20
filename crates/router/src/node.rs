@@ -157,7 +157,10 @@ async fn node_session(app: SharedApp, socket: WebSocket) {
     if let Some(v) = registered_vast_id {
         tracing::info!(v, "agent disconnected");
         app.hub.unregister(v);
-        let _ = app.db.update_instance_agent(v, None, false, "unreachable");
+        // NICHT sofort unreachable: Blips (Agent-Restart, NetBird-Zucken)
+        // soll der Connector in ~10 s wieder flicken. Der Reconciler
+        // setzt unreachable erst nach >3 min Agent-Stille — und genau dort
+        // wird der Maschinen-Fail gezählt (Blacklist-Basis).
         app.reconcile_now.notify_one();
     }
 }

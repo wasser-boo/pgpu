@@ -107,6 +107,36 @@ pub async fn offers(app: AppCtx, Query(params): Query<HashMap<String, String>>, 
     }
 }
 
+// ------------------------------------------------------------- Machines
+
+/// Host-Bilanz (Fails + Blacklist) — Basis der Wake-Replace-Vermeidung.
+pub async fn machines(app: AppCtx, req: Request) -> Response {
+    guarded!(app, req);
+    axum::Json(app.db.machine_stats()).into_response()
+}
+
+pub async fn machine_action(app: AppCtx, Path((machine_id, action)): Path<(i64, String)>, req: Request) -> Response {
+    guarded!(app, req);
+    let (set, note) = match action.as_str() {
+        "blacklist" => (true, "manuell blacklisted (API)"),
+        "unblacklist" => (false, ""),
+        _ => return (StatusCode::BAD_REQUEST, "unknown action; use blacklist|unblacklist").into_response(),
+    };
+    if app.db.machine_stat(machine_id).is_none() && !set {
+        return (StatusCode::NOT_FOUND, "machine unknown").into_response();
+    }
+    let _ = app.db.set_machine_blacklist(machine_id, set, note);
+    app.events.emit(
+        &app.0.db,
+        if set { "machine_blacklisted" } else { "machine_unblacklisted" },
+        None,
+        None,
+        &format!("Host {machine_id} {} (API)", if set { "blacklisted" } else { "von Blacklist entfernt" }),
+        &serde_json::json!({"machine_id": machine_id}),
+    );
+    (StatusCode::OK, if set { "blacklisted" } else { "unblacklisted" }).into_response()
+}
+
 // ------------------------------------------------------------- Slot actions
 
 pub async fn slot_action(app: AppCtx, Path((slot_id, action)): Path<(i64, String)>, req: Request) -> Response {

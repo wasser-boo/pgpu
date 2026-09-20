@@ -17,10 +17,11 @@
 
 <div class="card">
 <table>
-<tr><th>ID</th><th>GPU</th><th>RAM</th><th>Disk</th><th>inet ↓</th><th>Reliab.</th><th>min_bid</th><th>on-demand</th><th>Storage</th><th></th></tr>
+<tr><th>ID</th><th>Host</th><th>GPU</th><th>RAM</th><th>Disk</th><th>inet ↓</th><th>Reliab.</th><th>min_bid</th><th>on-demand</th><th>Storage</th><th></th></tr>
 {% for o in offers %}
-<tr>
+<tr{% if o.blacklisted %} style="opacity:0.45"{% endif %}>
   <td class="mono">{{ o.id }}</td>
+  <td class="mono">{% if o.blacklisted %}<span class="badge b-bad" title="Host blacklisted: {{ o.machine_fails }} Fails">⛔ {{ o.machine_id }}</span>{% else %}{{ o.machine_id }}{% if o.machine_fails > 0 %} <span class="badge b-warn" title="Fails">{{ o.machine_fails }}✗</span>{% endif %}{% endif %}</td>
   <td>{{ o.gpu_name }}</td>
   <td class="mono">{{ o.cpu_ram_gb|fmt1 }} GB</td>
   <td class="mono">{{ o.disk_gb|fmt0 }} GB</td>
@@ -35,7 +36,7 @@
       <input type="hidden" name="slot_id" value="{{ slot_id }}">
       <input type="hidden" name="mode" value="{{ mode }}">
       Disk <input name="disk_gb" size="4" value="{{ default_disk_gb }}">
-      <button>Mieten</button>
+      <button>{% if o.blacklisted %}Trotzdem mieten{% else %}Mieten{% endif %}</button>
     </form>
   </td>
 </tr>
@@ -43,4 +44,29 @@
 </table>
 </div>
 {% if offers.is_empty() %}<p class="mut">Keine Angebote — Suche fehlgeschlagen oder Filter zu eng. Vast-Key gesetzt?</p>{% endif %}
+
+{% if !machines.is_empty() %}
+<h2>Host-Bilanz (Fails → Blacklist)</h2>
+<div class="card">
+<table>
+<tr><th>Machine</th><th>Fails</th><th>Blacklist</th><th>Letzter Fail</th><th>Grund</th><th></th></tr>
+{% for m in machines %}
+<tr>
+  <td class="mono">{{ m.machine_id }}</td>
+  <td class="mono">{{ m.fails }}</td>
+  <td>{% if m.blacklisted %}<span class="badge b-bad">⛔ blacklisted</span>{% else %}<span class="badge b-ok">ok</span>{% endif %}</td>
+  <td class="mono">{% match m.last_fail_at %}{% when Some with (t) %}{{ t }}{% when None %}—{% endmatch %}</td>
+  <td>{{ m.note }}</td>
+  <td>
+    {% if m.blacklisted %}
+    <form method="post" action="/do/machines/{{ m.machine_id }}/unblacklist"><button>Entsperren</button></form>
+    {% else %}
+    <form method="post" action="/do/machines/{{ m.machine_id }}/blacklist"><button>Blacklisten</button></form>
+    {% endif %}
+  </td>
+</tr>
+{% endfor %}
+</table>
+</div>
+{% endif %}
 {% endblock %}

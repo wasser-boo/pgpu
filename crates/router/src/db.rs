@@ -60,6 +60,16 @@ pub struct EventRow {
     pub payload_json: String,
 }
 
+/// Host-Bilanz: Fails (Warmup-Tod/unreachable/Timeout) + Blacklist-Zustand.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MachineStatRow {
+    pub machine_id: i64,
+    pub fails: i64,
+    pub blacklisted: bool,
+    pub last_fail_at: Option<String>,
+    pub note: String,
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct MeterRow {
@@ -153,6 +163,13 @@ impl Db {
                 ts TEXT NOT NULL,
                 query TEXT NOT NULL DEFAULT '',
                 offers_json TEXT NOT NULL DEFAULT '[]'
+            );
+            CREATE TABLE IF NOT EXISTS machine_stats(
+                machine_id INTEGER PRIMARY KEY,
+                fails INTEGER NOT NULL DEFAULT 0,
+                blacklisted INTEGER NOT NULL DEFAULT 0,
+                last_fail_at TEXT,
+                note TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS assets_hash_cache(
                 path TEXT PRIMARY KEY,
@@ -570,6 +587,74 @@ impl Db {
         .optional()
         .ok()
         .flatten()
+    }
+
+    // ------------------------------------------------------------ Machines
+
+    /// Maschinen-Fail zählen (warmup-Tod, unreachable, Warmup-Timeout).
+    /// Liefert den neuen Zählerstand.
+    pub fn record_machine_fail(&self, machine_id: i64, kind: &str) -> anyhow::Result<i64> {
+        if machine_id == 0 {
+            return Ok(0); // ohne machine_id nicht attribuierbar
+        }
+        let conn = self.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO machine_stats(machine_id, fails, last_fail_at, note) VALUES(?1, 1, ?2, ?3)
+             ON CONFLICT(machine_id) DO UPDATE SET
+               fails = fails + 1, last_fail_at = ?2,
+               note = CASE WHEN ?3 = '' THEN note ELSE ?3 END",
+            params![machine_id, now_iso(), kind],
+        )?;
+        Ok(conn.query_row(
+            "SELECT fails FROM machine_stats WHERE machine_id=?1",
+            params![machine_id],
+            |r| r.get::<_, i64>(0),
+        )?)
+    }
+
+    pub fn set_machine_blacklist(&self, machine_id: i64, blacklisted: bool, note: &str) -> anyhow::Result<()> {
+        let conn = self.0.lock().unwrap();
+        conn.execute(
+            "INSERT INTO machine_stats(machine_id, fails, blacklisted, note) VALUES(?1, 0, ?2, ?3)
+             ON CONFLICT(machine_id) DO UPDATE SET blacklisted=?2,
+               note = CASE WHEN ?3 = '' THEN note ELSE ?3 END",
+            params![machine_id, blacklisted as i64, note],
+        )?;
+        Ok(())
+    }
+
+    pub fn machine_stat(&self, machine_id: i64) -> Option<MachineStatRow> {
+        let conn = self.0.lock().unwrap();
+        conn.query_row(
+            "SELECT * FROM machine_stats WHERE machine_id=?1",
+            params![machine_id],
+            Self::machine_row_from,
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    pub fn machine_stats(&self) -> Vec<MachineStatRow> {
+        let conn = self.0.lock().unwrap();
+        let Ok(mut stmt) =
+            conn.prepare("SELECT * FROM machine_stats ORDER BY blacklisted DESC, fails DESC, last_fail_at DESC")
+        else {
+            return vec![];
+        };
+        stmt.query_map([], Self::machine_row_from)
+            .map(|rows| rows.filter_map(Result::ok).collect())
+            .unwrap_or_default()
+    }
+
+    fn machine_row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<MachineStatRow> {
+        Ok(MachineStatRow {
+            machine_id: r.get("machine_id")?,
+            fails: r.get("fails")?,
+            blacklisted: r.get::<_, i64>("blacklisted")? != 0,
+            last_fail_at: r.get("last_fail_at")?,
+            note: r.get("note")?,
+        })
     }
 
     // ------------------------------------------------------------ Settings/Hashes

@@ -47,6 +47,10 @@ pub struct AgentHandle {
 
 struct HubInner {
     agents: HashMap<i64, Arc<Mutex<AgentHandle>>>,
+    /// Letzte Herzschlag-Zeit pro Instanz — überlebt `unregister`, damit
+    /// der Reconciler auch NACH einem WS-Abriß „Agent seit X s still"
+    /// erkennen kann (Sitzung weg = last_seen(None) sonst nicht unterscheidbar).
+    last_seen_all: HashMap<i64, i64>,
     pending: HashMap<u64, oneshot::Sender<CommandResult>>,
     terms: HashMap<u64, mpsc::UnboundedSender<serde_json::Value>>,
     next_id: u64,
@@ -54,7 +58,13 @@ struct HubInner {
 
 impl Default for HubInner {
     fn default() -> Self {
-        Self { agents: HashMap::new(), pending: HashMap::new(), terms: HashMap::new(), next_id: 0 }
+        Self {
+            agents: HashMap::new(),
+            last_seen_all: HashMap::new(),
+            pending: HashMap::new(),
+            terms: HashMap::new(),
+            next_id: 0,
+        }
     }
 }
 
@@ -91,12 +101,14 @@ impl Hub {
             .unwrap()
             .agents
             .insert(vast_id, Arc::new(Mutex::new(handle)));
+        self.inner.lock().unwrap().last_seen_all.insert(vast_id, chrono::Utc::now().timestamp());
         rx
     }
 
     pub fn unregister(&self, vast_id: i64) {
         let mut inner = self.inner.lock().unwrap();
         inner.agents.remove(&vast_id);
+        // last_seen_all bleibt bewusst stehen (s. oben).
     }
 
     #[allow(dead_code)]
@@ -112,7 +124,10 @@ impl Hub {
 
     pub fn last_seen(&self, vast_id: i64) -> Option<i64> {
         let inner = self.inner.lock().unwrap();
-        inner.agents.get(&vast_id).map(|h| h.lock().unwrap().last_seen)
+        match inner.agents.get(&vast_id) {
+            Some(h) => Some(h.lock().unwrap().last_seen),
+            None => inner.last_seen_all.get(&vast_id).copied(),
+        }
     }
 
     pub fn nb_ip(&self, vast_id: i64) -> Option<String> {
@@ -136,15 +151,17 @@ impl Hub {
 
     /// Heartbeat vom WS-Task einsortieren.
     pub fn record_heartbeat(&self, vast_id: i64, hb: HeartbeatData, nb_ip: Option<String>) {
-        let inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
+        let ts = chrono::Utc::now().timestamp();
         if let Some(h) = inner.agents.get(&vast_id) {
             let mut g = h.lock().unwrap();
             g.heartbeat = hb;
-            g.last_seen = chrono::Utc::now().timestamp();
+            g.last_seen = ts;
             if nb_ip.is_some() {
                 g.nb_ip = nb_ip;
             }
         }
+        inner.last_seen_all.insert(vast_id, ts);
     }
 
     /// Kommando senden und auf Ergebnis warten.
