@@ -173,8 +173,13 @@ docker compose -f vps-compose.yml up -d
 #    http://100.105.x.y:1337 → Login DASHBOARD_ADMIN_PASSWORD → Settings:
 #    DISCORD_BOT_TOKEN + Provider-Keys eintragen, dabei im Feld
 #    „Master-Passwort“ den Inhalt von vps/master_key einfügen → speichert
-#    verschlüsselt in secrets.enc2 (im praxis-state-Bind). Danach Discord
-#    im Settings-Tab aktivieren.
+#    verschlüsselt in secrets.enc2 (im praxis-state-Bind).
+#    FÜR DISCORD zusätzlich (Schritt-für-Schritt auch als Kommentarblock
+#    am praxis-Service in vps-compose.yml): DISCORD_APPLICATION_ID in
+#    vps/praxis.env auskommentieren + eintragen (Developer-Portal →
+#    General → Application ID), danach
+#    docker compose -f vps-compose.yml up -d --force-recreate praxis
+#    — der Bot verbindet sich erst beim Praxis-Start.
 ```
 
 **Ablauf des Master-Keys beim Start (zur Kontrolle):** Entrypoint (root)

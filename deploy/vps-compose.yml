@@ -75,6 +75,27 @@ services:
     restart: unless-stopped
     depends_on: [netbird]
 
+  # Discord aktivieren (einmalig, NACH dem ersten Start — Gateway/Dashboard
+  # laufen auch ohne):
+  #   1. vps/praxis.env: DISCORD_APPLICATION_ID auskommentieren und die
+  #      numerische Application-ID aus dem Discord-Developer-Portal
+  #      (discord.com/developers/applications → General → Application ID)
+  #      eintragen — sie ist KEIN Secret und kommt in die Env.
+  #   2. Praxis-Dashboard öffnen: http://<praxis-vps-nb-ip>:1337 → Login mit
+  #      DASHBOARD_ADMIN_PASSWORD aus vps/praxis.env → Settings-Tab.
+  #   3. Secret „DISCORD_BOT_TOKEN" eintragen (Bot-Token aus dem Portal,
+  #      discord.com/developers/applications → Bot → Reset/View Token) und
+  #      dabei im Feld „Master-Passwort" den INHALT von vps/master_key
+  #      einfügen — nur dann wird der Token verschlüsselt in
+  #      /opt/praxis/state/secrets.enc2 persistiert (ohne Master-Passwort
+  #      gilt er nur im RAM bis zum Restart). Die Agent-Shell (shared VM-
+  #      mode) kann den Store nie lesen — deshalb NIE als Compose-Env!
+  #   4. Neustart — der Bot verbindet sich erst beim Praxis-Start:
+  #      docker compose -f vps-compose.yml up -d --force-recreate praxis
+  #      Kontrolle: docker compose -f vps-compose.yml logs praxis |
+  #        grep -i discord   → „Discord bot connecting…"
+  #      (ohne Token/ID: „DISCORD_BOT_TOKEN not set" / APPLICATION_ID-Fehler —
+  #      Gateway und Dashboard laufen trotzdem weiter.)
   praxis:
     image: vayayo/praxis:latest
     container_name: praxis-app
