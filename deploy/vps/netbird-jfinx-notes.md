@@ -29,11 +29,18 @@ Der Heimserver-Stack bleibt GESTOPPT (gleicher VAST_API_KEY — niemals zwei
 Router gleichzeitig!) und wird nach NAS-Health stillgelegt
 (`docker compose -f vps-compose.yml down` auf dem Heimserver).
 
-Beobachtung 20.09. ~19:10: Router-Log zeigte vast-GET-Fehler
-(deprecated_endpoint für /api/v0) + alle Boxen „instance_gone" — Nutzer:
-Boxen wurden selbst zugemacht, Vast mietet normal. FALLS der NAS-Router beim
-Start keine Offers/Instances sieht: /api/v0→/api/v1 in crates/vast
-(BASE-Konstante) prüfen. Vast-Konto hat aktuell 0 Instanzen.
+Beobachtung 20.09. ~19:10: Router-Log zeigte vast-GET-Fehler + alle Boxen
+„instance_gone". AUFGELÖST 21.09. nachts: NICHT die v0-API und NICHT das
+Env-Reading — **der alte Vast-API-Key wurde von Vast ungültig** (v0
+users/current + v0 asks + v1 instances: „Invalid user key"; nur die
+publice Offers-Suche nahm ihn weiter an → wirkte wie „Key wird nicht
+gelesen"). Neuer Key (in deploy/.env + deploy/nas/docker-compose.yml,
+NIE ins Repo!) verifiziert auf ALLEN Router-Endpoints: v1-instances
+(success/next_token-Schema ✓), v0-users/current (Metering ✓, Credit
+10.71 $), v0-asks (auth ✓), v0-Suche mit Router-Body (Offers mit
+dph_total/min_bid ✓). crates/vast braucht KEINE Änderung — die Teil-
+Migration (instances=v1, Rest=v0) passt. ⚠️ Credit ist knapp: Pool-Refill
+(2× LLM-Download + Media) frisst die 10 $ schnell — ggf. aufladen.
 
 Offen nach NAS-Start:
 1. Budget in deploy/nas/vps/config.toml nach Stabilisierung auf 2.0/2.4
@@ -87,3 +94,11 @@ Frisch auf dem NAS: neue Peer-IPs, leere Volumes (keine Chats/Metering —
 
 ## Updates NetBird-Stack (VPS): cd ~ && docker compose pull && docker compose up -d
 (Das gepostete `netbirdio/reverse-proxy`-Snippet NICHT nutzen — Traefik macht den Job.)
+
+## Workstation-jfinx (ws-jfinx-compose.yml): optional, aktuell NICHT deployed
+Zweck: gibt DIESEM PC Browser-Zugriff aufs jfinx-Overlay (Host-Netz-Container,
+wt1) — volle Operators-Rechte inkl. Praxis :1337/:3537. Nutzer-Entscheidung
+21.09.: abgebaut (Container+Peer gelöscht) — Router-Zugriff läuft uber das
+tgrid-Bein (nur Router-Ports), das reicht. Datei bleibt als Muster im Repo;
+auf dem NAS ware es sinnlos (NAS hat sein eigenes jfinx-Access-NetBird, der
+Stack selbst sitzt ohnehin in jfinx).
