@@ -457,24 +457,29 @@ pub fn decide(snap: &Snapshot, cfg: &PolicyConfig) -> Vec<Action> {
         // ungeflippte) zählen — kein Doppel-Mieten.
         if slot.desired_running && !slot_pinned {
             let actives = slot.instances.iter().filter(|i| i.state.is_active()).count();
-            // Live-Zähler fürs total-Limit: nie-healthy-gewordene preempted
-            // Zombies sind Müll (werden im selben Pass geräumt) und dürfen
-            // die Pool-Grenze nicht blockieren (s. max_per_slot-Fix 751d771).
+            // Live-Zähler fürs total-Limit: Preempted (nie-healthy-Zombies UND
+            // ausgebene Boxen) zählen nicht — sie werden geräumt bzw. als
+            // Restart-Kandidat behandelt und dürfen die Pool-Grenze nicht
+            // blockieren (sonst: Box preempted → kein Refill → für immer
+            // unter-warm). Failed (Warmup-Müll) ebenso.
             let live = slot
                 .instances
                 .iter()
-                .filter(|i| !(i.state == InstanceState::Preempted && !i.healthy))
+                .filter(|i| !matches!(i.state, InstanceState::Preempted | InstanceState::Failed))
                 .count();
             if actives < scfg.pool.warm {
-                if let Some(stopped) = slot
+                // Restart-Präferenz: GESTOPPTE Box starten (Disk warm, kein
+                // Image-Pull). Preempted bewusst NICHT starten: Restart am
+                // gleichen Bid wäre sofort wieder ausgeboben — der Restart-
+                // Kandidat wird über SwapOut→stopped erreichbar.
+                if let Some(cand) = slot
                     .instances
                     .iter()
                     .find(|i| i.state == InstanceState::Stopped && !i.pinned)
                 {
-                    // Restart-Präferenz: gleiche Instanz starten (Disk warm).
-                    if let Some(r) = budget_ok_for_start(snap, cfg, stopped, hours_to_end, soft_usd, monthly_usd) {
+                    if let Some(r) = budget_ok_for_start(snap, cfg, cand, hours_to_end, soft_usd, monthly_usd) {
                         actions.push(Action::Start {
-                            instance_id: stopped.vast_id,
+                            instance_id: cand.vast_id,
                             reason: if scfg.pool.warm > 1 {
                                 format!("{} — Pool auffüllen ({actives}/{} warm)", r, scfg.pool.warm)
                             } else {
@@ -635,6 +640,30 @@ pub fn decide(snap: &Snapshot, cfg: &PolicyConfig) -> Vec<Action> {
                     instance_id: inst.vast_id,
                     reason: "preempted vor healthy — aufräumen (kein Warmhaltewert)".into(),
                 });
+            }
+        }
+
+        // --- Pool: ausgebene Boxen (preempted, healthy gewesen) nach dem
+        // Keep-Warm-Fenster räumen — Restart am gleichen Bid wäre sofort
+        // wieder ausgeboben, die Pool-Füllung mietet derweil frisch; ohne
+        // Traffic läuft die Box sonst Storage-Kosten ohne Nutzen.
+        if scfg.pool.total > 1 {
+            for inst in &slot.instances {
+                if inst.state != InstanceState::Preempted || !inst.healthy || inst.pinned {
+                    continue;
+                }
+                let stale = slot
+                    .last_traffic
+                    .map(|t| (snap.now - t).num_seconds() > scfg.swap.keep_warm_window_s)
+                    .unwrap_or(true);
+                if stale {
+                    actions.push(Action::Destroy {
+                        instance_id: inst.vast_id,
+                        reason: format!(
+                            "preempted nach healthy, kein Traffic seit Keep-Warm-Fenster (Pool räumt auf)"
+                        ),
+                    });
+                }
             }
         }
 
