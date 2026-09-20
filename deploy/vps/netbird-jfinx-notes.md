@@ -22,34 +22,50 @@ benötigt).
   (keine Ranges — dafür `port_ranges`).
 - Setup-Keys/Gruppen: wie gehabt (auto_groups = ID-Array).
 
-## Migration (offen):
-0. ⚠️ **Vast hat am 20.09. ~19:10 die v0-API abgeschaltet** (deprecated_endpoint):
-   der Router (crates/vast, BASE=…/api/v0) sieht keine Instanzen/Offers mehr und
-   hat daraufhin alle 3 Boxen als „instance_gone" entsorgt (Vast-Konto: 0
-   Instanzen). crates/vast MUSS vor dem nächsten Box-Start auf /api/v1 umgestellt
-   werden (Endpoints + Antwort-Schema prüfen), sonst mietet der Pool nie wieder.
-1. vps/config.toml `[netbird]`: api_url=management_url=https://***REMOVED***,
-   groups=["vast-gpus"] setzen; .env: NB_MANAGEMENT_URL=https://***REMOVED***,
-   NB_SETUP_KEY=***REMOVED***-…, NB_API_TOKEN=<NB_API_TOKEN_JFINX>.
-2. NetBird-Volume frisch (`docker volume rm praxis-vps_netbird-config`) →
-   praxis-netbird enrollt als NEUER Peer in jfinx (Gruppe praxis-stack).
-3. Compose neu hoch; router_nb_ip=auto findet die neue IP.
-4. tgrid-GPU-Boxen zerstören → Pool refüllt mit jfinx-Keys (Mint läuft über
-   NB_API_TOKEN=neuer PAT). (Vast-Konto hat aktuell 0 Instanzen — nichts
-   mehr zu zerstören, Refill startet automatisch.)
-5. Workstation dual-enroll: 2. netbird-Instanz (eigene Config),
-   Management-URL https://***REMOVED***, Operators-Key.
-6. Danach tgrid aufräumen (alte GPU-Peers/Keys; praxis-vps aus tgrid-Gruppen).
+## Migration — Plan (20.09. spät): Stack wandert auf den NAS
+Statt den Router auf dem Heimserver neu zu enrollen, zieht der GESAMTE Stack
+auf den NAS (immer an). `deploy/nas/` = Komplett-Bundle (s. NAS-Abschnitt).
+Der Heimserver-Stack bleibt GESTOPPT (gleicher VAST_API_KEY — niemals zwei
+Router gleichzeitig!) und wird nach NAS-Health stillgelegt
+(`docker compose -f vps-compose.yml down` auf dem Heimserver).
 
-## NAS: fertig ✅ (20.09. abends II)
-`deploy/nas-compose.yml` = Zero-Config-Compose mit BEIDEN NetBirds (Bridge-
-Netns, Sidecar-Muster): netbird-tgrid → tgrid (Peer „nas", Gruppen
-developers+servers, frischer reusable Key „nas-dual" `***REMOVED***-…`, bis
-20.09.2027 — tgrid nimmt expires_in in SEKUNDEN!) + netbird-jfinx →
-jfinx (Operators-Key). Live getestet: beide Enrollments Connected (tgrid
-***REMOVED*** / jfinx ***REMOVED***), Overlay-Datenpfad via ACL
-(nas→forgejo:22 OK); Test-Peers danach per API gelöscht. Auf dem NAS nur
-`docker compose -f nas-compose.yml up -d`.
+Beobachtung 20.09. ~19:10: Router-Log zeigte vast-GET-Fehler
+(deprecated_endpoint für /api/v0) + alle Boxen „instance_gone" — Nutzer:
+Boxen wurden selbst zugemacht, Vast mietet normal. FALLS der NAS-Router beim
+Start keine Offers/Instances sieht: /api/v0→/api/v1 in crates/vast
+(BASE-Konstante) prüfen. Vast-Konto hat aktuell 0 Instanzen.
+
+Offen nach NAS-Start:
+1. tgrid aufräumen: tote GPU-Peers/-Keys, toten praxis-vps-Peer
+   (***REMOVED***) löschen — tgrid-PAT liegt als NB_API_TOKEN in deploy/.env.
+2. Budget in deploy/nas/vps/config.toml nach Stabilisierung auf 2.0/2.4
+   (Achtung: blockiert evtl. den ersten kompletten Pool-Refill, s. Kommentar).
+3. Optional Heimserver-Daten übernehmen (alpine-tar pro Volume):
+   praxis-data (Chats), router-data (Metering+Host-Blacklist), stt-models.
+4. Workstation dual-enroll für jfinx (Operators-Key), wenn Browser-Zugriff
+   vom Arbeitsplatz gewünscht — das NAS bringt sein eigenes jfinx-Access-
+   NetBird mit.
+
+## NAS: fertig ✅ (20.09. abends II) — zwei Artefakte
+1. `deploy/nas-compose.yml` — NUR die beiden Access-NetBirds (Bridge-Netns,
+   Sidecar-Muster): netbird-tgrid → tgrid (Peer „nas", Gruppen
+developers+servers, reusable Key „nas-dual" `***REMOVED***-…`, bis 20.09.2027 —
+tgrid nimmt expires_in in SEKUNDEN!) + netbird-jfinx → jfinx (Operators-Key).
+Live getestet: beide Enrollments Connected (tgrid ***REMOVED*** / jfinx
+***REMOVED***), Overlay-Datenpfad via ACL (nas→forgejo:22 OK); Test-Peers
+hinterher per API gelöscht.
+2. `deploy/nas/` (gitignored — echte Secrets inline!) = KOMPLETT-Bundle:
+`docker-compose.yml` mit dem GANZEN GPU-Stack (netbird → jfinx als
+„praxis-vps" mit Key `***REMOVED***-…`; stt; router mit ROUTER_TOKEN/VAST_API_KEY/
+NB_API_TOKEN=jfinx-PAT inline; praxis mit ALLEN Env inline + master_key-
+Secret + praxis-state-Bind) PLUS den beiden Access-NetBirds. Dazu `vps/
+config.toml` (auf jfinx+vast-gpus umgestellt; Budget 12/14 € Test-Wert),
+`vps/master_key`, `vps/praxis-state/` (Secret-Store). Start auf dem NAS:
+das Verzeichnis rsyncen + `docker compose up -d` (Details im Compose-Header).
+Verifiziert: `docker compose config` valid; praxis-stack-Key live enrollt
+(praxis-vps → ***REMOVED***, Connected; Test-Peer danach gelöscht).
+Frisch auf dem NAS: neue Peer-IPs, leere Volumes (keine Chats/Metering —
+Übernahme optional, s. Migration Punkt 3).
 
 ## Updates NetBird-Stack (VPS): cd ~ && docker compose pull && docker compose up -d
 (Das gepostete `netbirdio/reverse-proxy`-Snippet NICHT nutzen — Traefik macht den Job.)

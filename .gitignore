@@ -10,3 +10,6 @@ deploy/data/
 deploy/vps/master_key
 deploy/vps/praxis.env
 deploy/vps/praxis-state/
+
+# NAS-Komplett-Bundle (echte Secrets inline in der Compose — NIE committen):
+deploy/nas/
