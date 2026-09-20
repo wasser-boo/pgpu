@@ -39,14 +39,17 @@ Entrypoint — sonst enrolls Vast unter Container-ID).
 | 2 | gpu-agent | ✅ v0.1.2: lauscht 127.0.0.1:9100, Router wählt sich ein; Health-Probes direkt auf Loopback; Asset-Push-Handler + Readiness-Gate (§14.2) |
 | 3 | Proxy | ✅ live bewiesen (Passthrough, Pfad-Strip, /inst, STT-Sidecar, X-GPU-*-Header) |
 | 4 | Reconciler + Policy live | ✅ erprobt: Wake, Idle-Stop, PREEMPTED→Auto-Replace, Budget-Alerts + budget-geblockter Start, Warming-Gate gegen Doppel-Miete |
-| 5 | Dashboard | ✅ gebaut (browsergetestet: noch offen) |
-| 6 | Praxis-Integration | 🔲 nur Settings: `/context set settings.comfyui_base_url=http://100.105.6.69:8188`, `settings.voice_vosk_url=ws://100.105.6.69:2700`, `settings.llama_base_url=http://100.105.6.69:11434` |
+| 5 | Dashboard | ✅ gebaut, alle Seiten rendern 200; Host-Bilanz + Blacklist-Knöpfe auf `/offers`; Klick-Fluss im Browser noch offen |
+| 6 | Praxis-Integration | 🔲 Settings auf Router-IP (Befehle unten) |
 | 7 | VPS-Umzug | compose ist host-unabhängig |
 
 ### Offene Punkte (nächste Session)
 - **Machine-Blacklist** ✅ 20.09. live: `machine_stats` zählt Fails (preempt während warmup, instance_gone im Warmup, warmup-timeout, agent >3 min still), Auto-Blacklist nach `vast.blacklist_after_fails` (Default 2), `best_candidate` filtert blacklisted Hosts, Offer-Score durch `reliability2` geteilt. Erster Live-Fang: Host 32560 + 144003 je Fail #1 in der ersten Stunde. Dashboard `/offers` zeigt Host-Bilanz + Blacklist-Knöpfe; API `GET /api/v1/machines`, `POST /api/v1/machines/:id/blacklist|unblacklist`.
 - **False-Preempt-Schutz** ✅ 20.09.: `cur_state=stopped` zählt nicht mehr als tot, solange `actual` noch loading/created ist; echte Preempts (actual=exited) weiterhin erkannt.
 - Alert-Dedupe (30 min/Art — budget_80 spamte alle 30 s), Audit-Trail `slot_desired` (wer setzt desired), Reconciler-Loop entkoppelt Offer-Refresh (blockierendes tick() verzog jede Wake-Reaktion), Connector dialt preempted Boxen nicht mehr.
+- **Idle-ab-Healthy** ✅ 20.09.: 50-min-Warmup-Box wurde 29 s nach dem Flip gestoppt (Idle zählte ab Miete) — jetzt `healthy_since` in DB, Idle-Uhr ab Healthy/letztem Traffic. Nebenbefund gefixt: `prewarm_start` lief an fensterfreien Tagen Some und verschluckte den „Fenster zu → Stop".
+- **Preempted-Warmup-Zombies** ✅ 20.09.: nie-healthy-gewordene preempted Boxen werden aufgeräumt und belegen `max_per_slot` nicht mehr (sonst blockieren sie jeden Wake-Replace). Heartbeat kann PREEMPTED nicht mehr auf booting zurücksetzen (zählte Doppel-Fails).
+- **LLM-Slot live** (20.09., in Arbeit): `qwen3.6-35b-a3b` (20.4 GB, Guide-Modell) statt Flash-Next (82 GB braucht Blackwell — moe-cache aktivierte auf Ada nicht, Fork-Guard griff; 0.30 $/h verbrannt, dann umgestellt). Download-Progress über Agent klappt (`PRAXIS_AGENT_MODEL_TOTAL_BYTES`), Warmup auf 60 min erhöht.
 - **Unreachable-Stopper**: Box mit vast=running + Agent >5 min tot wird gestoppt (Disk warm, kein GPU-Geld-Brennen); `resume_fallback_fresh` zerstört die alte Box nach 3× fehlgeschlagenem Start (blockiert sonst den Wake-Pfad).
 - **LLM-Image bauen** (CUDA-Build ≈ 30-60 min) + Slot-1-Test.
 - Praxis-Session-Hook (wake bei Session-Start), GpuRouterClient (X-Router-Wait/Job-Id), Browser-Test Dashboard.
