@@ -31,7 +31,14 @@ impl EventBus {
         self.tx.subscribe()
     }
 
+    /// Sender für Db::add_event (Live-Feed auch für direkte DB-Event-Rufer).
+    pub fn sender(&self) -> broadcast::Sender<SseEvent> {
+        self.tx.clone()
+    }
+
     /// Persistiert + verteilt. Payload landet nur in der DB.
+    /// Broadcast macht db.add_event selbst (injizierter Sender) — hier nicht
+    /// erneut senden (sonst Duplikate im Live-Feed).
     pub fn emit(
         &self,
         db: &Db,
@@ -41,17 +48,9 @@ impl EventBus {
         reason: &str,
         payload: &serde_json::Value,
     ) {
-        let id = db
+        let _ = db
             .add_event(kind, slot_id, instance_id, reason, payload)
             .unwrap_or(0);
-        let _ = self.tx.send(SseEvent {
-            id,
-            ts: crate::db::now_iso(),
-            kind: kind.to_string(),
-            slot_id,
-            instance_id,
-            reason: reason.to_string(),
-        });
         tracing::info!(kind, %reason, instance_id, slot_id, "event");
     }
 }

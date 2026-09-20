@@ -76,13 +76,21 @@ pub async fn login_page() -> Response {
         .into_response()
 }
 
-pub async fn login_submit(Form(form): Form<HashMap<String, String>>) -> Response {
+pub async fn login_submit(app: AppCtx, Form(form): Form<HashMap<String, String>>) -> Response {
     let token = form.get("token").cloned().unwrap_or_default();
-    let resp = Redirect::to("/").into_response();
-    if token.is_empty() {
-        return resp;
+    // Falscher Token: kein Cookie setzen — sonst endloser Login-Loop ohne
+    // Fehlermeldung (Guard bounced ohnehin zurück).
+    if token.is_empty() || token != token_of(&app.0) {
+        return Html(r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>pgpu Login</title>
+    <style>body{background:#101418;color:#dbe2ea;font:14px system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
+    form{background:#1a2027;padding:24px;border-radius:10px;border:1px solid #2a323c;display:flex;flex-direction:column;gap:10px}
+    input{background:#0d1116;color:#dbe2ea;border:1px solid #2a323c;border-radius:6px;padding:8px}
+    button{background:#22303c;color:#dbe2ea;border:1px solid #2a323c;border-radius:6px;padding:8px;cursor:pointer}
+    .err{color:#e07a5f}</style></head>
+    <body><form method="post" action="/login"><b>pgpu — Router-Token</b><span class="err">Token falsch — nochmal versuchen.</span><input name="token" type="password" autofocus><button>Login</button></form></body></html>"#)
+            .into_response();
     }
-    let mut r = Response::from(resp);
+    let mut r = Response::from(Redirect::to("/").into_response());
     let cookie = format!("pgpu_session={token}; Path=/; HttpOnly; SameSite=Lax");
     r.headers_mut().insert(
         axum::http::header::SET_COOKIE,
@@ -136,6 +144,9 @@ pub struct SlotView {
     pub busy_reason: String,
     pub cost_today: f64,
     pub pinned: bool,
+    /// Ersatz-Box, die parallel zum aktiven Box wärmt (Hot-Swap).
+    pub warming_id: i64,
+    pub warming_state: String,
 }
 
 pub struct StateView {
@@ -384,9 +395,20 @@ pub async fn index(app: AppCtx, req: Request) -> Response {
     let mut slots = Vec::new();
     for s in &app.cfg.slots {
         let active = app.db.active_instance(s.id);
-        let inst = active.and_then(|v| app.db.instance(v));
+        // Live-Boxen des Slots, die nicht die aktive sind: neueste = wärmende
+        // Ersatz-Box (Hot-Swap) — bzw. ohne aktive Instanz die Anzeige-Box
+        // (Warmup/Download-Progress), damit die Karte nicht blind „cold“ zeigt.
+        let live_others: Vec<_> = app
+            .db
+            .instances(false)
+            .into_iter()
+            .filter(|r| r.slot_id == s.id && Some(r.vast_id) != active)
+            .collect();
+        let newest_other = live_others.iter().max_by_key(|r| r.vast_id);
+        let shown = active.or_else(|| newest_other.map(|r| r.vast_id));
+        let inst = shown.and_then(|v| app.db.instance(v));
         let traffic = app.traffic.snapshot(s.id);
-        let hb = active.and_then(|v| app.hub.heartbeat(v));
+        let hb = shown.and_then(|v| app.hub.heartbeat(v));
         let pct = hb
             .as_ref()
             .and_then(|h| h.progress_json.get("pct").and_then(|p| p.as_f64()))
@@ -404,7 +426,7 @@ pub async fn index(app: AppCtx, req: Request) -> Response {
         slots.push(SlotView {
             id: s.id,
             name: s.name.clone(),
-            vast_id: active.unwrap_or(0),
+            vast_id: shown.unwrap_or(0),
             gpu_name: inst.as_ref().map(|i| i.gpu_name.clone()).unwrap_or_default(),
             state: state_view,
             healthy: inst.as_ref().map(|i| i.healthy).unwrap_or(false),
@@ -416,6 +438,8 @@ pub async fn index(app: AppCtx, req: Request) -> Response {
             busy_reason: inst.as_ref().map(|i| i.busy_reason.clone()).unwrap_or_default(),
             cost_today: 0.0,
             pinned,
+            warming_id: if active.is_some() { newest_other.map(|r| r.vast_id).unwrap_or(0) } else { 0 },
+            warming_state: if active.is_some() { newest_other.map(|r| r.state.clone()).unwrap_or_default() } else { String::new() },
         });
     }
     let events = app
@@ -562,6 +586,9 @@ pub async fn instance_page(app: AppCtx, Path(vast_id): Path<i64>, method: axum::
 
 pub async fn terminal_page(app: AppCtx, Path(vast_id): Path<i64>, req: Request) -> Response {
     page_guard!(app, req);
+    if app.db.instance(vast_id).is_none() {
+        return (StatusCode::NOT_FOUND, "Instanz unbekannt").into_response();
+    }
     Html(TerminalTpl { vast_id }.render().unwrap_or_default()).into_response()
 }
 
@@ -645,6 +672,10 @@ pub async fn settings_page(app: AppCtx, req: Request) -> Response {
 async fn api_slot(app: &SharedApp, slot_id: i64, action: &str) {
     let req = Request::builder()
         .method(axum::http::Method::POST)
+        // Bearer mitgeben: slot_action ist per guarded! geschützt — ohne
+        // Header war JEDE Dashboard-Slot-Aktion (wake/stop/pin/…) ein
+        // stilles 401-No-Op (gefunden im Browser-Klicktest 20.09.).
+        .header(axum::http::header::AUTHORIZATION, format!("Bearer {}", token_of(app)))
         .uri("/")
         .body(Body::empty())
         .unwrap();
@@ -753,6 +784,7 @@ pub async fn do_instance_action(
             let cmd_req = Request::builder()
                 .method(axum::http::Method::POST)
                 .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header(axum::http::header::AUTHORIZATION, format!("Bearer {}", token_of(&app.0)))
                 .uri(format!("/api/v1/instances/{vast_id}/cmd"))
                 .body(Body::from(serde_json::json!({"service": service}).to_string()))
                 .unwrap();
@@ -796,6 +828,7 @@ pub async fn do_instance_action(
         .method(axum::http::Method::POST)
         .uri(format!("/api/v1/instances/{vast_id}/{action}"))
         .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .header(axum::http::header::AUTHORIZATION, format!("Bearer {}", token_of(&app.0)))
         .body(Body::from(body_str))
         .unwrap();
     let _ = crate::api::instance_action(AppCtx(app.0.clone()), axum::extract::Path((vast_id, action.clone())), api_req).await;

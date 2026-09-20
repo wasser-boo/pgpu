@@ -71,7 +71,12 @@ pub async fn events_json(app: AppCtx, Query(params): Query<HashMap<String, Strin
 
 /// SSE `/api/v1/events/stream`
 pub async fn events_sse(app: AppCtx, req: Request) -> Response {
-    guarded!(app, req);
+    // EventSource kann KEINE Authorization-Header setzen — Session-Cookie
+    // (== Router-Token) zusaetzlich zum Bearer akzeptieren, sonst ist der
+    // Live-Event-Feed im Browser stumm (401).
+    if !crate::dashboard::session_ok(&app.0, req.headers()) {
+        return (StatusCode::UNAUTHORIZED, "bad token").into_response();
+    }
     let rx = app.events.subscribe();
     Sse::new(sse_stream(rx)).keep_alive(KeepAlive::default()).into_response()
 }
@@ -419,7 +424,11 @@ pub async fn instance_logs(app: AppCtx, Path(vast_id): Path<i64>, req: Request) 
 
 /// Dashboard-Terminal: WS ↔ Agent-TermOpen (Pipes-bash).
 pub async fn term_ws(app: AppCtx, Path(vast_id): Path<i64>, ws: WebSocketUpgrade, req: Request) -> Response {
-    guarded!(app, req);
+    // Browser-WebSocket (xterm.js) kann keine Authorization-Header setzen
+    // — Session-Cookie zusaetzlich akzeptieren (wie events_sse).
+    if !crate::dashboard::session_ok(&app.0, req.headers()) {
+        return (StatusCode::UNAUTHORIZED, "bad token").into_response();
+    }
     ws.on_upgrade(move |socket| async move {
         let (mut sink, mut stream) = socket.split();
         let term_id = app.hub.new_term_id();

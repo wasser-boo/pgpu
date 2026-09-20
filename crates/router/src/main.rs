@@ -81,10 +81,14 @@ async fn async_main() -> Result<()> {
         None
     };
 
+    let event_bus = events::EventBus::new(256);
+    // Db broadcastet ab jetzt jedes add_event in den SSE-Live-Feed.
+    db.set_sse_sender(event_bus.sender());
+
     let app: SharedApp = Arc::new(state::App {
         cfg: cfg.clone(),
         db: db.clone(),
-        events: events::EventBus::new(256),
+        events: event_bus,
         traffic: Traffic::default(),
         jobs: Default::default(),
         targets: Default::default(),

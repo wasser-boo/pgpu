@@ -9,7 +9,13 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
-pub struct Db(Arc<Mutex<Connection>>);
+pub struct Db(
+    Arc<Mutex<Connection>>,
+    /// Optional: SSE-Broadcast für JEDEN add_event (auch direkte DB-Rufer
+    /// wie set_slot_desired_audited — sonst fehlen solche Events im
+    /// Dashboard-Live-Feed). Wird in main nach dem EventBus-Bau injiziert.
+    Arc<Mutex<Option<tokio::sync::broadcast::Sender<crate::events::SseEvent>>>>,
+);
 
 pub fn now_iso() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
@@ -90,7 +96,7 @@ impl Db {
         }
         let conn = Connection::open(path)?;
         Self::migrate(&conn)?;
-        Ok(Self(Arc::new(Mutex::new(conn))))
+        Ok(Self(Arc::new(Mutex::new(conn)), Arc::new(Mutex::new(None))))
     }
 
     fn migrate(conn: &Connection) -> anyhow::Result<()> {
@@ -512,12 +518,31 @@ impl Db {
         reason: &str,
         payload: &serde_json::Value,
     ) -> anyhow::Result<i64> {
-        let conn = self.0.lock().unwrap();
-        conn.execute(
-            "INSERT INTO events(ts, kind, slot_id, instance_id, reason, payload_json) VALUES(?1,?2,?3,?4,?5,?6)",
-            params![now_iso(), kind, slot_id, instance_id, reason, payload.to_string()],
-        )?;
-        Ok(conn.last_insert_rowid())
+        let id = {
+            let conn = self.0.lock().unwrap();
+            conn.execute(
+                "INSERT INTO events(ts, kind, slot_id, instance_id, reason, payload_json) VALUES(?1,?2,?3,?4,?5,?6)",
+                params![now_iso(), kind, slot_id, instance_id, reason, payload.to_string()],
+            )?;
+            conn.last_insert_rowid()
+        };
+        // Live-Feed: broadcast ist non-blocking, ohne Receiver ist send() ein No-Op.
+        if let Some(tx) = self.1.lock().unwrap().as_ref() {
+            let _ = tx.send(crate::events::SseEvent {
+                id,
+                ts: now_iso(),
+                kind: kind.to_string(),
+                slot_id,
+                instance_id,
+                reason: reason.to_string(),
+            });
+        }
+        Ok(id)
+    }
+
+    /// SSE-Sender injizieren (main, nach EventBus-Bau).
+    pub fn set_sse_sender(&self, tx: tokio::sync::broadcast::Sender<crate::events::SseEvent>) {
+        *self.1.lock().unwrap() = Some(tx);
     }
 
     pub fn events(&self, limit: i64, instance_id: Option<i64>) -> Vec<EventRow> {

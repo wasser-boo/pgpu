@@ -46,6 +46,33 @@ Boxen heißen `gpu-<role>-<tok8>` (netbird up --hostname im Fork-Entrypoint).
 | 6 | Praxis-Integration | ✅ **2026-09-20 mittags bewiesen**: Praxis (pagent) → Router → llama-server, `HTTP 200`, Chat + Folge-Turn mit Verlauf („ok“-Test ×2). Ursprünglicher 500er war kein Router-Problem: Qwen3.6-GGUF-Template wirft „System message must be at the beginning“, Praxis injiziert System-Notizen mitten im Verlauf → Fix im Praxis-llamacpp-Adapter (alle system-Messages an Position 0 mergen, `testing` 0f149a6, auf pagent deployed als Daemon). **20.09. abends**: GpuRouterClient (X-Router-Wait/Wake/Job-Id/Cold-503) live, s. „Stand 20.09. abends“ |
 | 7 | VPS-Umzug | ✅ **Compose fertig + live getestet** (20.09. abends, auf dem Heim-Server als eigener NetBird-Peer `praxis-vps`): `deploy/vps-compose.yml` + `deploy/vps/README.md` — NetBird+Router+STT+Praxis in einem Namespace, Praxis-Image `vayayo/praxis`, Master-Key-Zustellung ohne env/argv, Env-only-Config, Auto-Miete-Toggle. Später zieht dieselbe Compose 1:1 auf den VPS um |
 
+## Stand 20.09. abends II — Browser-Klicktest: 3 echte Bugs gefunden + gefixt (Router 0.8)
+
+Der ausstehende Dashboard-Klicktest (browser-äquivalent per curl: Login →
+Cookie → alle Seiten → alle Form-POSTs) hat drei **produktive Bugs**
+aufgedeckt, alle seit Router 0.2 drin:
+
+| Bug | Wirkung | Fix |
+|---|---|---|
+| Dashboard-Slot-Formen (`wake/stop/destroy/swap/pin/bid`) bauten synthetische API-Requests **ohne Bearer** | `guarded!` → 401 → **stilles No-Op** — jeder Klick tat nichts | `api_slot` setzt Bearer (wie `do_rent` es immer tat) |
+| Instanz-Formen (`stop/start/bid/mode/lifecycle/cmd`) ebenfalls ohne Bearer | dito, inkl. supervisorctl-Knöpfe | Header nachgerüstet |
+| SSE `/api/v1/events/stream` + Terminal-WS nur Bearer | `EventSource`/Browser-WS können **keine** Header setzen → Live-Feed + xterm im Browser stumm/401 | Cookie-ODER-Bearer (session_ok) |
+
+Dazu: Login validiert jetzt den Token (Fehlermeldung statt stiller
+Login-Loop mit Müll-Cookie), `/term/:id` 404 für unbekannte Instanz,
+`slot_desired`-Events jetzt auch im Live-Feed (Db broadcastet jedes
+`add_event` — Sender in main injiziert, `events.emit` sendet nicht mehr
+selbst), Overview-Karte zeigt ohne aktive Instanz die **wärmende Box**
+(Download-Progress statt blindem „cold") und beim Hot-Swap einen
+„→ Ersatz #id wärmt“-Hinweis, Gebot-Zeile nur bei vorhandener Box.
+
+Live verifiziert: Wake-Form erzeugt Events, Budget-Hard-Cap blockt die
+Miete korrekt (Policy-Early-Return), Blacklist/Unblacklist-Knöpfe
+schreiben DB, Asset-Upload landet im Volume, SSE liefert wake+stop+
+slot_desired live, Proxy 503 `x-router-state: cold` auf kalten Slots,
+STT-Sidecar `ready` (de, ja). 43 Unit-Tests grün. Image `0.8` auf Hub,
+Compose läuft.
+
 ## Stand 20.09. abends — GpuRouterClient live, Auto-Miete-Toggle, VPS-Compose
 
 **Praxis ↔ Router komplett verdrahtet** (Bauplan §12.4, praxis `testing`
@@ -120,22 +147,17 @@ Was dazukam:
   Build auf pagent: `~/praxis` (branch `testing`, warmes target, ~5 min).
 
 ### Offene Punkte (nächste Session)
-- ~~GpuRouterClient~~ ✅ 20.09. abends live (s. o. — X-Router-Wait bewies
-  die Kette inkl. Auto-Replace; erster Chat nach Idle-Stopp geht jetzt
-  durch, statt 5× zu failen).
-- ~~Budget zurück auf 2.0/2.4~~ ✅ — Slot 1 bleibt `on_demand`
-  (Interruptible-Churn kostete den halben Tag, s. „Stand 20.09. mittags").
-- ~~pagent: Passwort/GATEWAY_API_KEY~~ ✅ 20.09. abends: SSH-Login + `GATEWAY_API_KEY` rotiert (altes Login gesperrt; neue Werte sicher notieren). Master-Passwort (`secrets.enc2`) bleibt bis zur Migration — es entfällt beim Compose-Umstieg (neuer Key via `gen-secrets.sh`) bzw. ist über `praxis onboard --interactive` → „Re-encrypt secrets with new password?" rotierbar.
 - **Media-TTS-E2E auf warmer Box**: Die frisch gemietete Media-Box hing
   ~3 h im Vast-Image-Pull (16,8 GB) und wurde vom Auto-Miete-Test-Stop
   beendet — der sprechende Pfad (TTS → X-Router-Job-Id → busy → WAV)
   braucht einmal eine warme Box zum Bestätigen (Spike bewies die Kette
-  grundsätzlich; Comfy-503-Handling ist live gesehen worden).
-- Dashboard-Kosmetik: `active_instance` zeigt bis zum Flip die alte Box
-  (das eigentliche 502-Problem ist mit der Active-Invarianten-Heilung
-  gefixt; reine Anzeige-Sache).
-- Browser-Test Dashboard-Klick-Fluss (Blacklist-Knöpfe, Auto-Miete-Toggle
-  wurde per API/browser-äquivalent getestet, HTMX-Klicks fehlen noch).
+  grundsätzlich; Comfy-503-Handling ist live gesehen worden). Budget-Tag
+  war am 20.09. ausgeschöpft (3,88 $) — nächster Tag/Cap-Erhöhung.
+- ~~Browser-Test Dashboard-Klick-Fluss~~ ✅ 20.09. abends II: browser-äquivalent
+  durchgeführt — 3 Produktiv-Bugs gefunden+gefixt (s. o.), Formen/SSE/Upload/
+  Blacklist jetzt live verifiziert. Bleibt: echter Klick im GUI-Browser als
+  Augen-Kontrolle (optional).
+- ~~Dashboard-Kosmetik `active_instance`~~ ✅ zeigt jetzt wärmende Box + Swap-Hinweis.
 - **Machine-Blacklist** ✅ 20.09. live: `machine_stats` zählt Fails (preempt während warmup, instance_gone im Warmup, warmup-timeout, agent >3 min still), Auto-Blacklist nach `vast.blacklist_after_fails` (Default 2), `best_candidate` filtert blacklisted Hosts, Offer-Score durch `reliability2` geteilt. Erster Live-Fang: Host 32560 + 144003 je Fail #1 in der ersten Stunde. Dashboard `/offers` zeigt Host-Bilanz + Blacklist-Knöpfe; API `GET /api/v1/machines`, `POST /api/v1/machines/:id/blacklist|unblacklist`.
 - **False-Preempt-Schutz** ✅ 20.09.: `cur_state=stopped` zählt nicht mehr als tot, solange `actual` noch loading/created ist; echte Preempts (actual=exited) weiterhin erkannt.
 - Alert-Dedupe (30 min/Art — budget_80 spamte alle 30 s), Audit-Trail `slot_desired` (wer setzt desired), Reconciler-Loop entkoppelt Offer-Refresh (blockierendes tick() verzog jede Wake-Reaktion), Connector dialt preempted Boxen nicht mehr.
