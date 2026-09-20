@@ -3,6 +3,7 @@
 FROM python:3.11-slim-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends wget unzip ca-certificates \
+        libatomic1 `# arm64: libvosk.so (aarch64-Wheel) linkt libatomic.so.1` \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir aiohttp==3.9.5 vosk==0.3.45
 
