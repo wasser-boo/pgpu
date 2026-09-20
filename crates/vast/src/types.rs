@@ -115,7 +115,12 @@ pub struct CreateInstanceParams<'a> {
     #[serde(rename = "client_id")]
     pub client: &'a str, // "me"
     pub image: &'a str,
-    pub price: f64,
+    /// None (Feld weggelassen) = ON-DEMAND-Vertrag zum Listenpreis (nicht
+    /// preemptbar); Some(x) = Interruptible-Gebot über x $/h.
+    /// (vastai-SDK: create_instance ohne bid_price mietet on-demand —
+    /// ein price=dph_total wäre nur ein Gebot AUF dem Listenpreis, is_bid=True.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disk: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]

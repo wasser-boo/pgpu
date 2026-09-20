@@ -34,6 +34,7 @@
     {% if s.vast_id > 0 %}Instanz #{{ s.vast_id }} · {{ s.gpu_name }}{% else %}keine Instanz (Slot kalt){% endif %}
     {% if s.pct >= 0.0 %}<br>Download: {{ s.pct|fmt1 }} %{% endif %}
     {% if s.warming_id > 0 %}<br>→ Ersatz #{{ s.warming_id }} wärmt ({{ s.warming_state }}) — Flip bei healthy{% endif %}
+    {% if !s.pool_line.is_empty() %}<br>{{ s.pool_line }}{% endif %}
     {% if s.vast_id > 0 %}<br>Gebot {{ s.bid|fmt4 }} $/h vs. min_bid {{ s.min_bid|fmt4 }} $/h{% endif %}
     <br>In-flight: {{ s.in_flight }} · Busy: {% if s.busy %}<span class="badge b-info">{{ s.busy_reason }}</span>{% else %}idle{% endif %}
     <br>Kosten heute: {{ s.cost_today|fmt2 }} $

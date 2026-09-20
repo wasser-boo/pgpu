@@ -6,3 +6,7 @@ config.toml
 .env
 nohup.out.env
 deploy/data/
+# VPS-Deploy-Secrets (NIE committen — master_key sperrt den Praxis-Store):
+deploy/vps/master_key
+deploy/vps/praxis.env
+deploy/vps/praxis-state/

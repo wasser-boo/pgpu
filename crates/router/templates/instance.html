@@ -15,6 +15,7 @@
     <tr><td>Vast-Status</td><td class="mono">{{ inst.actual_status }} / {{ inst.intended_status }}</td></tr>
     <tr><td>Preis</td><td class="mono">{{ inst.bid_usd_h|fmt4 }} $/h · min_bid {{ inst.min_bid|fmt4 }}</td></tr>
     <tr><td>Busy</td><td>{% if inst.busy %}{{ inst.busy_reason }}{% else %}idle{% endif %}</td></tr>
+    <tr><td>Agent-Health</td><td class="mono">{{ inst.agent_health }}</td></tr>
     <tr><td>Lifecycle</td><td class="mono">{{ inst.lifecycle }}</td></tr>
   </table>
   <div class="actions">

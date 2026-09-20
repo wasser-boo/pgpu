@@ -3,7 +3,7 @@
 //! reconciled stündlich gegen den Vast-Kontostand.
 
 use crate::state::SharedApp;
-use praxis_common::{Action, InstanceState, Mode};
+use praxis_common::{Action, InstanceState, Mode, Role};
 use praxis_policy::{InstanceSnapshot, OfferSnapshot, SlotSnapshot, Snapshot};
 use praxis_vast::CreateInstanceParams;
 use chrono::{Datelike, Timelike};
@@ -62,7 +62,22 @@ pub async fn tick(app: &SharedApp) -> anyhow::Result<()> {
                 if now_ts - seen > 180 {
                     let _ = app.db.set_instance_state(inst.vast_id, "unreachable");
                     record_machine_fail(app, inst.slot_id, inst.vast_id, inst.machine_id, "agent >3 min still (unreachable)");
-                    app.events.emit(&app.db, "unreachable", Some(inst.slot_id), Some(inst.vast_id), "Agent >3 min still", &serde_json::json!({}));
+                    // Letzter Agent-Health mit in den Event: Der Degraded-Grund
+                    // (z. B. "11434 → 503") sagt, warum die Box nicht healthy
+                    // wurde, bevor der Agent verstummte.
+                    let health = app
+                        .hub
+                        .heartbeat(inst.vast_id)
+                        .map(|hb| hb.health_json.to_string())
+                        .unwrap_or_else(|| "kein Heartbeat".into());
+                    app.events.emit(
+                        &app.db,
+                        "unreachable",
+                        Some(inst.slot_id),
+                        Some(inst.vast_id),
+                        &format!("Agent >3 min still — letzter Health: {health}"),
+                        &serde_json::json!({"health": health}),
+                    );
                 }
             }
         }
@@ -120,6 +135,20 @@ pub async fn tick(app: &SharedApp) -> anyhow::Result<()> {
             Some((v, n, h)) => app.targets.set(slot.id, Some(v), n, h),
             None => app.targets.set(slot.id, None, None, false),
         }
+        // Pool-Routing: ALLE healthy Instanzen des Slots (Multi-Instanz-
+        // Slots, Round-Robin + Job-Affinität im Proxy). Die aktive (primäre)
+        // Box bleibt davon unberührt — sie ist einfach mit dabei.
+        let healthy_targets: Vec<(i64, String)> = app
+            .db
+            .instances(false)
+            .into_iter()
+            .filter(|r| r.slot_id == slot.id && r.healthy && r.state == "healthy" && r.actual_status == "running")
+            .filter_map(|r| {
+                let ip = r.nb_ip.clone().or_else(|| app.hub.nb_ip(r.vast_id))?;
+                Some((r.vast_id, ip))
+            })
+            .collect();
+        app.pool_routes.set_healthy(slot.id, healthy_targets);
     }
 
     // 5. Metering (dt × Rate).
@@ -192,6 +221,77 @@ async fn sync_vast(app: &SharedApp, list: &[praxis_vast::Instance]) -> anyhow::R
         }
     }
     Ok(())
+}
+
+/// Warum ist die Box nicht healthy? Service-Log-Tails über den Agent
+/// ziehen (VOR dem Destroy — die Session fällt mit der Box). Die echten
+/// Fehler (CUDA-Arch „no kernel image" wie auf V100/sm_70, OOM, moe-cache-
+/// Guard, HF-Abbrüche) landen in /workspace/logs/*.log, NICHT im
+/// supervisord-stdout, den Vast request_logs zeigen.
+pub async fn agent_failure_logs(app: &SharedApp, vast_id: i64, role: Role) -> String {
+    let files: &[&str] = match role {
+        Role::Llm => &["llama-chat", "llama-prepare"],
+        Role::Media => &["comfyui"],
+    };
+    let mut parts: Vec<String> = Vec::new();
+    for svc in files {
+        let res = app
+            .hub
+            .command(vast_id, |id| praxis_common::node::RouterCommand::Cmd {
+                id,
+                command: praxis_common::node::Command::Tail {
+                    file: format!("/workspace/logs/{svc}.log"),
+                    lines: 30,
+                },
+            })
+            .await;
+        match res {
+            Ok(data) => {
+                if let Some(text) = data.get("output").and_then(|o| o.as_str()) {
+                    if !text.trim().is_empty() {
+                        parts.push(format!("--- {svc}.log ---\n{}", text));
+                    }
+                }
+            }
+            Err(e) => parts.push(format!("--- {svc}.log: Agent nicht erreichbar ({e}) ---")),
+        }
+    }
+    parts.join("\n")
+}
+
+/// Fehlschlag-Event mit Diagnose: letzter Agent-Health (Degraded-Grund,
+/// z. B. „11434 → 503“) + Service-Log-Tails. Grund im reason (Dashboard-
+/// Feed), volle Logs im Event-Payload.
+async fn emit_failure_diagnosis(app: &SharedApp, vast_id: i64, slot_id: i64, kind: &str, reason: &str) {
+    let row = app.db.instance(vast_id);
+    let role = row.as_ref().map(|r| r.role).unwrap_or(Role::Llm);
+    let health = app
+        .hub
+        .heartbeat(vast_id)
+        .map(|hb| hb.health_json.to_string())
+        .unwrap_or_else(|| "kein Heartbeat".into());
+    let logs = agent_failure_logs(app, vast_id, role).await;
+    // Kompakter Log-Schnipsel (letzte Zeilen) in den reason, damit der
+    // Grund IM Event-Feed sichtbar ist (z. B. „CUDA error: no kernel image").
+    let snippet: String = logs
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty() && !l.starts_with("---"))
+        .map(|l| l.chars().take(220).collect())
+        .unwrap_or_default();
+    let reason_full = if snippet.is_empty() {
+        format!("{reason} — health: {health}")
+    } else {
+        format!("{reason} — health: {health} — Log: {snippet}")
+    };
+    app.events.emit(
+        &app.db,
+        kind,
+        Some(slot_id),
+        Some(vast_id),
+        &reason_full,
+        &serde_json::json!({"health": health, "logs": logs}),
+    );
 }
 
 /// Maschinen-Fail buchen + Auto-Blacklist nach `vast.blacklist_after_fails`.
@@ -411,12 +511,22 @@ fn best_candidate(app: &SharedApp, slot_id: i64) -> Option<OfferSnapshot> {
         .filter(|m| m.blacklisted)
         .map(|m| m.machine_id)
         .collect();
+    // Pool-Redundanz: Maschinen, auf denen schon eine LIVE-Instanz dieses
+    // Slots läuft, nicht erneut mieten — ein Host-Tod soll nicht gleich
+    // zwei Pool-Mitglieder mitnehmen ("immer mindestens eine up").
+    let used_machines: std::collections::HashSet<i64> = app
+        .db
+        .instances(false)
+        .into_iter()
+        .filter(|r| r.slot_id == slot_id && r.machine_id != 0)
+        .map(|r| r.machine_id)
+        .collect();
     offers
         .into_iter()
         // On-Demand: dph_total ist der Preis (reine OD-Angebote haben min_bid=0);
         // Interruptible: min_bid (OD-only-Angebote raus, dph wäre Fehl-Ranking).
         .filter(|o| if on_demand { o.dph_total > 0.0 } else { o.min_bid > 0.0 })
-        .filter(|o| o.machine_id == 0 || !blacklisted.contains(&o.machine_id))
+        .filter(|o| o.machine_id == 0 || (!blacklisted.contains(&o.machine_id) && !used_machines.contains(&o.machine_id)))
         // On-Demand-Ranking über dph_total: min_bid nullen, damit score()
         // auf dph_total zurückfällt (merged Angebote tragen sonst min_bid).
         .map(|o| {
@@ -575,15 +685,26 @@ fn parse_state(s: &str) -> InstanceState {
 pub async fn apply_action(app: &SharedApp, action: &Action) -> anyhow::Result<()> {
     match action {
         Action::Create { slot_id, offer_id, mode, price_usd_h, disk_gb, reason } => {
-            // Kein Doppel-Create während ein Backversuch läuft.
-            let pending: Vec<_> = app
+            // Kein Doppel-Create über das Pool-Ziel hinaus: Aktive Instanzen
+            // (requested..draining) zählen gegen pool.warm — bei warm=1 ist
+            // das der klassische „Backer wärmt schon"-Guard (kein Doppel-
+            // Miete), bei warm=2 läuft die zweite Box parallel hoch.
+            let slot_cfg = app.cfg.slot(*slot_id);
+            let pool_warm = slot_cfg.map(|s| s.pool.warm).unwrap_or(1).max(1);
+            let actives = app
                 .db
                 .instances(false)
                 .into_iter()
-                .filter(|r| r.slot_id == *slot_id && matches!(r.state.as_str(), "requested" | "provisioning" | "booting" | "agent_connected"))
-                .collect();
-            if !pending.is_empty() {
-                tracing::debug!(slot_id, "create skipped: backer already warming");
+                .filter(|r| {
+                    r.slot_id == *slot_id
+                        && matches!(
+                            r.state.as_str(),
+                            "requested" | "provisioning" | "booting" | "agent_connected" | "healthy" | "draining"
+                        )
+                })
+                .count();
+            if actives >= pool_warm {
+                tracing::debug!(slot_id, actives, pool_warm, "create skipped: Pool-Ziel schon unterwegs/erreicht");
                 return Ok(());
             }
             // Snapshot-Race: "wake"/"preempted: replace" wurden geplant, als der
@@ -627,6 +748,17 @@ pub async fn apply_action(app: &SharedApp, action: &Action) -> anyhow::Result<()
             if reason.contains("warmup timeout") || reason.contains("swap_failed") {
                 if let Some(inst) = app.db.instance(*instance_id) {
                     record_machine_fail(app, inst.slot_id, *instance_id, inst.machine_id, "warmup timeout");
+                    // WARUM nicht healthy? Diagnose MIT Service-Logs ziehen,
+                    // solange die Agent-Session noch steht (CUDA-Arch, OOM,
+                    // moe-cache-Guard …) — danach stirbt die Box mit dem Destroy.
+                    emit_failure_diagnosis(
+                        app,
+                        *instance_id,
+                        inst.slot_id,
+                        "instance_failed",
+                        &format!("{reason} (Slot {})", inst.slot_id),
+                    )
+                    .await;
                 }
             }
             destroy_instance(app, *instance_id, reason).await?;
@@ -760,7 +892,7 @@ pub fn mint_node_token() -> String {
 }
 
 async fn mint_netbird_key(app: &SharedApp, name: &str) -> anyhow::Result<String> {
-    let token = app.cfg.netbird.api_token.clone();
+    let token = app.cfg.netbird_api_token();
     if token.is_empty() {
         // statischer Key aus Config (Fallback, Variante B).
         let k = app.cfg.netbird.setup_key.clone();
@@ -884,6 +1016,23 @@ pub async fn create_instance(
     env.insert("NB_SOCKS5_LISTENER_PORT".into(), serde_json::json!("1080"));
     env.insert("ROUTER_URL".into(), serde_json::json!(crate::config::router_call_url(&app.cfg)));
     env.insert("PRAXIS_NODE_TOKEN".into(), serde_json::json!(node_token));
+    // Endpoint-Check ("check_if_works"): Der Agent probed lokal (Loopback)
+    // die Health-Pfade der Slot-Services — healthy heißt dann wirklich
+    // „llama /health 200 NACH dem Model-Download / ComfyUI-Nodes geladen",
+    // nicht nur „Prozess läuft". Ohne URLs war der Agent optimistisch
+    // Healthy (Spike-Flip war Glück, kein Gating).
+    let health_urls: Vec<String> = slot
+        .services
+        .iter()
+        .filter_map(|(_name, svc)| {
+            svc.health
+                .as_ref()
+                .map(|h| format!("http://127.0.0.1:{}{}", svc.port, h))
+        })
+        .collect();
+    if !health_urls.is_empty() {
+        env.insert("PRAXIS_AGENT_HEALTH_URLS".into(), serde_json::json!(health_urls.join(",")));
+    }
     for (k, v) in &slot.env {
         env.insert(k.clone(), serde_json::json!(v));
     }
@@ -891,7 +1040,10 @@ pub async fn create_instance(
     let params = CreateInstanceParams {
         client: "me",
         image: &slot.image,
-        price: price_usd_h,
+        // On-Demand-Modus: KEIN price-Feld senden = echter On-Demand-Vertrag
+        // zum Listenpreis (nicht preemptbar). Ein Gebot AUF dph_total wäre
+        // weiterhin interruptible (is_bid=True, s. vastai-SDK-Doku).
+        price: (mode == praxis_common::Mode::Interruptible).then_some(price_usd_h),
         disk: Some(disk_gb),
         label: Some(&format!("praxis-{}-s{}", slot.role, slot_id)),
         template_hash_id: None,
@@ -1051,7 +1203,7 @@ pub async fn destroy_instance(app: &SharedApp, vast_id: i64, reason: &str) -> an
 /// NetBird-Peer nach Hostname (gpu-<role>-<tok8>) suchen und löschen.
 /// Match wie im Connector: name ODER hostname-Feld ODER dns_label-Präfix.
 async fn netbird_delete_peer(app: &SharedApp, hostname: &str) -> anyhow::Result<()> {
-    let token = app.cfg.netbird.api_token.clone();
+    let token = app.cfg.netbird_api_token();
     if token.is_empty() {
         return Ok(());
     }

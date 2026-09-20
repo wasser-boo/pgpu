@@ -4,7 +4,7 @@ use chrono::{TimeZone, Utc};
 use praxis_common::{Action, InstanceState, Mode, Role};
 use praxis_policy::{
     decide, BidConfig, BudgetConfig, IdleConfig, InstanceSnapshot, LimitsConfig, OfferSnapshot,
-    PolicyConfig, SlotMode, SlotPolicyCfg, SlotSnapshot, Snapshot, SwapConfig,
+    PolicyConfig, PoolConfig, SlotMode, SlotPolicyCfg, SlotSnapshot, Snapshot, SwapConfig,
 };
 use std::collections::HashMap;
 
@@ -25,6 +25,7 @@ fn cfg() -> PolicyConfig {
                 min_swap_interval_s: 3600,
                 keep_warm_window_s: 1800,
             },
+            pool: Default::default(),
         },
     );
     slots.insert(
@@ -42,6 +43,7 @@ fn cfg() -> PolicyConfig {
                 min_swap_interval_s: 3600,
                 keep_warm_window_s: 1800,
             },
+            pool: Default::default(),
         },
     );
     PolicyConfig {
@@ -577,4 +579,150 @@ fn hard_cap_fires_on_accumulated_spend_only() {
     let actions = decide(&s, &cfg());
     assert!(actions.iter().any(|x| matches!(x, Action::Stop { instance_id: 21, .. })), "{actions:?}");
     assert!(actions.iter().any(|x| matches!(x, Action::Alert { kind, .. } if kind == "budget_hard")), "{actions:?}");
+}
+
+// ---------------------------------------------------------------- Pool (Multi-Instanz-Slots)
+
+fn pool_cfg() -> PolicyConfig {
+    let mut c = cfg();
+    c.slots.get_mut(&1).unwrap().pool = PoolConfig { warm: 2, total: 3 };
+    c.limits.max_instances = 5;
+    c.limits.max_per_slot = 3;
+    c.limits.max_total_rate_usd_h = 1.0;
+    c
+}
+
+/// Slot an (desired), 1 healthy aktiv → Policy mietet die zweite Pool-Box.
+#[test]
+fn pool_fills_up_to_warm() {
+    let a = inst(11, 1, Role::Llm, InstanceState::Healthy);
+    let mut s = slot(1, Role::Llm, vec![a], Some(11));
+    s.desired_running = true;
+    let mut s = snap(vec![s]);
+    s.seconds_to_day_end = 23 * 3600;
+    s.spent_today_usd = 0.10;
+    s.running_rate_usd_h = 0.12;
+    let actions = decide(&s, &pool_cfg());
+    assert!(
+        actions.iter().any(|x| matches!(x, Action::Create { reason, .. } if reason.contains("pool fill"))),
+        "pool fill erwartet: {actions:?}"
+    );
+}
+
+/// 2 healthy (Aufskalierung fertig) → KEIN SwapOut der ersten Box —
+/// Koexistenz, Routing verteilt.
+#[test]
+fn pool_healthy_boxes_coexist_no_swapout() {
+    let a = inst(11, 1, Role::Llm, InstanceState::Healthy);
+    let b = inst(12, 1, Role::Llm, InstanceState::Healthy);
+    let mut s = slot(1, Role::Llm, vec![a, b], Some(11));
+    s.desired_running = true;
+    let mut s = snap(vec![s]);
+    s.seconds_to_day_end = 23 * 3600;
+    s.spent_today_usd = 0.10;
+    s.running_rate_usd_h = 0.24;
+    let actions = decide(&s, &pool_cfg());
+    assert!(
+        !actions.iter().any(|x| matches!(x, Action::SwapOut { instance_id: 11 | 12, .. })),
+        "Koexistenz: keine Box darf rausgeworfen werden: {actions:?}"
+    );
+    // Auch kein weiterer Create (warm = 2 erreicht).
+    assert!(
+        !actions.iter().any(|x| matches!(x, Action::Create { .. })),
+        "warm erreicht — kein weiterer Create: {actions:?}"
+    );
+}
+
+/// Aktive Box preempted, zweite healthy → Flip auf die zweite (Failover),
+/// und Pool-Füllung mietet/startert Ersatz bis warm wieder 2.
+#[test]
+fn pool_failover_flips_and_refills() {
+    let a = inst(11, 1, Role::Llm, InstanceState::Preempted);
+    let b = inst(12, 1, Role::Llm, InstanceState::Healthy);
+    let mut s = slot(1, Role::Llm, vec![a, b], Some(11));
+    s.desired_running = true;
+    let mut s = snap(vec![s]);
+    s.seconds_to_day_end = 23 * 3600;
+    s.spent_today_usd = 0.10;
+    s.running_rate_usd_h = 0.12;
+    let actions = decide(&s, &pool_cfg());
+    assert!(
+        actions.iter().any(|x| matches!(x, Action::FlipSlot { to_instance: 12, .. })),
+        "Failover-Flip auf 12 erwartet: {actions:?}"
+    );
+    assert!(
+        actions.iter().any(|x| matches!(x, Action::Create { reason, .. } if reason.contains("pool fill"))),
+        "Nachfüllen bis warm=2 erwartet: {actions:?}"
+    );
+}
+
+/// Gestoppte Reserve (cold standby) wird gestartet statt neu gemietet —
+/// Disk warm, kein Image-Pull. Und destroy_after_stopped greift NICHT,
+/// solange der Slot gewünscht ist (Reserve-Schutz).
+#[test]
+fn pool_prefers_cold_reserve_start_over_create() {
+    let a = inst(11, 1, Role::Llm, InstanceState::Healthy);
+    let mut r = inst(13, 1, Role::Llm, InstanceState::Stopped);
+    r.stopped_since = Some(now() - chrono::Duration::hours(72)); // weit über destroy_after
+    let mut s = slot(1, Role::Llm, vec![a, r], Some(11));
+    s.desired_running = true;
+    let mut s = snap(vec![s]);
+    s.seconds_to_day_end = 23 * 3600;
+    s.spent_today_usd = 0.10;
+    s.running_rate_usd_h = 0.12;
+    let actions = decide(&s, &pool_cfg());
+    assert!(
+        actions.iter().any(|x| matches!(x, Action::Start { instance_id: 13, .. })),
+        "Reserve 13 starten statt neu mieten: {actions:?}"
+    );
+    assert!(
+        !actions.iter().any(|x| matches!(x, Action::Create { .. })),
+        "Create nur wenn keine Reserve: {actions:?}"
+    );
+    assert!(
+        !actions.iter().any(|x| matches!(x, Action::Destroy { instance_id: 13, .. })),
+        "Reserve darf nicht zerstört werden, solange der Slot gewünscht ist: {actions:?}"
+    );
+}
+
+/// Slot aus (desired false) → normale destroy_after_stopped-Regeln
+/// (Scale-to-Zero bleibt erhalten, Pool-Schutz fällt weg).
+#[test]
+fn pool_reserve_unprotected_when_slot_off() {
+    let mut r = inst(13, 1, Role::Llm, InstanceState::Stopped);
+    r.stopped_since = Some(now() - chrono::Duration::hours(72));
+    let mut s = slot(1, Role::Llm, vec![r], None);
+    s.desired_running = false;
+    let mut s = snap(vec![s]);
+    s.seconds_to_day_end = 23 * 3600;
+    s.spent_today_usd = 0.10;
+    let actions = decide(&s, &pool_cfg());
+    assert!(
+        actions.iter().any(|x| matches!(x, Action::Destroy { instance_id: 13, .. })),
+        "Slot aus → destroy_after_stopped greift: {actions:?}"
+    );
+}
+
+/// total-Obergrenze: 3 live (1 healthy + 1 preempted + 1 stopped), warm=2 →
+/// Reserve starten JA, weitere Create-Box NEIN (3 = total erreicht).
+#[test]
+fn pool_respects_total_cap() {
+    let a = inst(11, 1, Role::Llm, InstanceState::Healthy);
+    let p = inst(12, 1, Role::Llm, InstanceState::Preempted);
+    let r = inst(13, 1, Role::Llm, InstanceState::Stopped);
+    let mut s = slot(1, Role::Llm, vec![a, p, r], Some(11));
+    s.desired_running = true;
+    let mut s = snap(vec![s]);
+    s.seconds_to_day_end = 23 * 3600;
+    s.spent_today_usd = 0.10;
+    s.running_rate_usd_h = 0.12;
+    let actions = decide(&s, &pool_cfg());
+    assert!(
+        actions.iter().any(|x| matches!(x, Action::Start { instance_id: 13, .. })),
+        "Reserve 13 starten: {actions:?}"
+    );
+    assert!(
+        !actions.iter().any(|x| matches!(x, Action::Create { .. })),
+        "total=3 erreicht (11+12+13 live) — kein Create: {actions:?}"
+    );
 }

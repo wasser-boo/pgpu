@@ -106,7 +106,7 @@ impl PeerInfo {
 }
 
 async fn fetch_peers(app: &SharedApp) -> Result<Vec<PeerInfo>> {
-    let token = app.cfg.netbird.api_token.clone();
+    let token = app.cfg.netbird_api_token();
     if token.is_empty() {
         return Ok(vec![]);
     }

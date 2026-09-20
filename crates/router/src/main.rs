@@ -92,6 +92,7 @@ async fn async_main() -> Result<()> {
         traffic: Traffic::default(),
         jobs: Default::default(),
         targets: Default::default(),
+        pool_routes: Default::default(),
         hub: Default::default(),
         vast: Arc::new(Mutex::new(vast)),
         reconcile_now: tokio::sync::Notify::new(),

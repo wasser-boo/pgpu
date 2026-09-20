@@ -46,6 +46,10 @@ services:
     environment:
       STT_LANGUAGES: ${STT_LANGUAGES:-de,ja}
       VOSK_BIND: 127.0.0.1 # nur im Namespace erreichbar, nicht übers Overlay
+      # 2701 statt 2700: Der Router bindet selbst :2700 (STT-Proxy mit
+      # Origin-Strip) und leitet an DAS Sidecar weiter — im gemeinsamen
+      # Namespace kollidierten beide auf 2700 (Errno 98, Stand 20.09.).
+      VOSK_PORT: "2701"
     volumes:
       - stt-models:/data/vosk
     restart: unless-stopped
@@ -66,6 +70,7 @@ services:
     environment:
       ROUTER_TOKEN: ${ROUTER_TOKEN:?ROUTER_TOKEN setzen}
       VAST_API_KEY: ${VAST_API_KEY:-}
+      NB_API_TOKEN: ${NB_API_TOKEN:-} # mintet ephemere Setup-Keys pro GPU-Box
       RUST_LOG: info
     restart: unless-stopped
     depends_on: [netbird]

@@ -219,6 +219,10 @@ pub struct SlotCfg {
     pub idle: Option<IdleConfig>,
     #[serde(default)]
     pub swap: SwapConfig,
+    /// Instanz-Pool (s. praxis_policy::PoolConfig): warm gleichzeitig
+    /// laufende Boxen, total Obergrenze inkl. kalter Reserve.
+    #[serde(default)]
+    pub pool: praxis_policy::PoolConfig,
     /// Extra-Env beim Instanz-Create (z. B. LLAMA_MODEL).
     #[serde(default)]
     pub env: HashMap<String, String>,
@@ -264,6 +268,7 @@ impl SlotCfg {
                 "on_demand" | "on-demand" | "ondemand" => praxis_policy::SlotMode::OnDemand,
                 _ => praxis_policy::SlotMode::Interruptible,
             },
+            pool: self.pool,
         }
     }
 }
@@ -271,9 +276,10 @@ impl SlotCfg {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServiceCfg {
     pub port: u16,
-    /// HTTP-Health-Pfad (relativ zum Service).
+    /// HTTP-Health-Pfad (relativ zum Service) — wird als
+    /// PRAXIS_AGENT_HEALTH_URLS an den Agent geschickt: healthy erst,
+    /// wenn der Endpoint NACH dem Boot/Download wirklich antwortet.
     #[serde(default)]
-    #[allow(dead_code)]
     pub health: Option<String>,
     #[serde(default)]
     pub busy: BusyKind,
@@ -350,6 +356,11 @@ impl Config {
 
     pub fn vast_api_key(&self) -> String {
         std::env::var("VAST_API_KEY").unwrap_or_else(|_| self.vast.api_key.clone())
+    }
+
+    /// NetBird-PAT (mintet ephemere Setup-Keys): env > config.
+    pub fn netbird_api_token(&self) -> String {
+        std::env::var("NB_API_TOKEN").unwrap_or_else(|_| self.netbird.api_token.clone())
     }
 }
 

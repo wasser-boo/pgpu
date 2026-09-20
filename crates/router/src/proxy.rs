@@ -265,14 +265,23 @@ async fn resolve_slot_target(
     }
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_s.max(1));
+    // Pool-Routing: X-Router-Job-Id hält Batches auf EINER Box (Cache-
+    // Lokalität für TTS-Sätze), sonst Round-Robin über alle healthy
+    // Instanzen des Slots (parallele Chats auf verschiedenen Boxen).
+    let job = req_headers
+        .get("x-router-job-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
     loop {
-        match app.targets.get(slot_id) {
-            Some((vast_id, Some(nb_ip), healthy)) if healthy || wait_s > 0 => {
-                if healthy {
-                    return Ok(UpstreamTarget { vast_id, nb_ip, port: svc.port });
-                }
+        if let Some((vast_id, nb_ip)) = app.pool_routes.pick(slot_id, job.as_deref()) {
+            return Ok(UpstreamTarget { vast_id, nb_ip, port: svc.port });
+        }
+        // Fallback: klassisches Einzel-Target (z. B. Reconciler hat den Pool
+        // noch nicht gefüllt, Boot-Race nach dem Start).
+        if let Some((vast_id, Some(nb_ip), true)) = app.targets.get(slot_id) {
+            if app.pool_routes.healthy(slot_id).is_empty() {
+                return Ok(UpstreamTarget { vast_id, nb_ip, port: svc.port });
             }
-            _ => {}
         }
         if wait_s == 0 || tokio::time::Instant::now() >= deadline {
             let state = describe_slot_state(app, slot_id);

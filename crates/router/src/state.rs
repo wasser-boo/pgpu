@@ -116,6 +116,76 @@ impl ActiveTargets {
     }
 }
 
+/// Pool-Routing (Multi-Instanz-Slots): Verwaltung aller healthy Ziele pro
+/// Slot + Auswahl pro Request.
+/// - Round-Robin über alle healthy Instanzen (Parallele Chats auf
+///   verschiedenen Boxen),
+/// - Job-Affinität: Requests mit gleicher X-Router-Job-Id landen auf
+///   DERSELBEN Box (TTS-Sätze eines Antwortblocks — Cache-Lokalität),
+///   TTL wie JobBatches (300 s nach letztem Request des Jobs erneuerbar).
+#[derive(Default)]
+pub struct PoolRoutes {
+    /// slot_id -> [(vast_id, nb_ip)] — nur healthy, Reconciler-gepflegt.
+    healthy: RwLock<HashMap<i64, Vec<(i64, String)>>>,
+    /// Round-Robin-Zeiger pro Slot.
+    rr: Mutex<HashMap<i64, usize>>,
+    /// job_id -> (slot_id, vast_id, expires_unix) — Sticky-Routing.
+    affinity: Mutex<HashMap<String, (i64, i64, i64)>>,
+}
+
+impl PoolRoutes {
+    pub const AFFINITY_TTL_S: i64 = 300;
+
+    pub fn set_healthy(&self, slot_id: i64, targets: Vec<(i64, String)>) {
+        self.healthy.write().unwrap().insert(slot_id, targets);
+    }
+
+    pub fn healthy(&self, slot_id: i64) -> Vec<(i64, String)> {
+        self.healthy.read().unwrap().get(&slot_id).cloned().unwrap_or_default()
+    }
+
+    /// Ziel für den nächsten Request des Slots. `job`: X-Router-Job-Id
+    /// (wenn vorhanden → Sticky auf der Box des Jobs, solange die noch
+    /// healthy ist). Ohne Pool-Eintrag: None (Aufrufer fällt auf ActiveTargets
+    /// zurück bzw. wartet per X-Router-Wait).
+    pub fn pick(&self, slot_id: i64, job: Option<&str>) -> Option<(i64, String)> {
+        let targets = self.healthy(slot_id);
+        if targets.is_empty() {
+            return None;
+        }
+        let now = chrono::Utc::now().timestamp();
+        // Affinität:Job-Mapping validieren (Box noch healthy?) und erneuern.
+        if let Some(job) = job.filter(|j| !j.is_empty()) {
+            let mut aff = self.affinity.lock().unwrap();
+            aff.retain(|_, (_, _, exp)| *exp > now);
+            if let Some(&(_, vast_id, _)) = aff.get(job) {
+                if let Some(t) = targets.iter().find(|(v, _)| *v == vast_id) {
+                    aff.insert(job.to_string(), (slot_id, vast_id, now + Self::AFFINITY_TTL_S));
+                    return Some(t.clone());
+                }
+            }
+            // Kein (gültiges) Mapping: Round-Robin unten, dann merken.
+            let picked = self.rr_pick(slot_id, &targets);
+            if let Some(p) = picked.clone() {
+                aff.insert(job.to_string(), (slot_id, p.0, now + Self::AFFINITY_TTL_S));
+            }
+            return picked;
+        }
+        self.rr_pick(slot_id, &targets)
+    }
+
+    fn rr_pick(&self, slot_id: i64, targets: &[(i64, String)]) -> Option<(i64, String)> {
+        if targets.is_empty() {
+            return None;
+        }
+        let mut rr = self.rr.lock().unwrap();
+        let idx = rr.entry(slot_id).or_insert(0);
+        let t = targets[*idx % targets.len()].clone();
+        *idx = (*idx + 1) % targets.len().max(1);
+        Some(t)
+    }
+}
+
 pub struct App {
     pub cfg: Config,
     pub db: Db,
@@ -123,6 +193,8 @@ pub struct App {
     pub traffic: Traffic,
     pub jobs: JobBatches,
     pub targets: ActiveTargets,
+    /// Pool-Routing: alle healthy Instanzen pro Slot + Job-Affinität.
+    pub pool_routes: PoolRoutes,
     pub hub: Hub,
     pub vast: Arc<Mutex<Option<Vast>>>,
     /// Reconciler sofort aufwecken (Wake-Request etc.).

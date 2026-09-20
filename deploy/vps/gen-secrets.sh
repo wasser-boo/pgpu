@@ -40,7 +40,7 @@ set_kv() {
 }
 
 needs() {
-    local key="$1" file="$2" placeholder="$3"
+    local key="$1" file="$2"
     [ "$FORCE" = "--force" ] && return 0
     local current
     current=$(grep -E "^${key}=" "$file" | head -1 | cut -d= -f2-)

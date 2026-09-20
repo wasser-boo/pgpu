@@ -147,6 +147,8 @@ pub struct SlotView {
     /// Ersatz-Box, die parallel zum aktiven Box wärmt (Hot-Swap).
     pub warming_id: i64,
     pub warming_state: String,
+    /// Pool-Anzeige: "Pool: 2/3 warm · 1 kalt" (nur bei total > 1).
+    pub pool_line: String,
 }
 
 pub struct StateView {
@@ -241,6 +243,9 @@ pub struct InstView {
     pub busy_reason: String,
     pub lifecycle: String,
     pub pinned: bool,
+    /// Letzter Agent-Health ("healthy" oder Degraded-Grund, z. B.
+    /// "11434 → 503") — sagt, warum die Box (noch) nicht serviert.
+    pub agent_health: String,
 }
 
 #[derive(Template)]
@@ -325,6 +330,25 @@ pub fn state_json(app: &SharedApp) -> serde_json::Value {
         let inst = shown.and_then(|v| app.db.instance(v));
         let traffic = app.traffic.snapshot(s.id);
         let hb = shown.and_then(|v| app.hub.heartbeat(v));
+        // Pool-Sicht: alle lebenden Instanzen des Slots (Multi-Instanz-
+        // Slots, Badges/Routing-Transparenz für Praxis).
+        let pool_cfg = app.cfg.slot(s.id).map(|c| c.pool).unwrap_or_default();
+        let instances: Vec<serde_json::Value> = app
+            .db
+            .instances(false)
+            .into_iter()
+            .filter(|r| r.slot_id == s.id)
+            .map(|r| {
+                serde_json::json!({
+                    "vast_id": r.vast_id,
+                    "state": r.state,
+                    "healthy": r.healthy,
+                    "busy": r.busy,
+                    "mode": r.mode.to_string(),
+                })
+            })
+            .collect();
+        let healthy_count = instances.iter().filter(|i| i["healthy"] == true).count();
         slots.push(serde_json::json!({
             "id": s.id,
             "role": s.role,
@@ -336,6 +360,8 @@ pub fn state_json(app: &SharedApp) -> serde_json::Value {
             "busy": inst.as_ref().map(|i| i.busy).unwrap_or(false),
             "in_flight": traffic.in_flight,
             "progress": hb.map(|h| h.progress_json.clone()),
+            "pool": { "warm": pool_cfg.warm, "total": pool_cfg.total, "healthy_now": healthy_count, "live_now": instances.len() },
+            "instances": instances,
         }));
     }
     serde_json::json!({
@@ -440,6 +466,22 @@ pub async fn index(app: AppCtx, req: Request) -> Response {
             pinned,
             warming_id: if active.is_some() { newest_other.map(|r| r.vast_id).unwrap_or(0) } else { 0 },
             warming_state: if active.is_some() { newest_other.map(|r| r.state.clone()).unwrap_or_default() } else { String::new() },
+            pool_line: {
+                let pool = s.pool;
+                if pool.total > 1 {
+                    let live = live_others.len() + usize::from(active.is_some());
+                    let healthy = app
+                        .db
+                        .instances(false)
+                        .into_iter()
+                        .filter(|r| r.slot_id == s.id && r.healthy && r.state == "healthy")
+                        .count();
+                    let cold = live.saturating_sub(healthy);
+                    format!("Pool: {healthy}/{} warm · {cold} kalt · {live}/{} live", pool.warm, pool.total)
+                } else {
+                    String::new()
+                }
+            },
         });
     }
     let events = app
@@ -543,6 +585,11 @@ fn inst_view(app: &SharedApp, row: &crate::db::InstanceRow) -> InstView {
         busy_reason: row.busy_reason.clone(),
         lifecycle: row.lifecycle.clone(),
         pinned: row.pinned,
+        agent_health: app
+            .hub
+            .heartbeat(row.vast_id)
+            .map(|hb| hb.health_json.to_string())
+            .unwrap_or_else(|| "—".into()),
     }
 }
 

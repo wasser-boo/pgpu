@@ -110,6 +110,39 @@ pub struct SlotPolicyCfg {
     /// on_demand (stabil, dph_total als Preis).
     #[serde(default)]
     pub mode: SlotMode,
+    /// Instanz-Pool: warm = gleichzeitig laufende Boxen (wenn Slot an),
+    /// total = Obergrenze inkl. kalt gestoppter Reserve. Default 1/1 =
+    /// klassisches Einzel-Box-Verhalten.
+    #[serde(default)]
+    pub pool: PoolConfig,
+}
+
+/// Multi-Instanz-Pool pro Slot ("3 running" / "2 warm 1 cold" / …):
+/// - warm: Ziel-Anzahl aktiver (booting..healthy) Instanzen, solange der
+///   Slot gewünscht ist. Fällt eine Box aus (preempt/host-tot), füllt die
+///   Policy automatisch nach — zuerst Reserve starten (Disk warm!), dann
+///   neu mieten.
+/// - total: Obergrenze lebender Instanzen des Slots. Gestoppte Instanzen
+///   unterhalb total sind geschützte Reserve (kein destroy_after_stopped,
+///   solange der Slot gewünscht ist).
+/// - Routing verteilt Requests über alle healthy Instanzen (Router-seitig,
+///   Round-Robin + Job-Stickiness) — mehrere Chats parallel möglich.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct PoolConfig {
+    #[serde(default = "d_pool_one")]
+    pub warm: usize,
+    #[serde(default = "d_pool_one")]
+    pub total: usize,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self { warm: 1, total: 1 }
+    }
+}
+
+fn d_pool_one() -> usize {
+    1
 }
 
 /// Slot-weiter Mietmodus. `on_demand` mietet zum listenpreis (dph_total):
@@ -378,20 +411,33 @@ pub fn decide(snap: &Snapshot, cfg: &PolicyConfig) -> Vec<Action> {
         }
 
         // --- Flip: Replacement healthy → Slot flippen, alten rausschmeißen.
+        // Pool: Bei mehreren gewünschten warmen Instanzen koexistieren
+        // healthy Boxen — Flip+SwapOut nur, wenn die AKTIVE krank ist
+        // (Failover) oder klassischer Einzel-Swap (pool.warm <= 1, das
+        // Replacement wurde gezielt als Ersatz gemietet).
         if let Some(repl) = slot.healthy_replacement() {
             if let Some(old) = active {
                 if old.vast_id != repl.vast_id {
-                    actions.push(Action::FlipSlot {
-                        slot_id: slot.id,
-                        from_instance: old.vast_id,
-                        to_instance: repl.vast_id,
-                        reason: "replacement healthy".into(),
-                    });
-                    actions.push(Action::SwapOut {
-                        instance_id: old.vast_id,
-                        destroy: slot.role == Role::Media,
-                        reason: "hot swap: replaced".into(),
-                    });
+                    let old_healthy = old.state == InstanceState::Healthy;
+                    if !old_healthy || scfg.pool.warm <= 1 {
+                        actions.push(Action::FlipSlot {
+                            slot_id: slot.id,
+                            from_instance: old.vast_id,
+                            to_instance: repl.vast_id,
+                            reason: if old_healthy {
+                                "replacement healthy".into()
+                            } else {
+                                format!("failover: aktive Box {} ({:?}) ersetzt", old.vast_id, old.state)
+                            },
+                        });
+                        actions.push(Action::SwapOut {
+                            instance_id: old.vast_id,
+                            destroy: slot.role == Role::Media,
+                            reason: "hot swap: replaced".into(),
+                        });
+                    }
+                    // Pool-Aufskalierung (warm > 1, aktive healthy): beide
+                    // laufen weiter — Routing verteilt den Traffic.
                 }
             } else {
                 actions.push(Action::FlipSlot {
@@ -403,15 +449,23 @@ pub fn decide(snap: &Snapshot, cfg: &PolicyConfig) -> Vec<Action> {
             }
         }
 
-        // --- Wake: Slot soll laufen, aber kein Backer da.
-        // Warming-Gate: Existiert bereits eine Instanz in aktivem Zustand
-        // (booting/healthy/connecting/draining — auch unabgeflipte), ist ein
-        // Backer unterwegs → NICHT erneut mieten. Sonst mietet der Wake-Zweig
-        // direkt nach dem Flip (active noch None) eine Zweitbox.
+        // --- Pool-Füllstand (verallgemeinertes Wake): Slot soll laufen →
+        // pool.warm aktive Instanzen (booting..healthy). Fällt eine aus
+        // (preempt/unreachable/destroyed), füllt der nächste Tick nach:
+        // zuerst Reserve starten (Disk warm, kein Image-Pull), sonst neu
+        // mieten bis pool.total. Warming-Gate: bereits aktive (auch
+        // ungeflippte) zählen — kein Doppel-Mieten.
         if slot.desired_running && !slot_pinned {
-            let running = active.map(|a| a.is_running()).unwrap_or(false);
-            let warming = slot.instances.iter().any(|i| i.state.is_active());
-            if !running && !warming {
+            let actives = slot.instances.iter().filter(|i| i.state.is_active()).count();
+            // Live-Zähler fürs total-Limit: nie-healthy-gewordene preempted
+            // Zombies sind Müll (werden im selben Pass geräumt) und dürfen
+            // die Pool-Grenze nicht blockieren (s. max_per_slot-Fix 751d771).
+            let live = slot
+                .instances
+                .iter()
+                .filter(|i| !(i.state == InstanceState::Preempted && !i.healthy))
+                .count();
+            if actives < scfg.pool.warm {
                 if let Some(stopped) = slot
                     .instances
                     .iter()
@@ -421,18 +475,24 @@ pub fn decide(snap: &Snapshot, cfg: &PolicyConfig) -> Vec<Action> {
                     if let Some(r) = budget_ok_for_start(snap, cfg, stopped, hours_to_end, soft_usd, monthly_usd) {
                         actions.push(Action::Start {
                             instance_id: stopped.vast_id,
-                            reason: r,
+                            reason: if scfg.pool.warm > 1 {
+                                format!("{} — Pool auffüllen ({actives}/{} warm)", r, scfg.pool.warm)
+                            } else {
+                                r
+                            },
                         });
                     }
-                } else if let Some(offer) = &slot.candidate_offer {
-                    if let Some(action) = plan_create(snap, cfg, slot, offer, over_soft, over_monthly, "wake", None) {
-                        actions.push(action);
+                } else if live < scfg.pool.total {
+                    if let Some(offer) = &slot.candidate_offer {
+                        if let Some(action) = plan_create(snap, cfg, slot, offer, over_soft, over_monthly, "pool fill", None) {
+                            actions.push(action);
+                        }
+                    } else {
+                        actions.push(Action::Alert {
+                            kind: "no_offer".into(),
+                            message: format!("Slot {} soll laufen (Pool {}/{}), aber kein Kandidat-Angebot gefunden.", slot.id, actives, scfg.pool.warm),
+                        });
                     }
-                } else {
-                    actions.push(Action::Alert {
-                        kind: "no_offer".into(),
-                        message: format!("Slot {} soll laufen, aber kein Kandidat-Angebot gefunden.", slot.id),
-                    });
                 }
             }
         }
@@ -442,7 +502,10 @@ pub fn decide(snap: &Snapshot, cfg: &PolicyConfig) -> Vec<Action> {
             let mut replacement_queued = false;
 
             // --- Preempted (Trigger A): Replacement nur bei frischem Traffic.
-            if inst.state == InstanceState::Preempted {
+            // Pool-Slots (warm > 1): die Pool-Füllung above übernimmt das
+            // Nachfüllen (Reserve-Start vor Neumiete) — hier KEIN zweiter
+            // Create, sonst Doppel-Miete.
+            if inst.state == InstanceState::Preempted && scfg.pool.warm <= 1 {
                 let had_traffic = slot
                     .last_traffic
                     .map(|t| (snap.now - t).num_seconds() <= scfg.swap.keep_warm_window_s)
@@ -473,7 +536,10 @@ pub fn decide(snap: &Snapshot, cfg: &PolicyConfig) -> Vec<Action> {
             }
 
             // --- Gebots-Druck (Trigger B): busy → defend, idle → Replacement.
-            if inst.mode == Mode::Interruptible && inst.is_running() && inst.min_bid > inst.bid_usd_h + 1e-9 {
+            // Pool-Slots (warm > 1) mieten bewusst stabil — Churn-Swaps
+            // würden die Pool-Füll-Logik durcheinanderbringen (eine neue
+            // healthy Box ist dort Aufskalierung, kein Ersatz).
+            if inst.mode == Mode::Interruptible && inst.is_running() && inst.min_bid > inst.bid_usd_h + 1e-9 && scfg.pool.warm <= 1 {
                 let can_bid = !over_soft && !over_monthly;
                 if inst.busy && scfg.bid.defend_when_busy && can_bid && !pinned {
                     let new_bid = (inst.min_bid * 1.1).min(scfg.bid.ceiling_usd_h);
@@ -513,8 +579,8 @@ pub fn decide(snap: &Snapshot, cfg: &PolicyConfig) -> Vec<Action> {
 
             // --- Kosten-Optimierung (Trigger C, für llm per Default aus).
             // On-Demand-Slots mieten bewusst stabil — kein Churn zurück
-            // in den Interruptible-Markt.
-            if scfg.swap.optimize_cost && scfg.mode != SlotMode::OnDemand && !pinned && inst.is_running() {
+            // in den Interruptible-Markt. Pool-Slots ebenso (s. Trigger B).
+            if scfg.swap.optimize_cost && scfg.mode != SlotMode::OnDemand && scfg.pool.warm <= 1 && !pinned && inst.is_running() {
                 let rate = inst.rate_usd_h();
                 let swap_recent = slot
                     .last_swap
@@ -573,8 +639,19 @@ pub fn decide(snap: &Snapshot, cfg: &PolicyConfig) -> Vec<Action> {
         }
 
         // --- Destroy nach Stoppen (Storage-Kosten).
+        // Pool-Reserve: Gestoppte Instanzen unterhalb pool.total bleiben
+        // erhalten, solange der Slot gewünscht ist — sie sind die KALTEN
+        // Standbys ("1 warm 2 cold") für schnelles Failover ohne Image-
+        // Pull. Ohne Slot-Bedarf greifen die normalen destroy-Regeln
+        // (Scale-to-Zero bleibt erhalten).
+        let live = slot
+            .instances
+            .iter()
+            .filter(|i| !(i.state == InstanceState::Preempted && !i.healthy))
+            .count();
+        let pool_reserve = slot.desired_running && scfg.pool.total > 1 && live <= scfg.pool.total;
         for inst in &slot.instances {
-            if inst.state == InstanceState::Stopped && !inst.pinned {
+            if inst.state == InstanceState::Stopped && !inst.pinned && !pool_reserve {
                 if let Some(since) = inst.stopped_since {
                     let stopped_secs = (snap.now - since).num_seconds();
                     if stopped_secs >= scfg.idle.destroy_after_stopped_s {
