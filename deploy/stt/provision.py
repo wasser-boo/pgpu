@@ -35,7 +35,13 @@ for lang in languages:
         continue
     print(f"provisioning {name} ...")
     archive = root / f"{name}.zip"
-    subprocess.run(["wget", "-q", "-O", str(archive), url], check=True)
+    # -c: Resume nach Abbruch (1,4-GB-Download über NAS-Egress);
+    # --tries/--timeout/--waitretry: Flaky-Firewall nicht sofort fatal —
+    # docker restartet den Container ohnehin, -c macht dann weiter.
+    subprocess.run(
+        ["wget", "-q", "-c", "--tries=10", "--timeout=45", "--waitretry=5", "-O", str(archive), url],
+        check=True,
+    )
     with zipfile.ZipFile(archive) as zf:
         zf.extractall(root / ".tmp")
     extracted = next((root / ".tmp").iterdir())
