@@ -12,6 +12,7 @@
   <div class="bar"><div class="{{ budget.bar_class }}" style="width:{{ budget.pct }}%"></div></div>
   {% if stt_sessions > 0 %}<span class="badge b-info">STT: {{ stt_sessions }} WS-Session(s) aktiv</span>{% else %}<span class="badge b-mut">STT idle</span>{% endif %}
   <div class="actions" style="margin-top:10px">
+    <form method="post" action="/do/destroy_all" onsubmit="return confirm('WIRKLICH ALLE Instanzen (über alle Slots, ungepinnt) zerstören?')"><button style="color:var(--bad)">Alle Instanzen zerstören</button></form>
     {% if auto_rent %}
       <span class="badge b-ok">Auto-Miete: AN</span>
       <form method="post" action="/do/auto_rent" onsubmit="return confirm('Auto-Miete AUSschalten? Laufende Boxen werden gestoppt; der Router mietet nichts mehr, bis du wieder anschaltest.')"><button>Aus</button></form>

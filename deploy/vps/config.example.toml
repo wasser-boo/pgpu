@@ -136,3 +136,23 @@ min_swap_interval_s = 3600
 
 [slots.env]
 PRAXIS_QWEN_TTS_DOWNLOAD = "1"
+
+# ---------------------------------------------------- Zeitpläne (Cron light)
+# Zeitgesteuerte Aktionen — persistent in der DB dedupliziert (1x/Regel/Tag),
+# 90-min-Nachholfenster falls der Router beim Termin aus war. Zeitzone =
+# router.tz. Live editierbar (Settings-Editor, kein Neustart).
+# Aktionen:
+#   sleep        = auto_rent AUS, laufende Boxen stoppen (Disk bleibt)
+#   wake / rent  = auto_rent AN, Slots mieten/warmen ("alles up, wenn ich aufstehe")
+#   destroy_all  = ALLE nicht gepinnten Instanzen zerstören + auto_rent AUS
+# Beispiel: abends aufräumen, morgens warm (werktags):
+# [[schedule]]
+# time = "18:00"
+# days = "daily"            # daily | weekdays | weekends | "Mon,Wed,Fri"
+# action = "destroy_all"
+# slots = [1, 2]            # optional: nur diese Slots (Default: alle)
+#
+# [[schedule]]
+# time = "07:00"
+# days = "weekdays"
+# action = "wake"

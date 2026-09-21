@@ -743,6 +743,14 @@ pub async fn settings_page(app: AppCtx, Query(q): Query<HashMap<String, String>>
     Html(tpl.render().unwrap_or_default()).into_response()
 }
 
+/// Dashboard-Button „Alle Instanzen zerstören“ — gleiches Primitiv wie
+/// /api/v1/destroy_all (alle nicht gepinnten, über alle Slots).
+pub async fn do_destroy_all(app: AppCtx, headers: axum::http::HeaderMap) -> Response {
+    page_guard!(app, ReqOf(&headers));
+    let n = crate::reconciler::destroy_all_instances(&app.0, None, "dashboard: destroy_all").await;
+    Redirect::to(&format!("/?msg=destroyed%20{n}")).into_response()
+}
+
 /// Save aus dem Dashboard-Editor: validiert + schreibt + tauscht live
 /// (gleicher Pfad wie PUT /api/v1/config). Fehler → Message statt Reload.
 pub async fn do_config_save(app: AppCtx, headers: axum::http::HeaderMap, Form(form): Form<HashMap<String, String>>) -> Response {

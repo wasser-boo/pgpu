@@ -150,6 +150,8 @@ async fn async_main() -> Result<()> {
         .route("/api/v1/state", get(api::state))
         .route("/api/v1/settings/auto_rent", post(api::auto_rent_set))
         .route("/api/v1/config", get(api::config_get).put(api::config_put))
+        .route("/api/v1/destroy_all", post(api::destroy_all))
+        .route("/do/destroy_all", post(dashboard::do_destroy_all))
         .route("/api/v1/budget", get(api::budget))
         .route("/api/v1/events", get(api::events_json))
         .route("/api/v1/events/stream", get(api::events_sse))

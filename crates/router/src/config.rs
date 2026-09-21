@@ -22,6 +22,11 @@ pub struct Config {
     pub limits: LimitsConfig,
     #[serde(default)]
     pub slots: Vec<SlotCfg>,
+    /// Zeitgesteuerte Aktionen (Cron light): s. SchedRule. Wird pro
+    /// Reconciler-Tick geprüft, Dedup pro Tag in der DB — persistent,
+    /// überlebt Router-Restarts.
+    #[serde(default)]
+    pub schedule: Vec<SchedRule>,
     #[serde(default)]
     pub alerts: AlertsCfg,
 }
@@ -180,6 +185,75 @@ fn d_stt_url() -> String {
     "http://127.0.0.1:2700".into()
 }
 
+/// Eine zeitgesteuerte Regel ([[schedule]] in der config.toml):
+/// cron-light — tägliche/wochentägliche Uhrzeit-Trigger für Rent/Sleep/
+/// Destroy-All. Beispiele:
+///
+/// ```toml
+/// [[schedule]]
+/// time = "18:00"
+/// days = "daily"
+/// action = "destroy_all"   # zerstört ALLE nicht gepinnten Instanzen + auto_rent aus
+///
+/// [[schedule]]
+/// time = "07:00"
+/// days = "weekdays"
+/// action = "wake"          # auto_rent an + Slots gewünscht → warm, wenn man aufsteht
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct SchedRule {
+    /// "HH:MM" in router.tz.
+    pub time: String,
+    /// "daily" | "weekdays" | "weekends" | "Mon,Wed,Fri" (3- oder Vollnamen).
+    #[serde(default = "d_sched_days")]
+    pub days: String,
+    /// "sleep" (auto_rent aus, Boxen stoppen) | "wake"/"rent" (auto_rent
+    /// an, Slots mieten) | "destroy_all" (alle Instanzen weg + aus).
+    pub action: String,
+    /// Nur diese Slots (Default: alle).
+    #[serde(default)]
+    pub slots: Option<Vec<i64>>,
+}
+
+fn d_sched_days() -> String {
+    "daily".into()
+}
+
+impl SchedRule {
+    /// Minuten seit Mitternacht (Validierung inklusive).
+    pub fn minutes(&self) -> Option<u32> {
+        let mut it = self.time.splitn(2, ':');
+        let h: u32 = it.next()?.parse().ok()?;
+        let m: u32 = it.next()?.parse().ok()?;
+        (h < 24 && m < 60).then_some(h * 60 + m)
+    }
+
+    /// Passt der Wochentag (1=Mon .. 7=Sun)?
+    pub fn matches_weekday(&self, weekday: u8) -> bool {
+        let d = self.days.trim().to_ascii_lowercase();
+        if d.is_empty() || d == "daily" || d == "*" {
+            return true;
+        }
+        if d == "weekdays" {
+            return (1..=5).contains(&weekday);
+        }
+        if d == "weekends" || d == "weekend" {
+            return weekday >= 6;
+        }
+        // Kommaliste: Mon/Tue/... (3 Buchstaben reichen, Groß/Klein egal).
+        d.split(',').any(|tok| {
+            let t = tok.trim().to_ascii_lowercase();
+            DAY_NAMES
+                .iter()
+                .position(|n| n.starts_with(&t) || *n == t)
+                .map(|idx| idx as u8 + 1 == weekday)
+                .unwrap_or(false)
+        })
+    }
+}
+
+const DAY_NAMES: [&str; 7] = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"];
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct AlertsCfg {
     /// Optional: Webhook (ntfy/Telegram/Discord) für Alerts.
@@ -329,6 +403,15 @@ impl Config {
         for s in &self.slots {
             if s.name.is_empty() {
                 anyhow::bail!("slot {} ohne name", s.id);
+            }
+        }
+        for (i, r) in self.schedule.iter().enumerate() {
+            if r.minutes().is_none() {
+                anyhow::bail!("schedule[{i}]: time muss \"HH:MM\" sein (ist {:?})", r.time);
+            }
+            let a = r.action.trim().to_ascii_lowercase();
+            if !["sleep", "wake", "rent", "destroy_all"].contains(&a.as_str()) {
+                anyhow::bail!("schedule[{i}]: unbekannte action {:?} (sleep|wake|rent|destroy_all)", r.action);
             }
         }
         Ok(())

@@ -42,6 +42,11 @@ pub async fn run(app: SharedApp) {
 }
 
 pub async fn tick(app: &SharedApp) -> anyhow::Result<()> {
+    // 0. Zeitpläne ([[schedule]]-Regeln) — vor allem anderen, damit eine
+    //    18:00-Destroy-All-Regel die Boxen weg räumt, bevor der Tick sie
+    //    wieder als "soll laufen" betrachtet.
+    run_schedules(app).await;
+
     // 1. Vast-Sync.
     let vast_client = app.vast.lock().unwrap().clone();
     let vast_instances = match vast_client {
@@ -835,6 +840,111 @@ pub async fn apply_action(app: &SharedApp, action: &Action) -> anyhow::Result<()
 /// Ausschalten „aus ist aus“: gewünschte Zustände runternehmen und laufende,
 /// nicht gepinnte Boxen stoppen (Disk bleibt warm; die Zerstörung übernimmt
 /// danach die Idle-Regel). Einschalten mietet NICHT — der Nutzer weckt selbst.
+// ------------------------------------------------------- Zeitpläne (Cron light)
+
+/// `[[schedule]]`-Regeln abarbeiten: feuert maximal 1× pro Regel+Tag
+/// (Dedup in der DB — Router-Restart refiret NICHT, wenn der Tag schon
+/// bedient wurde). Gnadenfenster 90 min: war der Router beim Termin aus,
+/// holt er nach. Außerhalb des Fensters = bewusst verpasst.
+pub async fn run_schedules(app: &SharedApp) {
+    let rules = app.cfg().schedule.clone();
+    if rules.is_empty() {
+        return;
+    }
+    let tz: chrono_tz::Tz = app
+        .cfg()
+        .router
+        .tz
+        .parse()
+        .unwrap_or(chrono_tz::Europe::Berlin);
+    let now_local = chrono::Utc::now().with_timezone(&tz);
+    let weekday = now_local.weekday().number_from_monday() as u8;
+    let minutes = now_local.time().hour() as u32 * 60 + now_local.time().minute() as u32;
+    let date = now_local.format("%Y-%m-%d").to_string();
+
+    for rule in &rules {
+        let Some(rule_min) = rule.minutes() else { continue };
+        // Noch nicht fällig / Tag passt nicht → weiter.
+        if minutes < rule_min || minutes > rule_min + 90 {
+            continue;
+        }
+        if !rule.matches_weekday(weekday) {
+            continue;
+        }
+        // Dedup: einmal pro Regel+Tag gefeuert?
+        let key = format!(
+            "sched_fired:{}:{}:{}:{}",
+            rule.time,
+            rule.days,
+            rule.action,
+            rule.slots.clone().unwrap_or_default().iter().map(|i| i.to_string()).collect::<Vec<_>>().join(".")
+        );
+        if app.db.setting(&key).as_deref() == Some(&date) {
+            continue;
+        }
+        if let Err(e) = app.db.set_setting(&key, &date) {
+            tracing::warn!(%e, "schedule dedup persist fehlgeschlagen");
+        }
+        let slots = rule.slots.clone();
+        let action = rule.action.trim().to_ascii_lowercase();
+        tracing::info!(%action, time = %rule.time, "schedule-Regel feuert");
+        match action.as_str() {
+            // Aus: Auto-Miete stoppt laufende Boxen (Disk bleibt).
+            "sleep" => set_auto_rent(app, false, "schedule").await,
+            // An: Slots gewünscht → Reconciler mietet/warmt im selben Tick.
+            "wake" | "rent" => {
+                set_auto_rent(app, true, "schedule").await;
+                for slot in &app.cfg().slots {
+                    if slots.as_ref().is_none_or(|ids| ids.contains(&slot.id)) {
+                        let _ = app.db.set_slot_desired_audited(slot.id, true, "schedule wake");
+                    }
+                }
+                app.reconcile_now.notify_one();
+            }
+            // Alles weg: zerstört ALLE nicht gepinnten Instanzen und schaltet
+            // die Auto-Miete aus (kein Nachmietschritt im selben Atemzug).
+            "destroy_all" => {
+                let n = destroy_all_instances(app, slots.as_deref(), "schedule destroy_all").await;
+                set_auto_rent(app, false, "schedule destroy_all").await;
+                app.events.emit(
+                    &app.db,
+                    "schedule_destroy_all",
+                    None,
+                    None,
+                    &format!("Zeitplan {time}: alle Instanzen zerstört", time = rule.time),
+                    &serde_json::json!({ "destroyed": n, "rule_time": rule.time }),
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Alle nicht gepinnten, nicht zerstörten Instanzen (optional gefiltert
+/// nach Slot-IDs) zerstören. Gibt die Anzahl zurück. Bewusste API-Aktion
+/// (Dashboard-Button/Cron) — Lock/Pin bleibt gewollt bestehen.
+pub async fn destroy_all_instances(
+    app: &SharedApp,
+    slot_ids: Option<&[i64]>,
+    reason: &str,
+) -> usize {
+    let mut n = 0;
+    for inst in app.db.instances(false) {
+        if inst.destroyed_at.is_some() || inst.pinned {
+            continue;
+        }
+        if let Some(ids) = slot_ids {
+            if !ids.contains(&inst.slot_id) {
+                continue;
+            }
+        }
+        if destroy_instance(app, inst.vast_id, reason).await.is_ok() {
+            n += 1;
+        }
+    }
+    n
+}
+
 pub async fn set_auto_rent(app: &SharedApp, enabled: bool, source: &str) {
     let was = app.db.auto_rent_enabled();
     if enabled == was {

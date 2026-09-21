@@ -37,6 +37,23 @@ macro_rules! guarded {
 
 // ------------------------------------------------------------- Config (Hot-Reload)
 
+/// `POST /api/v1/destroy_all` — ALLE nicht gepinnten Instanzen zerstören
+/// (optional body {"slots":[1,2]} oder {"auto_rent":false}). Fürs manuelle
+/// Aufräumen + als Ziel für externe Cronjobs.
+pub async fn destroy_all(app: AppCtx, req: Request) -> Response {
+    guarded!(app, req);
+    let body = axum::body::to_bytes(req.into_body(), 64 * 1024).await.unwrap_or_default();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+    let slots: Option<Vec<i64>> = payload
+        .get("slots")
+        .and_then(|s| serde_json::from_value(s.clone()).ok());
+    let n = crate::reconciler::destroy_all_instances(&app.0, slots.as_deref(), "api: destroy_all").await;
+    if payload.get("auto_rent").and_then(|a| a.as_bool()).unwrap_or(false) {
+        crate::reconciler::set_auto_rent(&app.0, false, "api: destroy_all").await;
+    }
+    (StatusCode::OK, format!("destroyed {n} instances")).into_response()
+}
+
 /// `GET /api/v1/config` — Rohtext der config.toml (Bearer-geschützt).
 pub async fn config_get(app: AppCtx, req: Request) -> Response {
     guarded!(app, req);
@@ -262,10 +279,19 @@ pub async fn slot_action(app: AppCtx, Path((slot_id, action)): Path<(i64, String
             (StatusCode::OK, "stopping").into_response()
         }
         "destroy" => {
-            if let Some(active) = app.db.active_instance(slot_id) {
-                let _ = crate::reconciler::destroy_instance(&app.0, active, &reason);
+            // Bugfix 21.09.: bisher nur die ACTIVE Instanz — während
+            // Warmup/Boot ist active None → Button war ein stilles No-Op
+            // ("der Destroy-Button zerstört die Instanz nicht"). Jetzt:
+            // ALLE Instanzen des Slots.
+            let mut n = 0;
+            for inst in app.db.instances(false) {
+                if inst.slot_id == slot_id && inst.destroyed_at.is_none() && !inst.pinned {
+                    if crate::reconciler::destroy_instance(&app.0, inst.vast_id, &reason).await.is_ok() {
+                        n += 1;
+                    }
+                }
             }
-            (StatusCode::OK, "destroying").into_response()
+            (StatusCode::OK, format!("destroying {n}")).into_response()
         }
         "start" => {
             if let Some(active) = app.db.active_instance(slot_id) {
