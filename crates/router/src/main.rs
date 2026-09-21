@@ -167,7 +167,12 @@ async fn async_main() -> Result<()> {
         .route("/api/v1/node/assets/:id", get(node::asset))
         .route("/api/v1/node/reports", post(node::report))
         .route("/api/v1/node/events", post(node::node_event))
-        .route_service("/static/*path", tower_http::services::ServeDir::new(static_dir()))
+        // nest_service (NICHT route_service): nest stript das /static-Präfix,
+        // route_service tut es NICHT → ServeDir suchte static/static/<file>
+        // → alles unter /static/* war 404 (xterm.js, htmx …), das Terminal-
+        // Widget renderte nie. Erste live bemerkt 21.09. (Terminal-Seite ohne
+        // xterm). Local reproduziert und verifiziert.
+        .nest_service("/static", tower_http::services::ServeDir::new(static_dir()))
         .with_state(app.clone());
 
     let bind_ip = app.cfg.router.bind_ip.clone();
