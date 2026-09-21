@@ -2,17 +2,21 @@
 {% block title %}pgpu — Assets{% endblock %}
 {% block content %}
 <h1>Assets (private Dateien für Instanzen)</h1>
-<p class="mut">Alles hier wird vom gpu-agent beim Start gezogen (SHA256-geprüft). Sidecar <span class="mono">&lt;datei&gt;.meta.toml</span> mit target/mode/restart/required steuert das Ziel (Default: /workspace/&lt;name&gt;).</p>
+{% if let Some(ok) = ok %}
+<p style="color:#2ecc71;font-weight:600">✓ Hochgeladen: {{ ok }} — aufgelöstes Ziel/Mode/Restart unten prüfen.</p>
+{% endif %}
+<p class="mut">Alles hier wird vom gpu-agent beim Start gezogen (SHA-geprüft). Sidecar <span class="mono">&lt;datei&gt;.meta.toml</span> oder <span class="mono">&lt;basis&gt;.meta.toml</span> (ohne Extension) mit target/mode/restart/required steuert das Ziel (Default: /workspace/&lt;name&gt;). Datei + Sidecar zusammen hochladen — Reihenfolge egal.</p>
 <div class="grid">
 {% for k in groups %}
 <div class="card">
   <h2 style="margin-top:0">{{ k.0 }}</h2>
   {% if k.1.is_empty() %}<p class="mut">leer</p>{% endif %}
   {% for a in k.1 %}
-  <div class="mono">{{ a.target }} <span class="mut">({{ a.size }} B · {{ a.id }})</span></div>
+  <div class="mono">{{ a.target }}
+    <span class="mut">({{ a.size }} B · mode {{ a.mode }}{% if a.restart %} · Restart: {{ a.restart }}{% else %} · ohne Restart{% endif %}{% if a.required %} · required{% endif %} · {{ a.id }})</span></div>
   {% endfor %}
   <form method="post" action="/do/assets/{{ k.0 }}/upload" enctype="multipart/form-data" style="margin-top:8px">
-    <input type="file" name="file" required>
+    <input type="file" name="file" required multiple>
     <button>Upload</button>
   </form>
 </div>

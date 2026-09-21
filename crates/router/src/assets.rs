@@ -155,22 +155,25 @@ struct Meta {
 }
 
 fn meta_for(file: &StdPath) -> Meta {
-    let side = file.with_extension(format!("{}.meta.toml", file
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or_default()));
-    let side = if side.exists() {
-        side
-    } else {
-        // auch <file>.meta.toml ohne Extra-Extension
-        let mut s = file.as_os_str().to_os_string();
-        s.push(".meta.toml");
-        StdPath::new(&s).to_path_buf()
-    };
-    if !side.exists() {
-        return Meta::default();
+    // Sidecar-Konvention <datei>.meta.toml — TOLERANT auch <basis>.meta.toml
+    // (ohne die Datei-Extension): reference.wav erkennt also sowohl
+    // reference.wav.meta.toml ALS AUCH reference.meta.toml. Die Reihenfolge
+    // beim Upload ist gleichgültig — das Meta wird erst beim Manifest-Bau
+    // gelesen (21.09. Nutzer-Wunsch: „keine Reihenfolge").
+    let mut s = file.as_os_str().to_os_string();
+    s.push(".meta.toml");
+    let candidates = [StdPath::new(&s).to_path_buf(), file.with_extension("meta.toml")];
+    for side in candidates {
+        if side.exists() {
+            if let Some(m) = std::fs::read_to_string(&side)
+                .ok()
+                .and_then(|t| toml::from_str::<Meta>(&t).ok())
+            {
+                return m;
+            }
+        }
     }
-    toml::from_str(&std::fs::read_to_string(side).unwrap_or_default()).unwrap_or_default()
+    Meta::default()
 }
 
 fn sha256_cached(db: &Db, file: &StdPath) -> String {

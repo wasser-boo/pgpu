@@ -276,12 +276,17 @@ pub struct SchedView {
 #[template(path = "assets.html")]
 pub struct AssetsTpl {
     pub groups: Vec<(String, Vec<AssetRow>)>,
+    /// Upload-Feedback (?ok=<name> nach do_asset_upload)
+    pub ok: Option<String>,
 }
 
 pub struct AssetRow {
     pub id: String,
     pub target: String,
     pub size: u64,
+    pub mode: String,
+    pub restart: String,
+    pub required: bool,
 }
 
 #[derive(Template)]
@@ -661,6 +666,16 @@ pub async fn schedules_page(app: AppCtx, req: Request) -> Response {
 
 pub async fn assets_page(app: AppCtx, req: Request) -> Response {
     page_guard!(app, req);
+    // Upload-Feedback per Query-Param (?ok=<name> — do_asset_upload redirectet
+    // hierher; Name ist auf [A-Za-z0-9.-_/] begrenzt, '/' wird als %2F encodiert).
+    let ok = req
+        .uri()
+        .query()
+        .and_then(|q| {
+            q.split('&').find(|p| p.starts_with("ok=")).map(|p| {
+                p[3..].replace("%2F", "/").replace("%2f", "/").replace('+', " ")
+            })
+        });
     let mut groups = Vec::new();
     for role in ["all", "llm", "media"] {
         let m = crate::assets::manifest_for_role(&app.0, role);
@@ -668,11 +683,18 @@ pub async fn assets_page(app: AppCtx, req: Request) -> Response {
             role.to_string(),
             m.assets
                 .into_iter()
-                .map(|a| AssetRow { id: a.id, target: a.target, size: a.size })
+                .map(|a| AssetRow {
+                    id: a.id,
+                    target: a.target,
+                    size: a.size,
+                    mode: a.mode,
+                    restart: a.restart,
+                    required: a.required,
+                })
                 .collect(),
         ));
     }
-    Html(AssetsTpl { groups }.render().unwrap_or_default()).into_response()
+    Html(AssetsTpl { groups, ok }.render().unwrap_or_default()).into_response()
 }
 
 pub async fn settings_page(app: AppCtx, req: Request) -> Response {
@@ -889,6 +911,7 @@ pub async fn do_asset_upload(
     mut multipart: Multipart,
 ) -> Response {
     page_guard!(app, ReqOf(&headers));
+    let mut uploaded: Vec<String> = Vec::new();
     while let Some(field) = multipart.next_field().await.ok().flatten() {
         let name = field.file_name().unwrap_or("upload.bin").to_string();
         let data = field.bytes().await.unwrap_or_default();
@@ -901,6 +924,11 @@ pub async fn do_asset_upload(
         if r.status() != StatusCode::OK {
             return r;
         }
+        uploaded.push(name);
     }
-    Redirect::to("/assets").into_response()
+    // Feedback: Name im Query-Param (safe-Zeichensatz, '/' → %2F) — die
+    // Assets-Seite zeigt danach das aufgeloeste Ziel/Restart/Mode (Meta!
+    // Erfolg sichtbar statt stiller Redirect, 21.09. Nutzer-Wunsch).
+    let ok = uploaded.join(", ").replace('/', "%2F");
+    Redirect::to(&format!("/assets?ok={ok}")).into_response()
 }

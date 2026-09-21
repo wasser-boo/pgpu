@@ -22,15 +22,21 @@ term.focus();
 // löscht, Enter schickt die komplette Zeile. Kein vty → Pfeile/History/Strg-C
 // gibt es nicht (Strg-C verwirft hier nur die lokale Zeile).
 let buf = '';
+const PROMPT = '\x1b[36magent>\x1b[0m ';
+// Prompt-Endmarker: Wir haengen an jede Zeile '; echo __PRAXIS_PROMPT__' an —
+// die Ausgabe des Markers ersetzen wir lokal durch den naechsten Prompt.
+// So steht der Prompt ERST, wenn der Befehl fertig ist (auch bei mehrsekündigen
+// Ausgaben). 'exit' klappt trotzdem: bash beendet vor dem echo → TermEnd.
 term.onData((d) => {
   if (d === '\r') {                                   // Enter → Zeile senden
     term.write('\r\n');
-    if (buf.length) ws.send(JSON.stringify({ type: 'input', data: buf }));
+    if (buf.length) ws.send(JSON.stringify({ type: 'input', data: buf + '; echo __PRAXIS_PROMPT__' }));
+    else term.write(PROMPT);
     buf = '';
   } else if (d === '\x7f') {                          // Backspace lokal
     if (buf.length) { buf = buf.slice(0, -1); term.write('\b \b'); }
   } else if (d === '\x03') {                          // Strg-C: Zeile verwerfen
-    buf = ''; term.write('^C\r\n');
+    buf = ''; term.write('^C\r\n' + PROMPT);
   } else if (d.length === 1 ? d >= ' ' : true) {      // druckbar → puffern + Echo
     buf += d; term.write(d);
   }
@@ -38,11 +44,14 @@ term.onData((d) => {
 ws.onmessage = (m) => {
   try {
     const v = JSON.parse(m.data);
-    if (v.type === 'output') term.write(v.data);
+    if (v.type === 'output') {
+      if (v.data === '__PRAXIS_PROMPT__\n') term.write(PROMPT);
+      else term.write(v.data);
+    }
     if (v.type === 'exit') { term.write('\r\n\x1b[31m[Session beendet]\x1b[0m\r\n'); ws.close(); }
   } catch (e) {}
 };
-ws.onopen = () => term.write('\x1b[32mverbunden — bash auf Instanz {{ vast_id }}\x1b[0m\r\n');
+ws.onopen = () => term.write('\x1b[32mverbunden — bash auf Instanz {{ vast_id }}\x1b[0m\r\n' + PROMPT);
 ws.onclose = () => term.write('\r\n\x1b[31m[getrennt]\x1b[0m\r\n');
 </script>
 {% endblock %}
