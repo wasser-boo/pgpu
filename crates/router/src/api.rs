@@ -431,14 +431,28 @@ pub async fn term_ws(app: AppCtx, Path(vast_id): Path<i64>, ws: WebSocketUpgrade
     }
     ws.on_upgrade(move |socket| async move {
         let (mut sink, mut stream) = socket.split();
-        let term_id = app.hub.new_term_id();
 
-        // Open an die Instanz.
-        let open = praxis_common::node::RouterCommand::Cmd {
-            id: term_id,
-            command: praxis_common::node::Command::TermOpen { cols: 80, rows: 24 },
+        // TermOpen über den Command-Weg (hub.command): Der Agent vergibt die
+        // Terminal-Session-ID SELBST (terms.open() → eigener Zähler) und
+        // antwortet mit {"term_id": N}. Vorher wurde diese Antwort verworfen
+        // und das Relay unter der ROUTER-eigenen ID (new_term_id) registriert
+        // → die Agent-Frames (Agent-ID!) fielen in relay_term still durch,
+        // das Dashboard-Terminal blieb leer (21.09. live reproduziert).
+        let open = app
+            .hub
+            .command(vast_id, |id| praxis_common::node::RouterCommand::Cmd {
+                id,
+                command: praxis_common::node::Command::TermOpen { cols: 80, rows: 24 },
+            })
+            .await;
+        let term_id = match open {
+            Ok(data) => data.get("term_id").and_then(|v| v.as_u64()).unwrap_or(0),
+            Err(_) => 0,
         };
-        if app.hub.term_send(vast_id, open).is_err() {
+        if term_id == 0 {
+            // Agent nicht verbunden/falsche Antwort → sauber beenden statt
+            // still leer zu bleiben (Frontend zeigt „[Session beendet]“).
+            let _ = sink.send(Message::Text(r#"{"type":"exit"}"#.into())).await;
             return;
         }
 

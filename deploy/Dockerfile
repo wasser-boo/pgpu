@@ -13,18 +13,28 @@ RUN T=$([ "${TARGETPLATFORM:-linux/amd64}" = "linux/arm64" ] && echo aarch64-unk
     rustup target add "$T" && \
     apt-get update && apt-get install -y --no-install-recommends musl-tools && rm -rf /var/lib/apt/lists/* && \
     echo "$T" > /rusttarget
+ARG TARGETARCH=""
 WORKDIR /agent
 COPY --from=agent Cargo.toml ./
 COPY --from=agent src ./src
-RUN T=$(cat /rusttarget) && cargo build --release --target "$T" && \
-    cp "target/$T/release/praxis-gpu-agent" /gpu-agent
+# Cache-Mounts pro Arch (Multi-Arch-Parallel-Build darf target/Registry nicht
+# ungeschützt teilen — Race beim Entpacken, s. praxis-Dockerfile 21.09.):
+RUN --mount=type=cache,target=/agent-tgt \
+    --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    T=$(cat /rusttarget) && \
+    CARGO_TARGET_DIR=/agent-tgt/${TARGETARCH:-host} cargo build --release --target "$T" && \
+    cp "/agent-tgt/${TARGETARCH:-host}/$T/release/praxis-gpu-agent" /gpu-agent
 
 FROM rust:1-bookworm AS router-builder
+ARG TARGETARCH=""
 WORKDIR /build
 # Workspace-Metadaten zuerst (Layer-Cache für Deps), dann echte Quellen.
 COPY Cargo.toml Cargo.lock* ./
 COPY crates ./crates
-RUN cargo build --release && cp target/release/praxis-router /praxis-router
+RUN --mount=type=cache,target=/build-tgt \
+    --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    CARGO_TARGET_DIR=/build-tgt/${TARGETARCH:-host} cargo build --release && \
+    cp "/build-tgt/${TARGETARCH:-host}/release/praxis-router" /praxis-router
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && \
