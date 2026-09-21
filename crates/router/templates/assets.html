@@ -13,7 +13,7 @@
   {% if k.1.is_empty() %}<p class="mut">leer</p>{% endif %}
   {% for a in k.1 %}
   <div class="mono">{{ a.target }}
-    <span class="mut">({{ a.size }} B · mode {{ a.mode }}{% if a.restart %} · Restart: {{ a.restart }}{% else %} · ohne Restart{% endif %}{% if a.required %} · required{% endif %} · {{ a.id }})</span></div>
+    <span class="mut">({{ a.size }} B · mode {{ a.mode }}{% if a.restart != "" %} · Restart: {{ a.restart }}{% else %} · ohne Restart{% endif %}{% if a.required %} · required{% endif %} · {{ a.id }})</span></div>
   {% endfor %}
   <form method="post" action="/do/assets/{{ k.0 }}/upload" enctype="multipart/form-data" style="margin-top:8px">
     <input type="file" name="file" required multiple>
