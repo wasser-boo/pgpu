@@ -112,3 +112,20 @@ Entrypoint ruft jetzt `praxis repair-assets --directory /opt/praxis` bei
 jedem Start (idempotent, offline, 93 created am Frischstart). Verifiziert
 an vayayo/praxis:0.6 (amd64+arm64 gepusht): VORHER 404/404 → automatisch
 repariert → 200/200. NAS: docker compose pull && up -d.
+
+## Praxis 0.7 (21.09.): Secret-Save-Guard ✅
+Bug: PUT /api/secrets verschluesselte den Store mit dem UNVERIFIZIERTEN
+Feld-Inhalt „master_password" neu → Tipp-/Paste-Differenz (\n, Space,
+falsches PW) schluesselte den Store still um → naechster Restart
+„Invalid MASTER_KEY (hash mismatch)" (live auf dem NAS passiert).
+Fix (0c10f5a): Feld wird getrimmt (wie MASTER_KEY_FILE beim Start) und bei
+existentem Store per verify_password() (echter Decrypt-Test) geprueft —
+Mismatch = Speichern VERWEIGERT („Falsches Master-Passwort — NICHTS
+gespeichert, Store unveraendert"), JS faerbt rot. E2E am 0.7-Image bewiesen:
+falsch→abgelehnt+bootbar; richtig+\n→gespeichert+bootbar.
+
+Recovery fuer einen gebrickten Store (nur Store-Inhalt geht verloren —
+Secrets neu ins Dashboard):
+  docker compose pull && docker compose stop praxis
+  rm vps/praxis-state/secrets.enc2 vps/praxis-state/.secrets_salt
+  docker compose up -d
