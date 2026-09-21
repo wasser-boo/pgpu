@@ -49,7 +49,7 @@ fn cfg() -> PolicyConfig {
         },
     );
     PolicyConfig {
-        budget: BudgetConfig { daily_soft_eur: 2.0, daily_hard_eur: 2.4, monthly_eur: 50.0, usd_per_eur: 1.08 },
+        budget: BudgetConfig { daily_soft_eur: 2.0, daily_hard_eur: 2.4, monthly_eur: 50.0, usd_per_eur: 1.08, hard_action: "stop".into() },
         limits: LimitsConfig { max_instances: 3, max_per_slot: 2, max_total_rate_usd_h: 0.60 },
         slots,
     }
@@ -338,6 +338,19 @@ fn hard_cap_stops_everything_and_alerts() {
     assert!(actions.iter().any(|x| matches!(x, Action::Stop { instance_id: 11, .. })), "{actions:?}");
     assert!(actions.iter().any(|x| matches!(x, Action::Alert { kind, .. } if kind == "budget_hard")), "{actions:?}");
     assert!(!actions.iter().any(|x| matches!(x, Action::Create { .. })), "{actions:?}");
+}
+
+#[test]
+fn hard_cap_destroy_mode_destroys_instead_of_stop() {
+    let a = inst(11, 1, Role::Llm, InstanceState::Healthy);
+    let mut s = snap(vec![slot(1, Role::Llm, vec![a], Some(11))]);
+    s.spent_today_usd = 5.0; // hart ist 2.4*1.08 = 2.592 USD
+    let mut c = cfg();
+    c.budget.hard_action = "destroy".into();
+    let actions = decide(&s, &c);
+    assert!(actions.iter().any(|x| matches!(x, Action::Destroy { instance_id: 11, .. })), "{actions:?}");
+    assert!(!actions.iter().any(|x| matches!(x, Action::Stop { instance_id: 11, .. })), "{actions:?}");
+    assert!(actions.iter().any(|x| matches!(x, Action::Alert { kind, .. } if kind == "budget_hard")), "{actions:?}");
 }
 
 #[test]

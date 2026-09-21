@@ -16,6 +16,15 @@ pub struct BudgetConfig {
     #[serde(default = "d_monthly")]
     pub monthly_eur: f64,
     pub usd_per_eur: f64,
+    /// Verhalten am HARD-Cap: "stop" (Default — Disk bleibt, Storage-Kosten
+    /// laufen weiter) oder "destroy" (Instanzen weg — Storage-Abfluss auf
+    /// null, Wieder-Aufwärmen kostet Model-Download/Neumiete).
+    #[serde(default = "d_hard_action")]
+    pub hard_action: String,
+}
+
+fn d_hard_action() -> String {
+    "stop".into()
 }
 
 fn d_monthly() -> f64 {
@@ -352,10 +361,23 @@ pub fn decide(snap: &Snapshot, cfg: &PolicyConfig) -> Vec<Action> {
     let hours_to_end = (snap.seconds_to_day_end.max(0) as f64) / 3600.0;
 
     // --- Budget-Hard-Cap: real akkumulierte Kosten ueberstiegen -> alles drainen.
+    // hard_action: "stop" (Disk bleibt) oder "destroy" (Boxen weg — Storage-
+    // Abfluss null; gewaehlt via [budget] hard_action = "destroy").
     if snap.spent_today_usd >= hard_usd {
+        let destroy_mode = cfg.budget.hard_action.trim().eq_ignore_ascii_case("destroy");
         for slot in &snap.slots {
             for inst in &slot.instances {
-                if inst.is_running() {
+                if inst.pinned {
+                    continue; // Lock schlaegt Budget-Drain (bewusste Nutzerwahl).
+                }
+                if destroy_mode {
+                    actions.push(Action::Destroy {
+                        instance_id: inst.vast_id,
+                        reason: format!(
+                            "budget hard cap (destroy): heute {spent:.2} USD >= {hard_usd:.2} USD", spent = snap.spent_today_usd
+                        ),
+                    });
+                } else if inst.is_running() {
                     actions.push(Action::Stop {
                         instance_id: inst.vast_id,
                         reason: format!(
@@ -368,8 +390,9 @@ pub fn decide(snap: &Snapshot, cfg: &PolicyConfig) -> Vec<Action> {
         actions.push(Action::Alert {
             kind: "budget_hard".into(),
             message: format!(
-                "Hard-Cap erreicht: heute {:.2} $ verbraucht (Limit {hard_usd:.2} $) — alle Instanzen gestoppt.",
-                snap.spent_today_usd
+                "Hard-Cap erreicht: heute {:.2} $ verbraucht (Limit {hard_usd:.2} $) — alle Instanzen {}.",
+                snap.spent_today_usd,
+                if destroy_mode { "zerstört" } else { "gestoppt" }
             ),
         });
         return actions;

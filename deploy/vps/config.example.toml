@@ -164,3 +164,5 @@ PRAXIS_QWEN_TTS_DOWNLOAD = "1"
 # (force=true umgeht bewusst). [slots.swap].allow_long_downloads = true
 # hält Instanzen in der Download-/Warmup-Phase von der Destroy-Automatik
 # fern (weder Warmup-Timeout noch preempt-vor-healthy-Aufräumen).
+# [budget] hard_action = "destroy": am Hard-Cap Boxen ZERSTÖREN statt nur
+# stoppen (Storage-Abfluss null). Default "stop". Pinned/Locked-Boxen bleiben.

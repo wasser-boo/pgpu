@@ -377,7 +377,7 @@ pub enum BusyKind {
 }
 
 fn default_budget() -> BudgetConfig {
-    BudgetConfig { daily_soft_eur: 2.0, daily_hard_eur: 2.4, monthly_eur: 50.0, usd_per_eur: 1.08 }
+    BudgetConfig { daily_soft_eur: 2.0, daily_hard_eur: 2.4, monthly_eur: 50.0, usd_per_eur: 1.08, hard_action: "stop".into() }
 }
 
 fn default_limits() -> LimitsConfig {
