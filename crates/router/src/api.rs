@@ -161,8 +161,8 @@ pub fn budget_json(app: &SharedApp) -> serde_json::Value {
         "date": date,
         "spent_today_usd": spent,
         "spent_month_usd": month,
-        "soft_eur": app.cfg().budget.daily_soft_eur,
-        "hard_eur": app.cfg().budget.daily_hard_eur,
+        "soft_eur": crate::reconciler::effective_policy(&app).budget.daily_soft_eur,
+        "hard_eur": crate::reconciler::effective_policy(&app).budget.daily_hard_eur,
         "monthly_eur": app.cfg().budget.monthly_eur,
         "usd_per_eur": app.cfg().budget.usd_per_eur,
     })

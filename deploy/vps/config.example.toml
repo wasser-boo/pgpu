@@ -166,3 +166,11 @@ PRAXIS_QWEN_TTS_DOWNLOAD = "1"
 # fern (weder Warmup-Timeout noch preempt-vor-healthy-Aufräumen).
 # [budget] hard_action = "destroy": am Hard-Cap Boxen ZERSTÖREN statt nur
 # stoppen (Storage-Abfluss null). Default "stop". Pinned/Locked-Boxen bleiben.
+
+# Budget per Zeitplan übersteuern (Override persistiert in der DB bis Reset):
+# [[schedule]]
+# time = "00:05"
+# days = "daily"                 # oder z. B. "Tue" = nur dienstags
+# action = "budget"
+# hard_eur = 2.0                 # und/oder soft_eur = 1.6
+# [[schedule]] action = "budget_reset"  # Override löschen (config gilt wieder)

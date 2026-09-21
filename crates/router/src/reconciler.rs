@@ -161,7 +161,7 @@ pub async fn tick(app: &SharedApp) -> anyhow::Result<()> {
 
     // 6. Snapshot bauen + Policy.
     let snap = build_snapshot(app).await?;
-    let actions = praxis_policy::decide(&snap, &app.cfg().policy_config());
+    let actions = praxis_policy::decide(&snap, &effective_policy(app));
     for action in actions {
         if let Err(e) = apply_action(app, &action).await {
             tracing::warn!(?action, %e, "action failed");
@@ -990,9 +990,56 @@ pub async fn run_schedules(app: &SharedApp) {
                     app.events.emit(&app.db, "unpinned", Some(sid), None, "schedule unpin", &serde_json::json!({ "rule_time": rule.time }));
                 }
             }
+            // Tagesbudget override (€, persistiert in DB bis gelöscht):
+            // [[schedule]] time="00:05" action="budget" hard_eur=2.0
+            "budget" => {
+                match rule.soft_eur {
+                    Some(v) => { let _ = app.db.set_setting("budget_override_soft_eur", &v.to_string()); }
+                    None => { let _ = app.db.set_setting("budget_override_soft_eur", ""); }
+                }
+                match rule.hard_eur {
+                    Some(v) => { let _ = app.db.set_setting("budget_override_hard_eur", &v.to_string()); }
+                    None => { let _ = app.db.set_setting("budget_override_hard_eur", ""); }
+                }
+                app.events.emit(
+                    &app.db,
+                    "budget_override",
+                    None,
+                    None,
+                    &format!("Zeitplan {}: Budget-Override soft={:?} hard={:?}", rule.time, rule.soft_eur, rule.hard_eur),
+                    &serde_json::json!({ "soft_eur": rule.soft_eur, "hard_eur": rule.hard_eur }),
+                );
+                app.reconcile_now.notify_one();
+            }
+            "budget_reset" => {
+                let _ = app.db.set_setting("budget_override_soft_eur", "");
+                let _ = app.db.set_setting("budget_override_hard_eur", "");
+                app.events.emit(
+                    &app.db,
+                    "budget_override",
+                    None,
+                    None,
+                    "Zeitplan: Budget-Override gelöscht — config.toml-Werte gelten wieder",
+                    &serde_json::json!({ "cleared": true }),
+                );
+            }
             _ => {}
         }
     }
+}
+
+/// Policy-Konfig inkl. DB-Budget-Override (schedule action="budget"):
+/// Override liegt in den Settings (persistiert, überlebt Router-Restart),
+/// soft/hard leer = Override-Komponente gelöscht (config.toml gilt).
+pub fn effective_policy(app: &SharedApp) -> praxis_policy::PolicyConfig {
+    let mut pol = app.cfg().policy_config();
+    if let Some(v) = app.db.setting("budget_override_soft_eur").and_then(|v| v.trim().parse::<f64>().ok()) {
+        pol.budget.daily_soft_eur = v;
+    }
+    if let Some(v) = app.db.setting("budget_override_hard_eur").and_then(|v| v.trim().parse::<f64>().ok()) {
+        pol.budget.daily_hard_eur = v;
+    }
+    pol
 }
 
 /// Alle nicht gepinnten, nicht zerstörten Instanzen (optional gefiltert

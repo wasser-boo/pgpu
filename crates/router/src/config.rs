@@ -215,6 +215,12 @@ pub struct SchedRule {
     /// Nur diese Slots (Default: alle).
     #[serde(default)]
     pub slots: Option<Vec<i64>>,
+    /// Für action="budget": Override fürs Tagesbudget (€). Beide None +
+    /// action="budget_reset" = Override löschen (config.toml gilt wieder).
+    #[serde(default)]
+    pub soft_eur: Option<f64>,
+    #[serde(default)]
+    pub hard_eur: Option<f64>,
 }
 
 fn d_sched_days() -> String {
@@ -412,8 +418,11 @@ impl Config {
                 anyhow::bail!("schedule[{i}]: time muss \"HH:MM\" sein (ist {:?})", r.time);
             }
             let a = r.action.trim().to_ascii_lowercase();
-            if !["sleep","sleep_all","wake","rent","destroy_all","lock","unlock","pin","unpin"].contains(&a.as_str()) {
-                anyhow::bail!("schedule[{i}]: unbekannte action {:?} (sleep|wake|rent|destroy_all)", r.action);
+            if !["sleep","sleep_all","wake","rent","destroy_all","lock","unlock","pin","unpin","budget","budget_reset"].contains(&a.as_str()) {
+                anyhow::bail!("schedule[{i}]: unbekannte action {:?} (sleep|wake|rent|destroy_all|lock|unlock|pin|unpin|budget|budget_reset)", r.action);
+            }
+            if a == "budget" && r.soft_eur.is_none() && r.hard_eur.is_none() {
+                anyhow::bail!("schedule[{i}]: action \"budget\" braucht soft_eur und/oder hard_eur");
             }
         }
         Ok(())
