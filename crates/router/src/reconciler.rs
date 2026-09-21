@@ -11,8 +11,8 @@ use rand::RngCore;
 use std::collections::HashMap;
 
 pub async fn run(app: SharedApp) {
-    let poll = std::time::Duration::from_secs(app.cfg.vast.poll_interval_s.max(5));
-    let offer_every = std::time::Duration::from_secs(app.cfg.vast.offer_poll_s.max(15));
+    let poll = std::time::Duration::from_secs(app.cfg().vast.poll_interval_s.max(5));
+    let offer_every = std::time::Duration::from_secs(app.cfg().vast.offer_poll_s.max(15));
     let mut offer_due = tokio::time::Instant::now();
     let mut meter_hour = tokio::time::Instant::now() + std::time::Duration::from_secs(3600);
     loop {
@@ -25,7 +25,7 @@ pub async fn run(app: SharedApp) {
             // Offer-Refresh entkoppelt: blockierendes interval.tick() hätte
             // jede Wake-Reaktion um bis zu offer_poll_s verzögert.
             _ = tokio::time::sleep_until(offer_due) => {
-                for slot in app.cfg.slots.clone() {
+                for slot in app.cfg().slots.clone() {
                     let _ = search_slot_offers(&app, slot.id, true).await;
                 }
                 offer_due = tokio::time::Instant::now() + offer_every;
@@ -87,7 +87,7 @@ pub async fn tick(app: &SharedApp) -> anyhow::Result<()> {
         if inst.state == "unreachable" && inst.actual_status == "running" {
             let connected = app.hub.heartbeat(inst.vast_id).is_some();
             let silence = app.hub.last_seen(inst.vast_id).map(|s| now_ts - s).unwrap_or(i64::MAX);
-            if !connected && silence > app.cfg.vast.unreachable_stop_after_s.max(180) {
+            if !connected && silence > app.cfg().vast.unreachable_stop_after_s.max(180) {
                 let _ = stop_instance(
                     app,
                     inst.vast_id,
@@ -109,7 +109,7 @@ pub async fn tick(app: &SharedApp) -> anyhow::Result<()> {
     }
 
     // 4. Targets-Cache aktualisieren (hot fürs Proxy).
-    for slot in &app.cfg.slots {
+    for slot in &app.cfg().slots {
         // Invariante heilen: Active darf nie auf eine zerstörte Instanz
         // zeigen. Alte mark_destroyed-Pfade (vor 20.09.-Fix) ließen sie
         // stehen → Proxy 502t auf die tote Box statt 503+Wake zu antworten.
@@ -156,7 +156,7 @@ pub async fn tick(app: &SharedApp) -> anyhow::Result<()> {
 
     // 6. Snapshot bauen + Policy.
     let snap = build_snapshot(app).await?;
-    let actions = praxis_policy::decide(&snap, &app.cfg.policy_config());
+    let actions = praxis_policy::decide(&snap, &app.cfg().policy_config());
     for action in actions {
         if let Err(e) = apply_action(app, &action).await {
             tracing::warn!(?action, %e, "action failed");
@@ -304,7 +304,7 @@ fn record_machine_fail(app: &SharedApp, slot_id: i64, instance_id: i64, machine_
     let Ok(fails) = app.db.record_machine_fail(machine_id, kind) else {
         return;
     };
-    let threshold = app.cfg.vast.blacklist_after_fails;
+    let threshold = app.cfg().vast.blacklist_after_fails;
     let already = app.db.machine_stat(machine_id).map(|m| m.blacklisted).unwrap_or(false);
     if threshold >= 1 && !already && fails >= threshold {
         let _ = app.db.set_machine_blacklist(machine_id, true, kind);
@@ -346,7 +346,7 @@ async fn compute_busy(app: &SharedApp, inst: &crate::db::InstanceRow) -> (bool, 
         }
     }
     // ComfyUI-Queue (Jobs laufen nach HTTP-Return weiter!).
-    if let Some(slot) = app.cfg.slot(inst.slot_id) {
+    if let Some(slot) = app.cfg().slot(inst.slot_id).cloned() {
         if let Some(svc) = slot.services.values().find(|s| s.busy == crate::config::BusyKind::ComfyQueue) {
             if let Some(nb_ip) = inst.nb_ip.clone().or_else(|| app.hub.nb_ip(inst.vast_id)) {
                 let url = format!("http://{nb_ip}:{}/prompt", svc.port);
@@ -365,7 +365,7 @@ async fn compute_busy(app: &SharedApp, inst: &crate::db::InstanceRow) -> (bool, 
         }
         // STT: lokale WS-Sessions (Router-proxy).
         if slot.services.values().any(|s| s.busy == crate::config::BusyKind::WsSessions)
-            && app.cfg.stt.mode == "local"
+            && app.cfg().stt.mode == "local"
             && app.stt_sessions.load(std::sync::atomic::Ordering::Relaxed) > 0
         {
             return (true, "stt sessions aktiv".into());
@@ -436,13 +436,13 @@ pub async fn search_slot_offers(
     slot_id: i64,
     refresh: bool,
 ) -> anyhow::Result<Vec<OfferSnapshot>> {
-    let Some(slot) = app.cfg.slot(slot_id) else {
+    let Some(slot) = app.cfg().slot(slot_id).cloned() else {
         anyhow::bail!("unknown slot {slot_id}");
     };
     if !refresh {
         if let Some((ts, json)) = app.db.cached_offers(slot_id) {
             if let Some(t) = crate::db::parse_iso(&ts) {
-                if (chrono::Utc::now() - t).num_seconds() < app.cfg.vast.offer_poll_s as i64 {
+                if (chrono::Utc::now() - t).num_seconds() < app.cfg().vast.offer_poll_s as i64 {
                     if let Ok(v) = serde_json::from_str::<Vec<OfferSnapshot>>(&json) {
                         return Ok(v);
                     }
@@ -500,7 +500,7 @@ pub async fn search_slot_offers(
 fn best_candidate(app: &SharedApp, slot_id: i64) -> Option<OfferSnapshot> {
     let (_, json) = app.db.cached_offers(slot_id)?;
     let offers: Vec<OfferSnapshot> = serde_json::from_str(&json).ok()?;
-    let slot = app.cfg.slot(slot_id)?;
+    let slot = app.cfg().slot(slot_id)?.clone();
     let on_demand = slot.policy().mode == praxis_policy::SlotMode::OnDemand;
     // Blacklist: Hosts mit ≥ blacklist_after_fails Fails werden nie mehr
     // automatisch gemietet (machine_id 0 = unbekannt/alter Cache → neutral).
@@ -546,7 +546,7 @@ fn best_candidate(app: &SharedApp, slot_id: i64) -> Option<OfferSnapshot> {
 // ---------------------------------------------------------------- Snapshot
 
 pub async fn build_snapshot(app: &SharedApp) -> anyhow::Result<Snapshot> {
-    let tz: chrono_tz::Tz = app.cfg.router.tz.parse().unwrap_or(chrono_tz::Europe::Berlin);
+    let tz: chrono_tz::Tz = app.cfg().router.tz.parse().unwrap_or(chrono_tz::Europe::Berlin);
     let now_local = chrono::Utc::now().with_timezone(&tz);
     let seconds_to_day_end = {
         let next_midnight = (now_local + chrono::Duration::days(1))
@@ -567,7 +567,7 @@ pub async fn build_snapshot(app: &SharedApp) -> anyhow::Result<Snapshot> {
     let mut storage_rate = 0.0;
     let instance_count = rows.len();
 
-    for slot in &app.cfg.slots {
+    for slot in &app.cfg().slots {
         let active_db = app.db.active_instance(slot.id);
         let desired_db = app.db.slot_desired(slot.id);
         // warm_hours: Fenster erzwungen Gewünscht.
@@ -689,7 +689,7 @@ pub async fn apply_action(app: &SharedApp, action: &Action) -> anyhow::Result<()
             // (requested..draining) zählen gegen pool.warm — bei warm=1 ist
             // das der klassische „Backer wärmt schon"-Guard (kein Doppel-
             // Miete), bei warm=2 läuft die zweite Box parallel hoch.
-            let slot_cfg = app.cfg.slot(*slot_id);
+            let slot_cfg = app.cfg().slot(*slot_id).cloned();
             let pool_warm = slot_cfg.map(|s| s.pool.warm).unwrap_or(1).max(1);
             let actives = app
                 .db
@@ -728,7 +728,7 @@ pub async fn apply_action(app: &SharedApp, action: &Action) -> anyhow::Result<()
             let Some(offer) = offers.into_iter().find(|o| o.id == *offer_id) else {
                 anyhow::bail!("offer {offer_id} nicht mehr verfügbar");
             };
-            let slot = app.cfg.slot(*slot_id).ok_or_else(|| anyhow::anyhow!("slot {slot_id} fehlt"))?;
+            let slot = app.cfg().slot(*slot_id).ok_or_else(|| anyhow::anyhow!("slot {slot_id} fehlt"))?.clone();
             let price = price_usd_h.unwrap_or(offer.min_bid * (1.0 + slot.bid.margin));
             let disk = disk_gb.unwrap_or(slot.disk_gb);
             let vast_id = create_instance(app, *slot_id, &offer, *mode, price, disk, praxis_common::Lifecycle::Auto, reason).await?;
@@ -815,7 +815,7 @@ pub async fn apply_action(app: &SharedApp, action: &Action) -> anyhow::Result<()
                 return Ok(());
             }
             app.events.emit(&app.db, kind, None, None, message, &serde_json::json!({}));
-            let url = &app.cfg.alerts.webhook_url;
+            let url = &app.cfg().alerts.webhook_url;
             if !url.is_empty() {
                 let url = url.clone();
                 let body = serde_json::json!({"kind": kind, "message": message});
@@ -856,7 +856,7 @@ pub async fn set_auto_rent(app: &SharedApp, enabled: bool, source: &str) {
         app.reconcile_now.notify_one();
         return;
     }
-    for slot in &app.cfg.slots {
+    for slot in &app.cfg().slots {
         let _ = app.db.set_slot_desired_audited(slot.id, false, "auto_rent off");
     }
     for inst in app.db.instances(false) {
@@ -892,23 +892,23 @@ pub fn mint_node_token() -> String {
 }
 
 async fn mint_netbird_key(app: &SharedApp, name: &str) -> anyhow::Result<String> {
-    let token = app.cfg.netbird_api_token();
+    let token = app.cfg().netbird_api_token();
     if token.is_empty() {
         // statischer Key aus Config (Fallback, Variante B).
-        let k = app.cfg.netbird.setup_key.clone();
+        let k = app.cfg().netbird.setup_key.clone();
         if k.is_empty() {
             anyhow::bail!("kein NetBird setup key konfiguriert");
         }
         return Ok(k);
     }
     let client = reqwest::Client::new();
-    let base = app.cfg.netbird.api_url.trim_end_matches('/').to_string();
+    let base = app.cfg().netbird.api_url.trim_end_matches('/').to_string();
 
     // Gruppennamen (Config) → Management-IDs auflösen (auto_groups will IDs).
     // `groups` (Liste) schlägt das Legacy-Feld `group` (String).
-    let mut wanted: Vec<String> = app.cfg.netbird.groups.clone();
+    let mut wanted: Vec<String> = app.cfg().netbird.groups.clone();
     if wanted.is_empty() {
-        let legacy = app.cfg.netbird.group.clone();
+        let legacy = app.cfg().netbird.group.clone();
         if !legacy.is_empty() {
             wanted.push(legacy);
         }
@@ -970,7 +970,7 @@ async fn mint_netbird_key(app: &SharedApp, name: &str) -> anyhow::Result<String>
             let status = r.status();
             let text = r.text().await.unwrap_or_default();
             tracing::warn!(status = %status, "netbird mint failed ({text:.200}), fallback static");
-            let k = app.cfg.netbird.setup_key.clone();
+            let k = app.cfg().netbird.setup_key.clone();
             if k.is_empty() {
                 anyhow::bail!("netbird mint fehlgeschlagen und kein statischer Key");
             }
@@ -978,7 +978,7 @@ async fn mint_netbird_key(app: &SharedApp, name: &str) -> anyhow::Result<String>
         }
         Err(e) => {
             tracing::warn!(%e, "netbird unreachable, fallback static");
-            let k = app.cfg.netbird.setup_key.clone();
+            let k = app.cfg().netbird.setup_key.clone();
             if k.is_empty() {
                 anyhow::bail!("netbird unreachable und kein statischer Key");
             }
@@ -997,7 +997,7 @@ pub async fn create_instance(
     lifecycle: praxis_common::Lifecycle,
     reason: &str,
 ) -> anyhow::Result<i64> {
-    let slot = app.cfg.slot(slot_id).ok_or_else(|| anyhow::anyhow!("slot {slot_id} fehlt"))?;
+    let slot = app.cfg().slot(slot_id).ok_or_else(|| anyhow::anyhow!("slot {slot_id} fehlt"))?.clone();
     let vast_client = app.vast.lock().unwrap().clone();
     let Some(vast) = vast_client else {
         anyhow::bail!("vast api not configured");
@@ -1009,12 +1009,12 @@ pub async fn create_instance(
 
     let mut env = serde_json::Map::new();
     env.insert("NB_SETUP_KEY".into(), serde_json::json!(nb_key));
-    if !app.cfg.netbird.management_url.is_empty() {
-        env.insert("NB_MANAGEMENT_URL".into(), serde_json::json!(app.cfg.netbird.management_url));
+    if !app.cfg().netbird.management_url.is_empty() {
+        env.insert("NB_MANAGEMENT_URL".into(), serde_json::json!(app.cfg().netbird.management_url));
     }
     env.insert("NB_HOSTNAME".into(), serde_json::json!(hostname));
     env.insert("NB_SOCKS5_LISTENER_PORT".into(), serde_json::json!("1080"));
-    env.insert("ROUTER_URL".into(), serde_json::json!(crate::config::router_call_url(&app.cfg)));
+    env.insert("ROUTER_URL".into(), serde_json::json!(crate::config::router_call_url(&app.cfg())));
     env.insert("PRAXIS_NODE_TOKEN".into(), serde_json::json!(node_token));
     // Endpoint-Check ("check_if_works"): Der Agent probed lokal (Loopback)
     // die Health-Pfade der Slot-Services — healthy heißt dann wirklich
@@ -1203,11 +1203,11 @@ pub async fn destroy_instance(app: &SharedApp, vast_id: i64, reason: &str) -> an
 /// NetBird-Peer nach Hostname (gpu-<role>-<tok8>) suchen und löschen.
 /// Match wie im Connector: name ODER hostname-Feld ODER dns_label-Präfix.
 async fn netbird_delete_peer(app: &SharedApp, hostname: &str) -> anyhow::Result<()> {
-    let token = app.cfg.netbird_api_token();
+    let token = app.cfg().netbird_api_token();
     if token.is_empty() {
         return Ok(());
     }
-    let base = app.cfg.netbird.api_url.trim_end_matches('/');
+    let base = app.cfg().netbird.api_url.trim_end_matches('/').to_string();
     let resp = reqwest::Client::new()
         .get(format!("{base}/api/peers"))
         .bearer_auth(&token)

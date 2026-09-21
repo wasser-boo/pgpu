@@ -311,7 +311,13 @@ fn default_limits() -> LimitsConfig {
 impl Config {
     pub fn load(path: &str) -> anyhow::Result<Self> {
         let raw = std::fs::read_to_string(path)?;
-        let cfg: Config = toml::from_str(&raw)?;
+        Self::load_str(&raw)
+    }
+
+    /// Parse+Validierung ohne Disk (Hot-Reload: Dashboard/API schicken
+    /// Rohtext, erst NACH erfolgreicher Validierung wird geschrieben).
+    pub fn load_str(raw: &str) -> anyhow::Result<Self> {
+        let cfg: Config = toml::from_str(raw)?;
         cfg.validate()?;
         Ok(cfg)
     }

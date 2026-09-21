@@ -233,7 +233,7 @@ pub async fn node_event(app: AppCtx, req: Request) -> Response {
 
 pub fn local_date(app: &SharedApp) -> String {
     let tz: chrono_tz::Tz = app
-        .cfg
+        .cfg()
         .router
         .tz
         .parse()

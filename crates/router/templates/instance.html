@@ -24,6 +24,11 @@
     <form method="post" action="/do/instances/{{ inst.vast_id }}/destroy" onsubmit="return confirm('Wirklich zerstören?')"><button>Zerstören</button></form>
     <form method="post" action="/do/instances/{{ inst.vast_id }}/pin"><button>Pin</button></form>
     <form method="post" action="/do/instances/{{ inst.vast_id }}/unpin"><button>Unpin</button></form>
+    {% if inst.pinned %}
+    <form method="post" action="/do/instances/{{ inst.vast_id }}/unlock" onsubmit="return confirm('Lock aufheben? Der Slot mietet wieder automatisch Ersatz.')"><button>Unlock</button></form>
+    {% else %}
+    <form method="post" action="/do/instances/{{ inst.vast_id }}/lock" onsubmit="return confirm('Instanz locken? Sie wird dann nicht mehr gestoppt/gestaucht/neu gemietet — kein Auto-Rent, kein Wake-Replace, bis du Unlock drückst.')"><button>Lock</button></form>
+    {% endif %}
     <a class="btn" href="/term/{{ inst.vast_id }}">Terminal</a>
   </div>
   <div class="actions">

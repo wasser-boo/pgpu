@@ -20,7 +20,7 @@ mod state;
 use anyhow::{Context, Result};
 use axum::routing::{get, post};
 use state::{SharedApp, Traffic};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -86,7 +86,8 @@ async fn async_main() -> Result<()> {
     db.set_sse_sender(event_bus.sender());
 
     let app: SharedApp = Arc::new(state::App {
-        cfg: cfg.clone(),
+        cfg: RwLock::new(Arc::new(cfg.clone())),
+        config_path: config_path.clone(),
         db: db.clone(),
         events: event_bus,
         traffic: Traffic::default(),
@@ -104,7 +105,7 @@ async fn async_main() -> Result<()> {
         "router_started",
         None,
         None,
-        &format!("pgpu {} — {} Slots", env!("CARGO_PKG_VERSION"), app.cfg.slots.len()),
+        &format!("pgpu {} — {} Slots", env!("CARGO_PKG_VERSION"), app.cfg().slots.len()),
         &serde_json::json!({"config": config_path}),
     );
 
@@ -121,7 +122,7 @@ async fn async_main() -> Result<()> {
         let app = app.clone();
         tokio::spawn(async move {
             // Erster Tick sofort: Angebote vorwärmen.
-            for slot in app.cfg.slots.clone() {
+            for slot in app.cfg().slots.clone() {
                 let _ = reconciler::search_slot_offers(&app, slot.id, true).await;
             }
             reconciler::run(app).await;
@@ -138,6 +139,8 @@ async fn async_main() -> Result<()> {
         .route("/schedules", get(dashboard::schedules_page))
         .route("/assets", get(dashboard::assets_page))
         .route("/settings", get(dashboard::settings_page))
+        .route("/do/config", post(dashboard::do_config_save))
+        .route("/do/config/reload", post(dashboard::do_config_reload))
         .route("/do/slots/:id/:action", post(dashboard::do_slot_action))
         .route("/do/auto_rent", post(dashboard::do_auto_rent))
         .route("/do/rent", post(dashboard::do_rent))
@@ -146,6 +149,7 @@ async fn async_main() -> Result<()> {
         .route("/do/assets/:scope/upload", post(dashboard::do_asset_upload))
         .route("/api/v1/state", get(api::state))
         .route("/api/v1/settings/auto_rent", post(api::auto_rent_set))
+        .route("/api/v1/config", get(api::config_get).put(api::config_put))
         .route("/api/v1/budget", get(api::budget))
         .route("/api/v1/events", get(api::events_json))
         .route("/api/v1/events/stream", get(api::events_sse))
@@ -175,12 +179,12 @@ async fn async_main() -> Result<()> {
         .nest_service("/static", tower_http::services::ServeDir::new(static_dir()))
         .with_state(app.clone());
 
-    let bind_ip = app.cfg.router.bind_ip.clone();
-    let dash_port = app.cfg.router.dashboard_port;
+    let bind_ip = app.cfg().router.bind_ip.clone();
+    let dash_port = app.cfg().router.dashboard_port;
 
     // Passthrough-Listener: pro Slot-Service-Port ein Socket.
     let mut passthrough_binds: Vec<(u16, i64, String)> = Vec::new();
-    for slot in &app.cfg.slots {
+    for slot in &app.cfg().slots {
         for (port, service) in slot.passthrough_ports() {
             passthrough_binds.push((port, slot.id, service));
         }
@@ -208,10 +212,10 @@ async fn async_main() -> Result<()> {
     }
 
     // STT-Port bei lokalem Mode gehört dem Router (Sidecar-Proxy).
-    if app.cfg.stt.mode == "local" {
+    if app.cfg().stt.mode == "local" {
         let stt_app = app.clone();
-        let stt_port = app.cfg.stt.listen_port;
-        let stt_url = app.cfg.stt.url.clone();
+        let stt_port = app.cfg().stt.listen_port;
+        let stt_url = app.cfg().stt.url.clone();
         let stt_router = axum::Router::new()
             .fallback(move |req| {
                 let app = stt_app.clone();
@@ -231,7 +235,7 @@ async fn async_main() -> Result<()> {
     let app2 = app.clone();
     let addr = format!("{bind_ip}:{dash_port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    tracing::info!("dashboard {addr} (Slots: {})", app2.cfg.slots.len());
+    tracing::info!("dashboard {addr} (Slots: {})", app2.cfg().slots.len());
     axum::serve(listener, dash).await?;
     for t in tasks {
         let _ = t.await;

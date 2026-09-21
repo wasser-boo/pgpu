@@ -243,7 +243,7 @@ async fn resolve_slot_target(
     service: &str,
     req_headers: &HeaderMap,
 ) -> Result<UpstreamTarget, Response> {
-    let Some(slot_cfg) = app.cfg.slot(slot_id) else {
+    let Some(slot_cfg) = app.cfg().slot(slot_id).cloned() else {
         return Err(service_unavailable(slot_id, "unknown_slot"));
     };
     let Some(svc) = slot_cfg.services.get(service) else {
@@ -256,7 +256,7 @@ async fn resolve_slot_target(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0)
-        .min(app.cfg.router.wait_for_backend_max_s);
+        .min(app.cfg().router.wait_for_backend_max_s);
 
     // Auto-Miete aus: kein impliziter Wake, kein Hold — Praxis/Cloud-Fallback
     // greift sofort statt X-Router-Wait-Sekunden zu verschwenden.
@@ -380,7 +380,7 @@ pub async fn passthrough(
     }
 
     // STT lokal: Sidecar statt media-Slot.
-    if service == "stt" && app.cfg.stt.mode == "local" {
+    if service == "stt" && app.cfg().stt.mode == "local" {
         return proxy_stt_local(&app, parts, body, &path).await;
     }
 
@@ -413,7 +413,7 @@ pub async fn inst_path(
     let Some(inst) = app.db.instance(vast_id) else {
         return service_unavailable(vast_id, "unknown_instance");
     };
-    let Some(slot_cfg) = app.cfg.slot(inst.slot_id) else {
+    let Some(slot_cfg) = app.cfg().slot(inst.slot_id).cloned() else {
         return service_unavailable(inst.slot_id, "unknown_slot");
     };
     let Some(svc) = slot_cfg.services.get(&service) else {
@@ -477,7 +477,7 @@ async fn proxy_stt_local(
         return stt_ws_relay(app, parts, body, path).await;
     }
 
-    let url = format!("{}{}", app.cfg.stt.url.trim_end_matches('/'), path);
+    let url = format!("{}{}", app.cfg().stt.url.trim_end_matches('/'), path);
     let client = reqwest::Client::new();
     let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET);
     let mut rreq = client.request(method, &url);
@@ -531,7 +531,7 @@ async fn stt_ws_relay(app: &SharedApp, parts: axum::http::request::Parts, _body:
     let Ok(ws) = axum::extract::ws::WebSocketUpgrade::from_request(ws_req, &()).await else {
         return bad_gateway("expected websocket upgrade");
     };
-    let stt_base = app.cfg.stt.url.trim_end_matches('/').to_string();
+    let stt_base = app.cfg().stt.url.trim_end_matches('/').to_string();
     let path_owned = path.trim_start_matches('/').to_string();
     let app2 = app.clone();
     ws.on_upgrade(move |client_ws| async move {

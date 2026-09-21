@@ -132,7 +132,7 @@ pub async fn push_assets(app: &SharedApp, vast_id: i64) -> anyhow::Result<serde_
 const ALL: &str = "all";
 
 fn assets_root(app: &SharedApp) -> PathBuf {
-    app.cfg.router.data_dir.join("assets")
+    app.cfg().router.data_dir.join("assets")
 }
 
 /// Rolle-Anteil: llm/media/all.

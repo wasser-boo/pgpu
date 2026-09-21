@@ -32,7 +32,7 @@ pub mod filters {
 // ---------------------------------------------------------------- Auth
 
 fn token_of(app: &SharedApp) -> String {
-    app.cfg.router_token()
+    app.cfg().router_token()
 }
 
 pub fn session_ok(app: &SharedApp, headers: &axum::http::HeaderMap) -> bool {
@@ -296,6 +296,10 @@ pub struct SettingsTpl {
     pub limits: praxis_policy::LimitsConfig,
     pub slots: Vec<SlotSettingView>,
     pub routing: RoutingView,
+    /// Rohtext der config.toml — editierbar (Hot-Reload, kein Neustart).
+    pub config_raw: String,
+    /// Status-Message (Query-Param nach Save/Reload).
+    pub config_msg: String,
 }
 
 pub struct SlotSettingView {
@@ -321,7 +325,7 @@ pub struct RoutingView {
 
 pub fn state_json(app: &SharedApp) -> serde_json::Value {
     let mut slots = Vec::new();
-    for s in &app.cfg.slots {
+    for s in &app.cfg().slots {
         let active = app.db.active_instance(s.id);
         // Ohne aktive Instanz: jüngste lebende Box des Slots zeigen
         // (Warmup/Download-Progress), sonst bleibt state/progress null.
@@ -337,7 +341,7 @@ pub fn state_json(app: &SharedApp) -> serde_json::Value {
         let hb = shown.and_then(|v| app.hub.heartbeat(v));
         // Pool-Sicht: alle lebenden Instanzen des Slots (Multi-Instanz-
         // Slots, Badges/Routing-Transparenz für Praxis).
-        let pool_cfg = app.cfg.slot(s.id).map(|c| c.pool).unwrap_or_default();
+        let pool_cfg = app.cfg().slot(s.id).map(|c| c.pool).unwrap_or_default();
         let instances: Vec<serde_json::Value> = app
             .db
             .instances(false)
@@ -378,9 +382,9 @@ pub fn state_json(app: &SharedApp) -> serde_json::Value {
 }
 
 fn budget_view(app: &SharedApp) -> BudgetView {
-    let soft = app.cfg.budget.daily_soft_eur * app.cfg.budget.usd_per_eur;
-    let hard = app.cfg.budget.daily_hard_eur * app.cfg.budget.usd_per_eur;
-    let monthly = app.cfg.budget.monthly_eur * app.cfg.budget.usd_per_eur;
+    let soft = app.cfg().budget.daily_soft_eur * app.cfg().budget.usd_per_eur;
+    let hard = app.cfg().budget.daily_hard_eur * app.cfg().budget.usd_per_eur;
+    let monthly = app.cfg().budget.monthly_eur * app.cfg().budget.usd_per_eur;
     let date = crate::node::local_date(app);
     let spent = app.db.spent_today(&date);
     // Projektion: verbraucht + aktuelle Rates bis Tagesende.
@@ -407,16 +411,16 @@ fn budget_view(app: &SharedApp) -> BudgetView {
         monthly_usd: monthly,
         pct,
         bar_class: if projected >= hard { "hard" } else if projected >= soft { "warn" } else { "" },
-        daily_soft_eur: app.cfg.budget.daily_soft_eur,
-        daily_hard_eur: app.cfg.budget.daily_hard_eur,
-        monthly_eur: app.cfg.budget.monthly_eur,
-        usd_per_eur: app.cfg.budget.usd_per_eur,
-        tz: app.cfg.router.tz.clone(),
+        daily_soft_eur: app.cfg().budget.daily_soft_eur,
+        daily_hard_eur: app.cfg().budget.daily_hard_eur,
+        monthly_eur: app.cfg().budget.monthly_eur,
+        usd_per_eur: app.cfg().budget.usd_per_eur,
+        tz: app.cfg().router.tz.clone(),
     }
 }
 
 fn tz_of(app: &SharedApp) -> chrono_tz::Tz {
-    app.cfg.router.tz.parse().unwrap_or(chrono_tz::Europe::Berlin)
+    app.cfg().router.tz.parse().unwrap_or(chrono_tz::Europe::Berlin)
 }
 
 // ---------------------------------------------------------------- Seiten
@@ -424,7 +428,7 @@ fn tz_of(app: &SharedApp) -> chrono_tz::Tz {
 pub async fn index(app: AppCtx, req: Request) -> Response {
     page_guard!(app, req);
     let mut slots = Vec::new();
-    for s in &app.cfg.slots {
+    for s in &app.cfg().slots {
         let active = app.db.active_instance(s.id);
         // Live-Boxen des Slots, die nicht die aktive sind: neueste = wärmende
         // Ersatz-Box (Hot-Swap) — bzw. ohne aktive Instanz die Anzeige-Box
@@ -507,7 +511,7 @@ pub async fn index(app: AppCtx, req: Request) -> Response {
 
 pub async fn offers_page(app: AppCtx, Query(q): Query<HashMap<String, String>>, req: Request) -> Response {
     page_guard!(app, req);
-    let slot_id = q.get("slot").and_then(|s| s.parse::<i64>().ok()).unwrap_or_else(|| app.cfg.slots.first().map(|s| s.id).unwrap_or(1));
+    let slot_id = q.get("slot").and_then(|s| s.parse::<i64>().ok()).unwrap_or_else(|| app.cfg().slots.first().map(|s| s.id).unwrap_or(1));
     let mode = q.get("mode").cloned().unwrap_or_else(|| "interruptible".into());
     let (offers, error) = match crate::reconciler::search_slot_offers(&app.0, slot_id, true).await {
         Ok(o) => (o, None),
@@ -537,13 +541,13 @@ pub async fn offers_page(app: AppCtx, Query(q): Query<HashMap<String, String>>, 
             }
         })
         .collect();
-    let slot_names = app.cfg.slots.iter().map(|s| (s.id, s.name.clone())).collect();
+    let slot_names = app.cfg().slots.iter().map(|s| (s.id, s.name.clone())).collect();
     let tpl = OffersTpl {
         slot_names,
         slot_id,
         mode,
         offers: rows,
-        default_disk_gb: app.cfg.slot(slot_id).map(|s| s.disk_gb).unwrap_or(60),
+        default_disk_gb: app.cfg().slot(slot_id).map(|s| s.disk_gb).unwrap_or(60),
         machines: machines.into_iter().take(12).collect(),
         error,
     };
@@ -648,16 +652,16 @@ pub async fn schedules_page(app: AppCtx, req: Request) -> Response {
     page_guard!(app, req);
     let mut instances = Vec::new();
     for row in app.db.instances(true) {
-        let slot = app.cfg.slot(row.slot_id);
+        let slot = app.cfg().slot(row.slot_id).cloned();
         instances.push(SchedView {
             vast_id: row.vast_id,
             slot_id: row.slot_id,
             role: crate::api::role_str(row.role).to_string(),
             mode: row.mode.to_string(),
             lifecycle: row.lifecycle.clone(),
-            warm_hours: slot.and_then(|s| s.warm_hours.clone()).unwrap_or_else(|| "—".into()),
-            stop_after_s: slot.map(|s| s.idle_cfg(row.role).stop_after_s).unwrap_or(0),
-            destroy_after_s: slot.map(|s| s.idle_cfg(row.role).destroy_after_stopped_s).unwrap_or(0),
+            warm_hours: slot.as_ref().and_then(|s| s.warm_hours.clone()).unwrap_or_else(|| "—".into()),
+            stop_after_s: slot.as_ref().map(|s| s.idle_cfg(row.role).stop_after_s).unwrap_or(0),
+            destroy_after_s: slot.as_ref().map(|s| s.idle_cfg(row.role).destroy_after_stopped_s).unwrap_or(0),
             state: row.state.clone(),
         });
     }
@@ -697,10 +701,11 @@ pub async fn assets_page(app: AppCtx, req: Request) -> Response {
     Html(AssetsTpl { groups, ok }.render().unwrap_or_default()).into_response()
 }
 
-pub async fn settings_page(app: AppCtx, req: Request) -> Response {
+pub async fn settings_page(app: AppCtx, Query(q): Query<HashMap<String, String>>, req: Request) -> Response {
     page_guard!(app, req);
+    let config_msg = q.get("msg").cloned().unwrap_or_default();
     let slots = app
-        .cfg
+        .cfg()
         .slots
         .iter()
         .map(|s| SlotSettingView {
@@ -715,7 +720,7 @@ pub async fn settings_page(app: AppCtx, req: Request) -> Response {
         })
         .collect();
     let mut passthrough = Vec::new();
-    for s in &app.cfg.slots {
+    for s in &app.cfg().slots {
         for (port, service) in s.passthrough_ports() {
             passthrough.push((port, s.id, service));
         }
@@ -723,17 +728,51 @@ pub async fn settings_page(app: AppCtx, req: Request) -> Response {
     passthrough.sort_by_key(|(p, _, _)| *p);
     let tpl = SettingsTpl {
         budget: budget_view(&app.0),
-        limits: app.cfg.limits.clone(),
+        limits: app.cfg().limits.clone(),
         slots,
         routing: RoutingView {
-            bind_ip: app.cfg.router.bind_ip.clone(),
-            dashboard_port: app.cfg.router.dashboard_port,
+            bind_ip: app.cfg().router.bind_ip.clone(),
+            dashboard_port: app.cfg().router.dashboard_port,
             passthrough,
-            stt: format!("{} ({})", app.cfg.stt.mode, app.cfg.stt.url),
-            vast_ok: !app.cfg.vast_api_key().is_empty(),
+            stt: format!("{} ({})", app.cfg().stt.mode, app.cfg().stt.url),
+            vast_ok: !app.cfg().vast_api_key().is_empty(),
         },
+        config_raw: app.cfg_raw(),
+        config_msg,
     };
     Html(tpl.render().unwrap_or_default()).into_response()
+}
+
+/// Save aus dem Dashboard-Editor: validiert + schreibt + tauscht live
+/// (gleicher Pfad wie PUT /api/v1/config). Fehler → Message statt Reload.
+pub async fn do_config_save(app: AppCtx, headers: axum::http::HeaderMap, Form(form): Form<HashMap<String, String>>) -> Response {
+    page_guard!(app, ReqOf(&headers));
+    let raw = form.get("raw").cloned().unwrap_or_default();
+    match crate::api::apply_config(&app.0, &raw).await {
+        Ok(msg) => Redirect::to(&format!("/settings?msg=gespeichert%3A%20{}", urlencode(&msg))).into_response(),
+        Err(e) => Redirect::to(&format!("/settings?msg=fehler%3A%20{}", urlencode(&format!("{e}")))).into_response(),
+    }
+}
+
+/// Reload von Disk (Datei außerhalb geändert — z. B. per SSH/Editor).
+pub async fn do_config_reload(app: AppCtx, headers: axum::http::HeaderMap) -> Response {
+    page_guard!(app, ReqOf(&headers));
+    let raw = app.cfg_raw();
+    match crate::api::apply_config(&app.0, &raw).await {
+        Ok(msg) => Redirect::to(&format!("/settings?msg=neu%20geladen%3A%20{}", urlencode(&msg))).into_response(),
+        Err(e) => Redirect::to(&format!("/settings?msg=fehler%3A%20{}", urlencode(&format!("{e}")))).into_response(),
+    }
+}
+
+fn urlencode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b' ' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------- Form-Actions

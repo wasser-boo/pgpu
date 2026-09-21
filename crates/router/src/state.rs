@@ -187,7 +187,12 @@ impl PoolRoutes {
 }
 
 pub struct App {
-    pub cfg: Config,
+    /// Hot-reloadable Konfig: TOML-Edit im Dashboard/API tauscht sie live
+    /// (GET/PUT /api/v1/config). Reader kriegen ein `Arc<Config>`-Snapshot —
+    /// nie einen Guard über `.await` halten (std-RwLock ist !Send).
+    pub cfg: RwLock<Arc<Config>>,
+    /// Pfad der config.toml — für Reload/Schreiben aus dem Dashboard.
+    pub config_path: String,
     pub db: Db,
     pub events: EventBus,
     pub traffic: Traffic,
@@ -203,10 +208,29 @@ pub struct App {
     pub stt_sessions: AtomicU32,
 }
 
+impl App {
+    /// Konfig-Snapshot (Arc-Clone, billig): Reader halten NIE einen Guard
+    /// über `.await` (std-RwLock ist !Send) — immer `let cfg = app.cfg();`.
+    pub fn cfg(&self) -> Arc<Config> {
+        Arc::clone(&self.cfg.read().unwrap())
+    }
+
+    /// Live-Swap der Konfig (hot reload). Folgt atomar — Leser mit altem
+    /// Snapshot laufen den Tick zu Ende, der nächste sieht die neue.
+    pub fn cfg_swap(&self, new: Config) {
+        *self.cfg.write().unwrap() = Arc::new(new);
+    }
+
+    /// Aktuelle config.toml als Rohtext (für Dashboard-Editor/API).
+    pub fn cfg_raw(&self) -> String {
+        std::fs::read_to_string(&self.config_path).unwrap_or_default()
+    }
+}
+
 pub type SharedApp = Arc<App>;
 
 /// State-Extractor-Newtype: Handler nehmen `app: AppCtx` und arbeiten per
-/// Deref direkt auf `App` (`app.db`, `app.cfg`, ...). `app.0` = SharedApp.
+/// Deref direkt auf `App` (`app.db`, `app.cfg()`, ...). `app.0` = SharedApp.
 #[derive(Clone)]
 pub struct AppCtx(pub SharedApp);
 

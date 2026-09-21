@@ -17,7 +17,7 @@ use crate::node::bearer;
 use futures::{SinkExt, StreamExt};
 
 pub fn check_token(app: &SharedApp, req: &Request) -> bool {
-    let token = app.cfg.router_token();
+    let token = app.cfg().router_token();
     if token.is_empty() {
         return true; // offener Modus (nur lokal testen!)
     }
@@ -33,6 +33,87 @@ macro_rules! guarded {
             return (StatusCode::UNAUTHORIZED, "bad token").into_response();
         }
     };
+}
+
+// ------------------------------------------------------------- Config (Hot-Reload)
+
+/// `GET /api/v1/config` — Rohtext der config.toml (Bearer-geschützt).
+pub async fn config_get(app: AppCtx, req: Request) -> Response {
+    guarded!(app, req);
+    Json(serde_json::json!({
+        "path": app.config_path,
+        "raw": app.cfg_raw(),
+    }))
+    .into_response()
+}
+
+/// `PUT /api/v1/config` {"raw": "<toml>"} — validiert, schreibt atomar auf
+/// Disk, tauscht live (slots/budget/limits/policy sofort wirksam) und
+/// weckt den Reconciler. `[router]/[vast]/[netbird]/[stt]`-Basisdaten
+/// (Bind, Ports, Keys, URLs) gelten erst nach Router-Neustart — sie
+/// werden gespeichert, aber im laufenden Prozess nicht umgebogen.
+pub async fn config_put(app: AppCtx, req: Request) -> Response {
+    guarded!(app, req);
+    let body = axum::body::to_bytes(req.into_body(), 1 << 20).await.unwrap_or_default();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+    let Some(raw) = payload.get("raw").and_then(|r| r.as_str()).map(|s| s.to_string()) else {
+        return (StatusCode::BAD_REQUEST, "missing raw").into_response();
+    };
+    match apply_config(&app.0, &raw).await {
+        Ok(msg) => Json(serde_json::json!({ "ok": true, "message": msg })).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
+    }
+}
+
+/// Geteilter Apply-Pfad (API + Dashboard-Form): parse → validate →
+/// atomar schreiben → live-swap → Slot-DB sync → Event + Reconciler-Wake.
+/// `new_cfg` behält bereits aufgelöste Werte (bind_ip/router_nb_ip != "auto")
+/// der laufenden Konfig, damit ein Edit am File den laufenden Router nicht
+/// dekonfiguriert.
+pub async fn apply_config(app: &SharedApp, raw: &str) -> anyhow::Result<String> {
+    let mut new_cfg = crate::config::Config::load_str(raw)?; // wirft bei TOML-/Validierungs-Fehler
+    let cur = app.cfg();
+    // "auto"-Auflösungen der laufenden Config übernehmen (detect läuft nur
+    // beim Boot; die laufenden Werte sind bereits real).
+    if new_cfg.router.bind_ip == "auto" {
+        new_cfg.router.bind_ip = cur.router.bind_ip.clone();
+    }
+    if new_cfg.netbird.router_nb_ip == "auto" {
+        new_cfg.netbird.router_nb_ip = cur.netbird.router_nb_ip.clone();
+    }
+    // Secrets: leere Felder → Werte der laufenden Config (Env-Override
+    // greift eh in router_token()/vast_api_key()/netbird_api_token()).
+    if new_cfg.router.token.is_empty() {
+        new_cfg.router.token = cur.router.token.clone();
+    }
+    if new_cfg.vast.api_key.is_empty() {
+        new_cfg.vast.api_key = cur.vast.api_key.clone();
+    }
+    if new_cfg.netbird.api_token.is_empty() {
+        new_cfg.netbird.api_token = cur.netbird.api_token.clone();
+    }
+
+    // Slot-DB synchronisieren (neue Slots, geänderte Rollen/Namen).
+    app.db.init_slots(&new_cfg)?;
+    // Atomar schreiben: tmp + rename — der Router startet nach einem Crash
+    // nie mit halber TOML.
+    let tmp = format!("{}.tmp", app.config_path);
+    std::fs::write(&tmp, raw)?;
+    std::fs::rename(&tmp, &app.config_path)?;
+
+    let slots: Vec<String> = new_cfg.slots.iter().map(|s| format!("#{} {}", s.id, s.name)).collect();
+    app.cfg_swap(new_cfg);
+    app.events.emit(
+        &app.db,
+        "config_reloaded",
+        None,
+        None,
+        "config.toml live neu geladen (Dashboard/API)",
+        &serde_json::json!({ "slots": slots, "path": app.config_path }),
+    );
+    // Reconciler sofort ticken lassen (neue warmups/ceilings greifen in <30s).
+    app.reconcile_now.notify_one();
+    Ok(format!("ok — {} Slots aktiv", slots.len()))
 }
 
 // ------------------------------------------------------------- State
@@ -55,10 +136,10 @@ pub fn budget_json(app: &SharedApp) -> serde_json::Value {
         "date": date,
         "spent_today_usd": spent,
         "spent_month_usd": month,
-        "soft_eur": app.cfg.budget.daily_soft_eur,
-        "hard_eur": app.cfg.budget.daily_hard_eur,
-        "monthly_eur": app.cfg.budget.monthly_eur,
-        "usd_per_eur": app.cfg.budget.usd_per_eur,
+        "soft_eur": app.cfg().budget.daily_soft_eur,
+        "hard_eur": app.cfg().budget.daily_hard_eur,
+        "monthly_eur": app.cfg().budget.monthly_eur,
+        "usd_per_eur": app.cfg().budget.usd_per_eur,
     })
 }
 
@@ -269,7 +350,7 @@ pub async fn instance_create(app: AppCtx, req: Request) -> Response {
     let Ok(payload) = serde_json::from_slice::<CreateInstanceBody>(&body) else {
         return (StatusCode::BAD_REQUEST, "bad json").into_response();
     };
-    let Some(slot) = app.cfg.slot(payload.slot_id) else {
+    let Some(slot) = app.cfg().slot(payload.slot_id).cloned() else {
         return (StatusCode::NOT_FOUND, "unknown slot").into_response();
     };
 
@@ -338,10 +419,37 @@ pub async fn instance_action(app: AppCtx, Path((vast_id, action)): Path<(i64, St
             app.events.emit(&app.db, "pinned", None, Some(vast_id), &reason, &payload);
             (StatusCode::OK, "pinned").into_response()
         }
-        "unpin" => {
+        // Lock: Instanz-Pin + Slot-Pin — die Box wird von NOTHING angefasst
+        // (kein Idle-Destroy, kein Preempt-/Kosten-Swap, keine Lifecycle-
+        // Aktionen) UND der Slot mietet keinen Ersatz (kein Wake-Replace,
+        // kein Pool-Refill, kein Auto-Rent). Manuelles Stop/Destroy bleibt
+        // möglich (bewusste Aktion schlägt immer den Lock).
+        "lock" => {
+            let slot_id = app.db.instance(vast_id).map(|i| i.slot_id);
+            let _ = app.db.update_instance_pinned(vast_id, true);
+            if let Some(sid) = slot_id {
+                let _ = app.db.set_slot_pin(sid, Some(vast_id));
+            }
+            app.events.emit(&app.db, "locked", slot_id, Some(vast_id), &reason, &payload);
+            (StatusCode::OK, "locked").into_response()
+        }
+        "unlock" => {
+            let slot_id = app.db.instance(vast_id).map(|i| i.slot_id);
             let _ = app.db.update_instance_pinned(vast_id, false);
-            app.events.emit(&app.db, "unpinned", None, Some(vast_id), &reason, &payload);
-            (StatusCode::OK, "unpinned").into_response()
+            if let Some(sid) = slot_id {
+                // Slot-Pin nur lösen, wenn er auf DIESE Instanz zeigt.
+                let pins: std::collections::HashMap<i64, Option<i64>> = app.db.slot_pins().into_iter().collect();
+                if pins.get(&sid).copied().flatten() == Some(vast_id) {
+                    let _ = app.db.set_slot_pin(sid, None);
+                }
+                for inst in app.db.instances(false) {
+                    if inst.slot_id == sid && inst.pinned && inst.vast_id != vast_id {
+                        let _ = app.db.update_instance_pinned(inst.vast_id, false);
+                    }
+                }
+            }
+            app.events.emit(&app.db, "unlocked", slot_id, Some(vast_id), &reason, &payload);
+            (StatusCode::OK, "unlocked").into_response()
         }
         "bid" => {
             let Some(price) = payload.get("price").and_then(|p| p.as_f64()) else {

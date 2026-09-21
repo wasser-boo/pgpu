@@ -27,7 +27,7 @@
     <tr><td>Slot {{ s.id }} Swap</td><td>preempt={{ s.on_preempt }} bid_pressure={{ s.on_bid_pressure }} optimize={{ s.optimize_cost }}</td></tr>
     {% endfor %}
   </table>
-  <p class="mut">Änderungen: config.toml anpassen + Router neu starten (docker compose restart router).</p>
+  <p class="mut">Slot-Parameter: direkt oben editieren (live). Instanz-Lock (kein Re-Rent/Auto-Rent/Destroy): Instanz-Seite → „Lock“.</p>
 </div>
 <div class="card">
   <h2 style="margin-top:0">Routing</h2>
@@ -41,5 +41,20 @@
     <tr><td>Vast-API</td><td>{% if routing.vast_ok %}aktiv{% else %}<span class="badge b-bad">nicht konfiguriert</span>{% endif %}</td></tr>
   </table>
 </div>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">config.toml (Live-Editor)</h2>
+  {% if !config_msg.is_empty() %}<p class="badge b-info">{{ config_msg }}</p>{% endif %}
+  <form method="post" action="/do/config">
+    <textarea name="raw" rows="24" style="width:100%; font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px; background:#0d1116; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:8px;">{{ config_raw }}</textarea>
+    <div class="actions">
+      <button type="submit">Speichern &amp; live anwenden</button>
+    </div>
+  </form>
+  <form method="post" action="/do/config/reload" style="margin-top:8px">
+    <button type="submit">Von Disk neu laden</button>
+  </form>
+  <p class="mut">Speichern validiert die TOML, schreibt atomar auf Disk und tauscht die Konfig live (Slots, Budget, Limits, Bid/Idle/Swap/Pool — wirksam im nächsten Reconciler-Tick ≤ 30 s, kein Neustart). Base-Parameter ([router] bind/ports, [vast]/[netbird] Keys/URLs, [stt]) werden gespeichert, brauchen aber einen Router-Neustart. Fehlerhafte TOML wird abgelehnt — die laufende Konfig bleibt unverändert.</p>
 </div>
 {% endblock %}

@@ -106,11 +106,11 @@ impl PeerInfo {
 }
 
 async fn fetch_peers(app: &SharedApp) -> Result<Vec<PeerInfo>> {
-    let token = app.cfg.netbird_api_token();
+    let token = app.cfg().netbird_api_token();
     if token.is_empty() {
         return Ok(vec![]);
     }
-    let base = app.cfg.netbird.api_url.trim_end_matches('/');
+    let base = app.cfg().netbird.api_url.trim_end_matches('/').to_string();
     let resp = reqwest::Client::new()
         .get(format!("{base}/api/peers"))
         .bearer_auth(&token)
