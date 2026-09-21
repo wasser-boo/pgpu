@@ -92,9 +92,14 @@ max_warmup_s = 3600
 keep_warm_window_s = 1800
 
 [slots.env]
-LLAMA_MODEL = "qwen3.6-35b-a3b"
+# Alias aus scripts/llama-models.json des Fork-Images — dort existiert NUR
+# qwen3.8-flash-next (UD-IQ3_XXS). „qwen3.6-35b-a3b" war nie im Manifest →
+# Boxen fielen still auf den 82-GB-Default zurück (21.09. bestätigt).
+LLAMA_MODEL = "qwen3.8-flash-next"
 LLAMA_DOWNLOAD_MODELS = "1"
-PRAXIS_AGENT_MODEL_TOTAL_BYTES = "20693856128"
+# Download-Fortschritt im Dashboard (Agent misst Bytes vs. Total im Heartbeat):
+PRAXIS_AGENT_MODEL_DIR = "/workspace/llama.cpp/models"
+PRAXIS_AGENT_MODEL_TOTAL_BYTES = "85022702752" # chat 81.96 GB + MTP 2.79 GB + embed 274 MB (HF, 21.09.)
 
 # ----------------------------------------------------------- Slot 2: Media
 
