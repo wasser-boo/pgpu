@@ -156,3 +156,11 @@ PRAXIS_QWEN_TTS_DOWNLOAD = "1"
 # time = "07:00"
 # days = "weekdays"
 # action = "wake"
+
+# Schedule-Aktionen (alle [[schedule]]-fähig): sleep|sleep_all, wake|rent,
+# destroy_all, lock, unlock, pin, unpin — slots = [1,2] filtert.
+# Preisfenster pro Slot ([slots.bid]): rent_min_usd_h .. ceiling_usd_h —
+# hart: Offers außerhalb werden weder gerankt noch manuell mietbar
+# (force=true umgeht bewusst). [slots.swap].allow_long_downloads = true
+# hält Instanzen in der Download-/Warmup-Phase von der Destroy-Automatik
+# fern (weder Warmup-Timeout noch preempt-vor-healthy-Aufräumen).

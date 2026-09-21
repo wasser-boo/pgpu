@@ -37,6 +37,14 @@ macro_rules! guarded {
 
 // ------------------------------------------------------------- Config (Hot-Reload)
 
+/// `POST /api/v1/sleep_all` — Auto-Miete aus + alle laufenden Boxen stoppen
+/// (Disk bleibt). Gegenstück zu destroy_all fürs sanfte Runterfahren.
+pub async fn sleep_all(app: AppCtx, req: Request) -> Response {
+    guarded!(app, req);
+    crate::reconciler::set_auto_rent(&app.0, false, "api: sleep_all").await;
+    (StatusCode::OK, "sleeping: auto_rent off, instances stopped").into_response()
+}
+
 /// `POST /api/v1/destroy_all` — ALLE nicht gepinnten Instanzen zerstören
 /// (optional body {"slots":[1,2]} oder {"auto_rent":false}). Fürs manuelle
 /// Aufräumen + als Ziel für externe Cronjobs.
@@ -368,6 +376,11 @@ pub struct CreateInstanceBody {
     #[serde(default)]
     #[allow(dead_code)]
     pub search: Option<String>, // live-Suche statt offer_id
+    /// true = bewusst über Ceiling mieten (Notfall). Default: nein — die
+    /// Ceiling ist ein hartes Budget, manuelles Mieten umgeht sie NICHT mehr
+    /// (21.09.: „20 €/h-Instanz"-Überraschungen über do_rent).
+    #[serde(default)]
+    pub force: bool,
 }
 
 pub async fn instance_create(app: AppCtx, req: Request) -> Response {
@@ -396,6 +409,21 @@ pub async fn instance_create(app: AppCtx, req: Request) -> Response {
     let Some(price) = price else {
         return (StatusCode::BAD_REQUEST, "no price").into_response();
     };
+    // Hartes Preisfenster durchsetzen (search filtert bereits — das hier
+    // fängt explizite price_usd_h-Übergaben und UI-Edge-Cases ab).
+    if !payload.force {
+        let rate = if payload.mode == Mode::Interruptible { offer.min_bid } else { offer.dph_total };
+        if rate < slot.bid.rent_min_usd_h || rate > slot.bid.ceiling_usd_h {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "price {:.4} $/h außerhalb Fenster [{:.4}, {:.4}] $/h (slot {}) — force=true zum bewussten Überschreiten",
+                    rate, slot.bid.rent_min_usd_h, slot.bid.ceiling_usd_h, slot.id
+                ),
+            )
+                .into_response();
+        }
+    }
     let disk = payload.disk_gb.unwrap_or(slot.disk_gb);
     match crate::reconciler::create_instance(
         &app.0,

@@ -13,7 +13,7 @@ fn cfg() -> PolicyConfig {
     slots.insert(
         1,
         SlotPolicyCfg {
-            bid: BidConfig { margin: 0.15, ceiling_usd_h: 0.30, defend_when_busy: true },
+            bid: BidConfig { margin: 0.15, ceiling_usd_h: 0.30, defend_when_busy: true, rent_min_usd_h: 0.0 },
             idle: IdleConfig { stop_after_s: 900, destroy_after_stopped_s: 172_800 },
             mode: Default::default(),
             swap: SwapConfig {
@@ -24,6 +24,7 @@ fn cfg() -> PolicyConfig {
                 max_warmup_s: 2700,
                 min_swap_interval_s: 3600,
                 keep_warm_window_s: 1800,
+                allow_long_downloads: false,
             },
             pool: Default::default(),
         },
@@ -31,7 +32,7 @@ fn cfg() -> PolicyConfig {
     slots.insert(
         2,
         SlotPolicyCfg {
-            bid: BidConfig { margin: 0.10, ceiling_usd_h: 0.20, defend_when_busy: true },
+            bid: BidConfig { margin: 0.10, ceiling_usd_h: 0.20, defend_when_busy: true, rent_min_usd_h: 0.0 },
             idle: IdleConfig { stop_after_s: 600, destroy_after_stopped_s: 3600 },
             mode: Default::default(),
             swap: SwapConfig {
@@ -42,6 +43,7 @@ fn cfg() -> PolicyConfig {
                 max_warmup_s: 1200,
                 min_swap_interval_s: 3600,
                 keep_warm_window_s: 1800,
+                allow_long_downloads: false,
             },
             pool: Default::default(),
         },

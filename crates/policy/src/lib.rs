@@ -49,6 +49,10 @@ pub struct BidConfig {
     pub ceiling_usd_h: f64,
     #[serde(default = "d_defend")]
     pub defend_when_busy: bool,
+    /// Preisfenster (USD/h) für Neumieten: Untergrenze — Angebote darunter
+    /// (trotz Suchfilter) sind verdächtige Faker/brechen beim Mieten. 0 = aus.
+    #[serde(default)]
+    pub rent_min_usd_h: f64,
 }
 
 fn d_margin() -> f64 {
@@ -82,6 +86,12 @@ pub struct SwapConfig {
     /// Traffic-Fenster: nur bei Nutzung in den letzten X Minuten Replacement.
     #[serde(default = "d_keep_warm")]
     pub keep_warm_window_s: i64,
+    /// Große Model-Downloads (85-GB-LLM, Qwen3-TTS): Instanzen in der
+    /// Download-/Warmup-Phase NICHT über die Automatik zerstören — weder
+    /// Warmup-Timeout noch "preempted vor healthy"-Aufräumen. Ein hängender
+    /// Download fällt über agent-unreachable/instance_gone weiter auf.
+    #[serde(default)]
+    pub allow_long_downloads: bool,
 }
 
 fn d_true() -> bool {
@@ -391,6 +401,10 @@ pub fn decide(snap: &Snapshot, cfg: &PolicyConfig) -> Vec<Action> {
 
         // --- Warmup-Watchdog: Backversuch abbrechen.
         for inst in &slot.instances {
+            if scfg.swap.allow_long_downloads {
+                // Bewusst: keine Warmup-Zeitbombe bei großen Downloads.
+                continue;
+            }
             if inst.state.is_active()
                 && inst.state != InstanceState::Healthy
                 && inst.state != InstanceState::Draining
@@ -636,6 +650,11 @@ pub fn decide(snap: &Snapshot, cfg: &PolicyConfig) -> Vec<Action> {
         // gewesene bleiben für Restart-Präferenz/manuelle Entscheidung.
         for inst in &slot.instances {
             if inst.state == InstanceState::Preempted && !inst.healthy && !inst.pinned {
+                // Download-Boxen weiter stehen lassen, wenn gewünscht
+                // (Disk+Warmup bleiben erhalten — Restart statt Neumiete).
+                if scfg.swap.allow_long_downloads {
+                    continue;
+                }
                 actions.push(Action::Destroy {
                     instance_id: inst.vast_id,
                     reason: "preempted vor healthy — aufräumen (kein Warmhaltewert)".into(),

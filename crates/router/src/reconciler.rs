@@ -528,6 +528,13 @@ fn best_candidate(app: &SharedApp, slot_id: i64) -> Option<OfferSnapshot> {
         .collect();
     offers
         .into_iter()
+        // Preisfenster [rent_min_usd_h, ceiling_usd_h]: hartes Budget —
+        // Offers außerhalb tauchen weder im Ranking noch im Dashboard-
+        // Picker auf („20-€/h-Boxen" unmöglich, 21.09.).
+        .filter(|o| {
+            let rate = if on_demand { o.dph_total } else { o.min_bid };
+            rate >= slot.bid.rent_min_usd_h && rate <= slot.bid.ceiling_usd_h
+        })
         // On-Demand: dph_total ist der Preis (reine OD-Angebote haben min_bid=0);
         // Interruptible: min_bid (OD-only-Angebote raus, dph wäre Fehl-Ranking).
         .filter(|o| if on_demand { o.dph_total > 0.0 } else { o.min_bid > 0.0 })
@@ -888,9 +895,15 @@ pub async fn run_schedules(app: &SharedApp) {
         let slots = rule.slots.clone();
         let action = rule.action.trim().to_ascii_lowercase();
         tracing::info!(%action, time = %rule.time, "schedule-Regel feuert");
+        let slot_ids = |all: &Option<Vec<i64>>| -> Vec<i64> {
+            match all {
+                Some(ids) => ids.clone(),
+                None => app.cfg().slots.iter().map(|s| s.id).collect(),
+            }
+        };
         match action.as_str() {
             // Aus: Auto-Miete stoppt laufende Boxen (Disk bleibt).
-            "sleep" => set_auto_rent(app, false, "schedule").await,
+            "sleep" | "sleep_all" => set_auto_rent(app, false, "schedule").await,
             // An: Slots gewünscht → Reconciler mietet/warmt im selben Tick.
             "wake" | "rent" => {
                 set_auto_rent(app, true, "schedule").await;
@@ -914,6 +927,68 @@ pub async fn run_schedules(app: &SharedApp) {
                     &format!("Zeitplan {time}: alle Instanzen zerstört", time = rule.time),
                     &serde_json::json!({ "destroyed": n, "rule_time": rule.time }),
                 );
+            }
+            // Slot(s) locken: aktive Instanz pinnen + Slot-Pin — kein
+            // Auto-Rent/Replace/Destroy bis unlock. Für „Box soll über
+            // Nacht genau SO bleiben"-Szenarien.
+            "lock" => {
+                for sid in slot_ids(&slots) {
+                    let insts = app.db.instances(false);
+                    let cand = app
+                        .db
+                        .active_instance(sid)
+                        .or_else(|| {
+                            insts
+                                .iter()
+                                .find(|r| {
+                                    r.slot_id == sid && r.destroyed_at.is_none()
+                                        && matches!(r.state.as_str(), "healthy" | "booting" | "agent_connected" | "provisioning" | "requested")
+                                })
+                                .map(|r| r.vast_id)
+                        });
+                    match cand {
+                        Some(vid) => {
+                            let _ = app.db.update_instance_pinned(vid, true);
+                            let _ = app.db.set_slot_pin(sid, Some(vid));
+                            app.events.emit(&app.db, "locked", Some(sid), Some(vid), "schedule lock", &serde_json::json!({ "rule_time": rule.time }));
+                        }
+                        None => {
+                            app.events.emit(&app.db, "schedule_noop", Some(sid), None, &format!("schedule {}: kein Kandidat zum Locken", rule.time), &serde_json::json!({}));
+                        }
+                    }
+                }
+            }
+            "unlock" => {
+                for sid in slot_ids(&slots) {
+                    let _ = app.db.set_slot_pin(sid, None);
+                    for inst in app.db.instances(false) {
+                        if inst.slot_id == sid && inst.pinned {
+                            let _ = app.db.update_instance_pinned(inst.vast_id, false);
+                        }
+                    }
+                    app.events.emit(&app.db, "unlocked", Some(sid), None, "schedule unlock", &serde_json::json!({ "rule_time": rule.time }));
+                }
+            }
+            // Pin/unpin = Slot-Pin ohne Instanz-Brandsatz (klassisches Pin).
+            "pin" => {
+                for sid in slot_ids(&slots) {
+                    if let Some(active) = app.db.active_instance(sid) {
+                        let _ = app.db.update_instance_pinned(active, true);
+                        let _ = app.db.set_slot_pin(sid, Some(active));
+                        app.events.emit(&app.db, "pinned", Some(sid), Some(active), "schedule pin", &serde_json::json!({ "rule_time": rule.time }));
+                    }
+                }
+            }
+            "unpin" => {
+                for sid in slot_ids(&slots) {
+                    let _ = app.db.set_slot_pin(sid, None);
+                    for inst in app.db.instances(false) {
+                        if inst.slot_id == sid && inst.pinned {
+                            let _ = app.db.update_instance_pinned(inst.vast_id, false);
+                        }
+                    }
+                    app.events.emit(&app.db, "unpinned", Some(sid), None, "schedule unpin", &serde_json::json!({ "rule_time": rule.time }));
+                }
             }
             _ => {}
         }

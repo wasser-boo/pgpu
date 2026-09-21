@@ -207,8 +207,10 @@ pub struct SchedRule {
     /// "daily" | "weekdays" | "weekends" | "Mon,Wed,Fri" (3- oder Vollnamen).
     #[serde(default = "d_sched_days")]
     pub days: String,
-    /// "sleep" (auto_rent aus, Boxen stoppen) | "wake"/"rent" (auto_rent
-    /// an, Slots mieten) | "destroy_all" (alle Instanzen weg + aus).
+    /// "sleep"/"sleep_all" (auto_rent aus, Boxen stoppen) | "wake"/"rent"
+    /// (auto_rent an, Slots mieten) | "destroy_all" (alle Instanzen weg +
+    /// aus) | "lock"/"unlock" (Slot+Instanz fixieren/freigeben) |
+    /// "pin"/"unpin".
     pub action: String,
     /// Nur diese Slots (Default: alle).
     #[serde(default)]
@@ -410,7 +412,7 @@ impl Config {
                 anyhow::bail!("schedule[{i}]: time muss \"HH:MM\" sein (ist {:?})", r.time);
             }
             let a = r.action.trim().to_ascii_lowercase();
-            if !["sleep", "wake", "rent", "destroy_all"].contains(&a.as_str()) {
+            if !["sleep","sleep_all","wake","rent","destroy_all","lock","unlock","pin","unpin"].contains(&a.as_str()) {
                 anyhow::bail!("schedule[{i}]: unbekannte action {:?} (sleep|wake|rent|destroy_all)", r.action);
             }
         }
