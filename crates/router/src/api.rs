@@ -500,7 +500,7 @@ pub async fn term_ws(app: AppCtx, Path(vast_id): Path<i64>, ws: WebSocketUpgrade
                                 .unwrap_or("")
                                 .replace("\r\n", "\n")
                                 .replace('\n', "\r\n");
-                            if sink.send(Message::Text(format!("{{\"type\":\"output\",\"data\":{}}}", serde_json::to_string(data).unwrap_or_default()).into())).await.is_err() {
+                            if sink.send(Message::Text(format!("{{\"type\":\"output\",\"data\":{}}}", serde_json::to_string(&data).unwrap_or_default()).into())).await.is_err() {
                                 break;
                             }
                         } else if frame.get("type").and_then(|t| t.as_str()) == Some("term_end") {
