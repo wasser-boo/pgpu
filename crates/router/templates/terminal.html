@@ -8,14 +8,33 @@
 <h1>Terminal · Instanz #{{ vast_id }}</h1>
 <div class="card">
   <div id="term"></div>
-  <p class="mut">Pipes-bash (kein vty): interaktive Programme ohne Fullscreen-Modus. exit beendet.</p>
+  <p class="mut">Zeilenmodus (kein vty): tippen + Enter schickt die ganze Zeile · Backspace ja · Pfeile/History nein · exit beendet.</p>
 </div>
 <script>
 const wsUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/api/v1/instances/{{ vast_id }}/ws/term';
 const ws = new WebSocket(wsUrl);
 const term = new Terminal({ fontSize: 13, cursorBlink: true, cols: 100, rows: 30 });
 term.open(document.getElementById('term'));
-term.onData((d) => ws.send(JSON.stringify({ type: 'input', data: d })));
+term.focus();
+// Zeilenmodus für Pipes-bash: Der Agent führt JEDE TermIn als eigene Zeile
+// aus (stdin + '\n' — deshalb tippte jeder Buchstabe einen eigenen Befehl,
+// 21.09.). Also bauen wir die Zeile IM BROWSER: lokales Echo, Backspace
+// löscht, Enter schickt die komplette Zeile. Kein vty → Pfeile/History/Strg-C
+// gibt es nicht (Strg-C verwirft hier nur die lokale Zeile).
+let buf = '';
+term.onData((d) => {
+  if (d === '\r') {                                   // Enter → Zeile senden
+    term.write('\r\n');
+    if (buf.length) ws.send(JSON.stringify({ type: 'input', data: buf }));
+    buf = '';
+  } else if (d === '\x7f') {                          // Backspace lokal
+    if (buf.length) { buf = buf.slice(0, -1); term.write('\b \b'); }
+  } else if (d === '\x03') {                          // Strg-C: Zeile verwerfen
+    buf = ''; term.write('^C\r\n');
+  } else if (d.length === 1 ? d >= ' ' : true) {      // druckbar → puffern + Echo
+    buf += d; term.write(d);
+  }
+});
 ws.onmessage = (m) => {
   try {
     const v = JSON.parse(m.data);
