@@ -39,7 +39,7 @@
     {% if s.vast_id > 0 %}<br>Gebot {{ s.bid|fmt4 }} $/h vs. min_bid {{ s.min_bid|fmt4 }} $/h{% endif %}
     <br>In-flight: {{ s.in_flight }} · Busy: {% if s.busy %}<span class="badge b-info">{{ s.busy_reason }}</span>{% else %}idle{% endif %}
     <br>Kosten heute: {{ s.cost_today|fmt2 }} $
-    {% if s.pinned %}<br><span class="badge b-warn">PINNED</span>{% endif %}
+    {% if s.pinned %}<br><span class="badge b-warn">LOCKED</span>{% endif %}
   </div>
   <div class="actions">
     <form method="post" action="/do/slots/{{ s.id }}/wake"><button>Wake</button></form>
@@ -47,9 +47,9 @@
     <form method="post" action="/do/slots/{{ s.id }}/destroy" onsubmit="return confirm('Instanz wirklich zerstören?')"><button>Zerstören</button></form>
     <form method="post" action="/do/slots/{{ s.id }}/swap"><button>Swap now</button></form>
     {% if s.pinned %}
-    <form method="post" action="/do/slots/{{ s.id }}/unpin"><button>Unpin</button></form>
+    <form method="post" action="/do/slots/{{ s.id }}/unlock" onsubmit="return confirm('Lock aufheben? Der Slot mietet wieder automatisch Ersatz.')"><button>Unlock</button></form>
     {% else %}
-    <form method="post" action="/do/slots/{{ s.id }}/pin"><button>Pin</button></form>
+    <form method="post" action="/do/slots/{{ s.id }}/lock" onsubmit="return confirm('Slot locken? Kein Auto-Rent/Replace/Destroy bis Unlock.')"><button>Lock</button></form>
     {% endif %}
     {% if s.vast_id > 0 %}<a class="btn" href="/instances/{{ s.vast_id }}">Details</a>{% endif %}
   </div>
