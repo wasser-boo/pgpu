@@ -258,20 +258,29 @@ pub async fn slot_action(app: AppCtx, Path((slot_id, action)): Path<(i64, String
 
     match action.as_str() {
         "wake" => {
+            // Force-Wake (nur via Bearer-API — z. B. Praxis mit ROUTER_TOKEN):
+            // schaltet die Auto-Miete ZURÜCK an und weckt den Slot. Das ist
+            // der Nachtmodus-Ausstieg: 20:00-Sleep fährt alles runter, die
+            // erste gepairte Discord-Nachricht morgens/nachts weckt alles
+            // wieder hoch (Budget-Caps greifen weiter).
+            let force = payload.get("force").and_then(|f| f.as_bool()).unwrap_or(false);
             if !app.db.auto_rent_enabled() {
-                app.events.emit(
-                    &app.db,
-                    "wake_blocked",
-                    Some(slot_id),
-                    None,
-                    "Auto-Miete ist ausgeschaltet — Wake ignoriert (Dashboard-Schalter)",
-                    &serde_json::json!({}),
-                );
-                return (
-                    StatusCode::CONFLICT,
-                    "auto_rent disabled — wake ignored",
-                )
-                    .into_response();
+                if !force {
+                    app.events.emit(
+                        &app.db,
+                        "wake_blocked",
+                        Some(slot_id),
+                        None,
+                        "Auto-Miete ist ausgeschaltet — Wake ignoriert (Dashboard-Schalter)",
+                        &serde_json::json!({}),
+                    );
+                    return (
+                        StatusCode::CONFLICT,
+                        "auto_rent disabled — wake ignored",
+                    )
+                        .into_response();
+                }
+                crate::reconciler::set_auto_rent(&app.0, true, "api: force wake").await;
             }
             let _ = app.db.set_slot_desired_audited(slot_id, true, "api: wake");
             app.events.emit(&app.db, "wake", Some(slot_id), None, &reason, &payload);
