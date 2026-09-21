@@ -3,56 +3,52 @@
 {% block head %}
 <link rel="stylesheet" href="/static/xterm.css">
 <script src="/static/xterm.js"></script>
+<style>
+  #term { background:#0d1116; border-radius:8px; padding:6px; }
+  .xterm .xterm-viewport { background:#0d1116 !important; }
+</style>
 {% endblock %}
 {% block content %}
 <h1>Terminal · Instanz #{{ vast_id }}</h1>
 <div class="card">
   <div id="term"></div>
-  <p class="mut">Zeilenmodus (kein vty): tippen + Enter schickt die ganze Zeile · Backspace ja · Pfeile/History nein · exit beendet.</p>
+  <p class="mut">Voll-Terminal (echtes PTY): vim, nload, htop, Pfeiltasten, Tab, Strg-C — alles geht. exit oder Tab schließen beendet.</p>
 </div>
 <script>
 const wsUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/api/v1/instances/{{ vast_id }}/ws/term';
 const ws = new WebSocket(wsUrl);
-const term = new Terminal({ fontSize: 13, cursorBlink: true, cols: 100, rows: 30 });
+const term = new Terminal({
+  fontSize: 13, cursorBlink: true, cols: 100, rows: 30,
+  scrollback: 5000, convertEol: false,
+});
 term.open(document.getElementById('term'));
 term.focus();
-// Zeilenmodus für Pipes-bash: Der Agent führt JEDE TermIn als eigene Zeile
-// aus (stdin + '\n' — deshalb tippte jeder Buchstabe einen eigenen Befehl,
-// 21.09.). Also bauen wir die Zeile IM BROWSER: lokales Echo, Backspace
-// löscht, Enter schickt die komplette Zeile. Kein vty → Pfeile/History/Strg-C
-// gibt es nicht (Strg-C verwirft hier nur die lokale Zeile).
-let buf = '';
-const PROMPT = '\x1b[36magent>\x1b[0m ';
-// Prompt-Endmarker: Wir haengen an jede Zeile '; echo __PRAXIS_PROMPT__' an —
-// die Ausgabe des Markers ersetzen wir lokal durch den naechsten Prompt.
-// So steht der Prompt ERST, wenn der Befehl fertig ist (auch bei mehrsekündigen
-// Ausgaben). 'exit' klappt trotzdem: bash beendet vor dem echo → TermEnd.
-term.onData((d) => {
-  if (d === '\r') {                                   // Enter → Zeile senden
-    term.write('\r\n');
-    if (buf.trim() === 'clear') { term.clear(); buf = ''; term.write(PROMPT); return; }
-    if (buf.length) ws.send(JSON.stringify({ type: 'input', data: buf + '; echo __PRAXIS_PROMPT__' }));
-    else term.write(PROMPT);
-    buf = '';
-  } else if (d === '\x7f') {                          // Backspace lokal
-    if (buf.length) { buf = buf.slice(0, -1); term.write('\b \b'); }
-  } else if (d === '\x03') {                          // Strg-C: Zeile verwerfen
-    buf = ''; term.write('^C\r\n' + PROMPT);
-  } else if (d.length === 1 ? d >= ' ' : true) {      // druckbar → puffern + Echo
-    buf += d; term.write(d);
-  }
-});
+
+// PTY-Größe beim Start + bei jedem Resize nachziehen (vim braucht die
+// echten Maße, sonst zeichnet es in ein falsches Grid).
+const sendResize = () => ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+ws.onopen = () => sendResize();
+window.addEventListener('resize', sendResize);
+// Terminal-Container beobachten (Layout-Änderungen ohne Window-Resize):
+new ResizeObserver(() => sendResize()).observe(document.getElementById('term'));
+
+// Tastatur: ALLES roh durchreichen (Pfeile = ANSI-Escapes, Strg-C = \x03,
+// Tab, Backspace — das PTY/bash macht Echo/History/Completion selbst).
+term.onData((d) => ws.send(JSON.stringify({ type: 'input', data: d })));
+
+// NUL-Escape (Agent ersetzt \x00 durch \u0001\u0002, JSON mag kein NUL).
 ws.onmessage = (m) => {
   try {
     const v = JSON.parse(m.data);
     if (v.type === 'output') {
-      if (v.data === '__PRAXIS_PROMPT__\n') term.write(PROMPT);
-      else term.write(v.data);
+      term.write(v.data.replace(/\u0001\u0002/g, '\x00'));
     }
-    if (v.type === 'exit') { term.write('\r\n\x1b[31m[Session beendet]\x1b[0m\r\n'); ws.close(); }
+    if (v.type === 'exit') {
+      term.write('\r\n\x1b[31m[Session beendet]\x1b[0m\r\n');
+      ws.close();
+    }
   } catch (e) {}
 };
-ws.onopen = () => term.write('\x1b[32mverbunden — bash auf Instanz {{ vast_id }}\x1b[0m\r\n' + PROMPT);
 ws.onclose = () => term.write('\r\n\x1b[31m[getrennt]\x1b[0m\r\n');
 </script>
 {% endblock %}

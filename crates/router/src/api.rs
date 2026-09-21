@@ -628,13 +628,22 @@ pub async fn term_ws(app: AppCtx, Path(vast_id): Path<i64>, ws: WebSocketUpgrade
                     match from_client {
                         Some(Ok(Message::Text(t))) => {
                             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) {
-                                if v.get("type").and_then(|t| t.as_str()) == Some("input") {
-                                    if let Some(data) = v.get("data").and_then(|d| d.as_str()) {
-                                        let _ = hub.term_send(vast_id, praxis_common::node::RouterCommand::TermIn { id: term_id, data: data.to_string() });
+                                match v.get("type").and_then(|t| t.as_str()) {
+                                    Some("input") => {
+                                        if let Some(data) = v.get("data").and_then(|d| d.as_str()) {
+                                            let _ = hub.term_send(vast_id, praxis_common::node::RouterCommand::TermIn { id: term_id, data: data.to_string() });
+                                        }
                                     }
-                                } else if v.get("type").and_then(|t| t.as_str()) == Some("close") {
-                                    let _ = hub.term_send(vast_id, praxis_common::node::RouterCommand::TermClose { id: term_id });
-                                    break;
+                                    Some("resize") => {
+                                        let cols = v.get("cols").and_then(|c| c.as_u64()).unwrap_or(80).min(500) as u16;
+                                        let rows = v.get("rows").and_then(|r| r.as_u64()).unwrap_or(24).min(200) as u16;
+                                        let _ = hub.term_send(vast_id, praxis_common::node::RouterCommand::TermResize { id: term_id, cols, rows });
+                                    }
+                                    Some("close") => {
+                                        let _ = hub.term_send(vast_id, praxis_common::node::RouterCommand::TermClose { id: term_id });
+                                        break;
+                                    }
+                                    _ => {}
                                 }
                             }
                         }

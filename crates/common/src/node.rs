@@ -104,6 +104,8 @@ pub enum RouterCommand {
     },
     /// stdin für einen offenen exec/term-Stream.
     TermIn { id: u64, data: String },
+    /// PTY-Resize (Browser-Größe → Agent).
+    TermResize { id: u64, cols: u16, rows: u16 },
     TermClose { id: u64 },
 }
 
