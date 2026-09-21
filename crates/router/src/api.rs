@@ -488,7 +488,18 @@ pub async fn term_ws(app: AppCtx, Path(vast_id): Path<i64>, ws: WebSocketUpgrade
                 from_agent = out_rx.recv() => {
                     if let Some(frame) = from_agent {
                         if frame.get("type").and_then(|t| t.as_str()) == Some("term") {
-                            let data = frame.get("data").and_then(|d| d.as_str()).unwrap_or("");
+                            // CRLF-Normalisierung: Der Agent pumpt Zeilen als
+                            // "...\n" (pipes-bash) — xterm.js interpretiert \n
+                            // aber als LF OHNE Wagenrücklauf → Treppeneffekt
+                            // (jede Ausgabezeile startet in der Spalte der
+                            // vorigen, 21.09. live gesehen). \r\n erzwingt
+                            // sauberen Zeilenanfang (idempotent: CR-LF → LF → CRLF).
+                            let data = frame
+                                .get("data")
+                                .and_then(|d| d.as_str())
+                                .unwrap_or("")
+                                .replace("\r\n", "\n")
+                                .replace('\n', "\r\n");
                             if sink.send(Message::Text(format!("{{\"type\":\"output\",\"data\":{}}}", serde_json::to_string(data).unwrap_or_default()).into())).await.is_err() {
                                 break;
                             }

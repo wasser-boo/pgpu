@@ -30,6 +30,7 @@ const PROMPT = '\x1b[36magent>\x1b[0m ';
 term.onData((d) => {
   if (d === '\r') {                                   // Enter → Zeile senden
     term.write('\r\n');
+    if (buf.trim() === 'clear') { term.clear(); buf = ''; term.write(PROMPT); return; }
     if (buf.length) ws.send(JSON.stringify({ type: 'input', data: buf + '; echo __PRAXIS_PROMPT__' }));
     else term.write(PROMPT);
     buf = '';
