@@ -6,7 +6,9 @@ bind_ip = "127.0.0.1"        # Produktion: NetBird-IP (z. B. 100.x.y.z)
 dashboard_port = 8080
 data_dir = "/data"           # lokal testen: "./data"
 # Router-Token: API-Bearer + Dashboard-Login. env ROUTER_TOKEN überschreibt.
-token = "change-me"
+# Pflicht: mindestens 32 Zeichen (A-Z/a-z/0-9/-/_), z. B. openssl rand -hex 32.
+# Leer bleibt absichtlich NICHT startfähig; ein Secret setzen oder per Env liefern.
+token = ""
 tz = "Europe/Berlin"
 # Hold-Window für X-Router-Wait (Sekunden, 0 = sofort 503)
 wait_for_backend_max_s = 600
@@ -15,6 +17,10 @@ wait_for_backend_max_s = 600
 # api_key = ""               # oder env VAST_API_KEY
 poll_interval_s = 30
 offer_poll_s = 60
+# Unabhängige Schalter. AUS löscht keine Einträge/Messdaten.
+activate_blacklist = true    # gesperrte Hosts ausschließen (Default)
+activate_whitelist = false   # AN: nur explizit freigegebene Hosts zulassen
+# Beide AN: Whitelist nötig UND nicht blacklisted. Limits gelten immer.
 # Host nach N Fails (warmup-Tod/unreachable/timeout) blacklisten; 0 = aus.
 blacklist_after_fails = 2
 # Unreachable-Box (Vast running, Agent tot) nach X s stoppen (Disk bleibt).
@@ -88,6 +94,58 @@ on_bid_pressure = true
 optimize_cost = false         # 82-GB-Download macht Swap teurer als Behalten
 max_warmup_s = 2700           # 45 min (Model-Download)
 keep_warm_window_s = 1800
+
+# Lokale Prüfungen ZUSÄTZLICH zum Vast-Suchstring (auch manuelle Mieten).
+[slots.requirements]
+# gpu_names = ["RTX 5090", "RTX 5070 Ti"] # exakte Modelle, keine Teilstrings
+# machine_ids = [12345, 67890] # zusätzliche harte Allowlist, unabhängig von [vast]
+min_gpu_ram_gb = 15.0
+min_cpu_ram_gb = 30.0
+min_disk_bw = 1500.0
+min_inet_down = 500.0
+min_reliability = 0.95
+num_gpus = 1
+# min_cuda = 12.9             # Provider-CUDA-Version, NICHT Compute Capability
+# max_storage_usd_h = 0.04
+# max_download_usd_gb = 0.005
+# max_effective_usd_h = 0.34  # GPU + Storage, zusätzlich zu slots.bid.ceiling_usd_h
+# gpu_price_ceiling_usd_h = { "RTX 5090" = 0.30, "RTX 4060 Ti" = 0.15 }
+
+# Alle neuen Mess-/Last-/Ranking-Funktionen standardmäßig AUS.
+# Vollständige Anleitung: docs/gpu-performance.md
+[slots.performance]
+enabled = false
+collect_usage = false        # passiv: JSON/SSE-Metadaten, keine Inhalte speichern
+profile = "qwen-flash-next-quant-context-v1" # Quantisierung/Kontext/Runtime eindeutig benennen!
+retention_days = 90          # Rohdaten; Lebenszeit-Aggregate bleiben erhalten
+max_samples = 50000          # maximale Rohdaten-Zeilen pro Slot
+
+[slots.performance.benchmark]
+enabled = false             # zusätzlich Agent >=0.2.0 + PRAXIS_AGENT_ALLOW_BENCHMARK=1
+auto_when_idle = false       # sonst nur manueller Button/API
+min_interval_s = 86400       # auch fehlgeschlagene Versuche, persistent
+idle_s = 120                 # kein In-flight/Batch/Agent-Busy
+
+[slots.performance.benchmark.spec]
+port = 11434                # muss einem Slot-Service entsprechen
+model = ""                  # vor Aktivierung EXAKTEN /v1/models-Alias eintragen
+requests = 3
+prompt_repetitions = 64      # synthetisches Profil, keine Benutzer-Prompts
+max_tokens = 128
+timeout_s = 120              # hart begrenzt, 10..600 s
+disk_read_mb = 0            # optional 1..256 MiB O_DIRECT, nur bestehende GGUF lesen
+
+[slots.performance.score]
+enabled = false             # AN: gute vergleichbare Benchmark-Hosts bevorzugen
+preference_weight = 0.25     # max. ±25 % Ranking-Anpassung, kein Preislimit-Override
+min_samples = 3
+max_age_days = 30
+decode_target_tps = 40.0     # 50 Punkte = konfiguriertes Ziel erreicht
+prefill_target_tps = 500.0
+ttft_target_ms = 1000.0
+decode_weight = 0.7
+prefill_weight = 0.2
+ttft_weight = 0.1
 
 # Extra-Env beim Create (Modellvariante!):
 [slots.env]

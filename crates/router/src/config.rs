@@ -79,8 +79,12 @@ fn d_wait() -> u64 {
     600
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct VastCfg {
+    #[serde(default = "d_true")]
+    pub activate_blacklist: bool,
+    #[serde(default)]
+    pub activate_whitelist: bool,
     /// Vast API-Key (env VAST_API_KEY überschreibt).
     #[serde(default)]
     pub api_key: String,
@@ -98,6 +102,15 @@ pub struct VastCfg {
     pub unreachable_stop_after_s: i64,
 }
 
+impl Default for VastCfg {
+    fn default() -> Self {
+        Self { activate_blacklist: true, activate_whitelist: false, api_key: String::new(), poll_interval_s: d_poll(), offer_poll_s: d_offer_poll(),
+            blacklist_after_fails: d_blacklist_fails(), unreachable_stop_after_s: d_unreachable_stop_s() }
+    }
+}
+
+fn d_true() -> bool { true }
+
 fn d_poll() -> u64 {
     30
 }
@@ -111,7 +124,7 @@ fn d_unreachable_stop_s() -> i64 {
     300
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct NetbirdCfg {
     /// Management-API-Token (ephemerere Setup-Keys minten). Leer = statischer Key.
     #[serde(default)]
@@ -139,6 +152,14 @@ pub struct NetbirdCfg {
     /// Port des Router-Dashboards aus Agent-Sicht (Call-home).
     #[serde(default = "d_nb_port")]
     pub router_nb_port: u16,
+}
+
+impl Default for NetbirdCfg {
+    fn default() -> Self {
+        Self { api_token: String::new(), api_url: d_nb_api(), management_url: d_nb_mgmt(),
+            setup_key: String::new(), group: d_group(), groups: Vec::new(),
+            router_nb_ip: String::new(), router_nb_port: d_nb_port() }
+    }
 }
 
 fn d_nb_api() -> String {
@@ -305,6 +326,10 @@ pub struct SlotCfg {
     /// laufende Boxen, total Obergrenze inkl. kalter Reserve.
     #[serde(default)]
     pub pool: praxis_policy::PoolConfig,
+    #[serde(default)]
+    pub requirements: praxis_policy::eligibility::Requirements,
+    #[serde(default)]
+    pub performance: crate::performance::PerformanceConfig,
     /// Extra-Env beim Instanz-Create (z. B. LLAMA_MODEL).
     #[serde(default)]
     pub env: HashMap<String, String>,
@@ -408,10 +433,43 @@ impl Config {
         if self.slots.is_empty() {
             anyhow::bail!("keine Slots konfiguriert");
         }
+        anyhow::ensure!(self.router.tz.parse::<chrono_tz::Tz>().is_ok(), "invalid router.tz");
+        anyhow::ensure!(self.router.bind_ip == "auto" || self.router.bind_ip.parse::<std::net::IpAddr>().is_ok(), "invalid router.bind_ip");
+        let nonnegative = |v: f64| v.is_finite() && v >= 0.0;
+        anyhow::ensure!([self.budget.daily_soft_eur, self.budget.daily_hard_eur, self.budget.monthly_eur].into_iter().all(nonnegative), "budgets must be finite and nonnegative");
+        anyhow::ensure!(self.budget.usd_per_eur.is_finite() && self.budget.usd_per_eur > 0.0, "usd_per_eur must be positive");
+        anyhow::ensure!(self.budget.daily_soft_eur <= self.budget.daily_hard_eur, "soft budget exceeds hard budget");
+        anyhow::ensure!(["stop", "destroy"].contains(&self.budget.hard_action.as_str()), "invalid budget.hard_action");
+        anyhow::ensure!(self.limits.max_instances > 0 && self.limits.max_per_slot > 0 && self.limits.max_total_rate_usd_h.is_finite() && self.limits.max_total_rate_usd_h > 0.0, "invalid instance/rate limits");
+        let mut ids = std::collections::HashSet::new();
+        let mut ports = std::collections::HashSet::new();
+        anyhow::ensure!(self.router.dashboard_port != 0, "dashboard port must not be zero");
+        ports.insert(self.router.dashboard_port);
+        anyhow::ensure!(["local", "media_slot"].contains(&self.stt.mode.as_str()), "invalid stt.mode");
+        if self.stt.mode == "local" {
+            anyhow::ensure!(self.stt.listen_port != 0 && ports.insert(self.stt.listen_port), "duplicate/invalid STT listener port");
+        }
         for s in &self.slots {
-            if s.name.is_empty() {
-                anyhow::bail!("slot {} ohne name", s.id);
+            anyhow::ensure!(s.id > 0 && ids.insert(s.id), "duplicate/invalid slot id {}", s.id);
+            anyhow::ensure!(!s.name.trim().is_empty(), "slot {} ohne name", s.id);
+            anyhow::ensure!(s.disk_gb > 0 && nonnegative(s.traffic_gb), "invalid disk/traffic for slot {}", s.id);
+            anyhow::ensure!(["", "interruptible", "on_demand", "on-demand", "ondemand"].contains(&s.mode.as_str()), "invalid slot mode");
+            anyhow::ensure!(s.pool.warm > 0 && s.pool.warm <= s.pool.total && s.pool.total <= self.limits.max_per_slot as usize, "invalid pool limits for slot {}", s.id);
+            anyhow::ensure!([s.bid.margin, s.bid.ceiling_usd_h, s.bid.rent_min_usd_h].into_iter().all(nonnegative) && s.bid.rent_min_usd_h <= s.bid.ceiling_usd_h, "invalid bid window for slot {}", s.id);
+            s.requirements.validate().map_err(anyhow::Error::msg)?;
+            s.performance.validate().map_err(anyhow::Error::msg)?;
+            if s.performance.benchmark.enabled {
+                anyhow::ensure!(s.role == Role::Llm, "built-in benchmark currently supports LLM slots only");
+                anyhow::ensure!(s.services.values().any(|svc|svc.port == s.performance.benchmark.spec.port), "benchmark port must be a configured slot service");
             }
+            let idle = s.idle_cfg(s.role);
+            anyhow::ensure!(idle.stop_after_s >= 0 && idle.destroy_after_stopped_s >= 0 && s.swap.max_warmup_s > 0, "invalid lifecycle timers for slot {}", s.id);
+            for (port, service) in &s.passthrough {
+                let port: u16 = port.parse()?;
+                anyhow::ensure!(port != 0 && ports.insert(port), "duplicate/invalid listener port {port}");
+                anyhow::ensure!(s.services.contains_key(service), "unknown passthrough service {service}");
+            }
+            anyhow::ensure!(s.services.values().all(|svc| svc.port != 0), "service port must not be zero");
         }
         for (i, r) in self.schedule.iter().enumerate() {
             if r.minutes().is_none() {
@@ -424,7 +482,23 @@ impl Config {
             if a == "budget" && r.soft_eur.is_none() && r.hard_eur.is_none() {
                 anyhow::bail!("schedule[{i}]: action \"budget\" braucht soft_eur und/oder hard_eur");
             }
+            anyhow::ensure!(r.soft_eur.into_iter().chain(r.hard_eur).all(nonnegative), "invalid schedule budget");
+            if let (Some(soft), Some(hard)) = (r.soft_eur, r.hard_eur) {
+                anyhow::ensure!(soft <= hard, "schedule soft budget exceeds hard budget");
+            }
+            if let Some(slots) = &r.slots {
+                anyhow::ensure!(slots.iter().all(|id| ids.contains(id)), "schedule references unknown slot");
+            }
         }
+        Ok(())
+    }
+
+    /// Required at startup/reload, including loopback. Fail closed if an env
+    /// override accidentally clears the token. Cookie-safe tokens only.
+    pub fn validate_auth(&self) -> anyhow::Result<()> {
+        let token = self.router_token();
+        anyhow::ensure!(token.len() >= 32 && token.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+            "ROUTER_TOKEN must contain at least 32 ASCII letters/digits, '-' or '_' (e.g. openssl rand -hex 32)");
         Ok(())
     }
 

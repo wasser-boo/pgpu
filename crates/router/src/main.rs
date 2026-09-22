@@ -5,6 +5,8 @@
 //! Reconciler mit Policy, Agent-Hub mit Assets.
 
 mod api;
+mod catalog;
+mod performance;
 mod assets;
 mod connector;
 mod config;
@@ -13,8 +15,17 @@ mod db;
 mod events;
 mod hub;
 mod node;
+mod operations;
+
+#[cfg(test)]
+mod test_support;
+#[cfg(test)]
+mod regressions;
+#[cfg(test)]
+mod performance_tests;
 mod proxy;
 mod reconciler;
+mod schedule_time;
 mod state;
 
 use anyhow::{Context, Result};
@@ -47,6 +58,7 @@ async fn async_main() -> Result<()> {
         .unwrap_or_else(|| "config.toml".to_string());
     let mut cfg = config::Config::load(&config_path)
         .with_context(|| format!("config {config_path} laden"))?;
+    cfg.validate_auth()?;
     // bind_ip = "auto": erste IPv4 im NetBird-Range (100.64.0.0/10) am
     // wt0/anderen Interfaces erkennen — VPS-Deploy ohne hartcodierte IP
     // (NetBird-IP steht erst nach Enroll fest). Gleiches gilt für
@@ -89,6 +101,10 @@ async fn async_main() -> Result<()> {
         cfg: RwLock::new(Arc::new(cfg.clone())),
         config_path: config_path.clone(),
         db: db.clone(),
+        management: tokio::sync::Mutex::new(()),
+        proxy_client: proxy::http_client(),
+        last_reconcile: Default::default(),
+        shutting_down: Default::default(),
         events: event_bus,
         traffic: Traffic::default(),
         jobs: Default::default(),
@@ -109,16 +125,15 @@ async fn async_main() -> Result<()> {
         &serde_json::json!({"config": config_path}),
     );
 
-    // Agent-Connector: Router waehlt sich in die gpu-agents ein (:9100).
-    {
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    // Keep handles: a dead control loop must fail the process, not silently
+    // leave only the dashboard alive while GPUs continue costing money.
+    let mut connector_task = {
         let app = app.clone();
-        tokio::spawn(async move {
-            connector::run(app).await;
-        });
-    }
+        tokio::spawn(async move { connector::run(app).await })
+    };
 
-    // Reconciler.
-    {
+    let mut reconciler_task = {
         let app = app.clone();
         tokio::spawn(async move {
             // Erster Tick sofort: Angebote vorwärmen.
@@ -126,14 +141,17 @@ async fn async_main() -> Result<()> {
                 let _ = reconciler::search_slot_offers(&app, slot.id, true).await;
             }
             reconciler::run(app).await;
-        });
-    }
+        })
+    };
 
     // Dashboard + API.
     let dash = axum::Router::<SharedApp>::new()
         .route("/", get(dashboard::index))
+        .route("/healthz", get(|| async { "ok" }))
+        .route("/readyz", get(api::ready))
         .route("/login", get(dashboard::login_page).post(dashboard::login_submit))
         .route("/offers", get(dashboard::offers_page))
+        .route("/performance", get(dashboard::performance_page))
         .route("/instances/:id", get(dashboard::instance_page).post(dashboard::instance_page))
         .route("/term/:id", get(dashboard::terminal_page))
         .route("/schedules", get(dashboard::schedules_page))
@@ -158,6 +176,8 @@ async fn async_main() -> Result<()> {
         .route("/api/v1/events/stream", get(api::events_sse))
         .route("/api/v1/offers", get(api::offers))
         .route("/api/v1/machines", get(api::machines))
+        .route("/api/v1/performance", get(api::performance_history))
+        .route("/api/v1/performance/summary", get(api::performance_summary))
         .route("/api/v1/machines/:id/:action", post(api::machine_action))
         .route("/api/v1/slots/:id/:action", post(api::slot_action))
         .route("/api/v1/instances", post(api::instance_create))
@@ -192,7 +212,7 @@ async fn async_main() -> Result<()> {
             passthrough_binds.push((port, slot.id, service));
         }
     }
-    let mut tasks = Vec::new();
+    let mut tasks = tokio::task::JoinSet::new();
     for (port, slot_id, service) in passthrough_binds {
         let outer_app = app.clone();
         let service2 = service.clone();
@@ -207,11 +227,10 @@ async fn async_main() -> Result<()> {
         let addr = format!("{bind_ip}:{port}");
         let listener = tokio::net::TcpListener::bind(&addr).await?;
         tracing::info!("passthrough {addr} → slot {slot2}/{service}");
-        tasks.push(tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, router).await {
-                tracing::error!(%e, "passthrough listener died");
-            }
-        }));
+        let shutdown = shutdown_rx.clone();
+        tasks.spawn(async move {
+            axum::serve(listener, router).with_graceful_shutdown(wait_shutdown(shutdown)).await
+        });
     }
 
     // STT-Port bei lokalem Mode gehört dem Router (Sidecar-Proxy).
@@ -228,22 +247,56 @@ async fn async_main() -> Result<()> {
         let addr = format!("{bind_ip}:{stt_port}");
         let listener = tokio::net::TcpListener::bind(&addr).await?;
         tracing::info!("stt local {addr} → sidecar {stt_url}");
-        tasks.push(tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, stt_router).await {
-                tracing::error!(%e, "stt listener died");
-            }
-        }));
+        let shutdown = shutdown_rx.clone();
+        tasks.spawn(async move {
+            axum::serve(listener, stt_router).with_graceful_shutdown(wait_shutdown(shutdown)).await
+        });
     }
 
     let app2 = app.clone();
     let addr = format!("{bind_ip}:{dash_port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("dashboard {addr} (Slots: {})", app2.cfg().slots.len());
-    axum::serve(listener, dash).await?;
-    for t in tasks {
-        let _ = t.await;
+    tasks.spawn(async move {
+        axum::serve(listener, dash).with_graceful_shutdown(wait_shutdown(shutdown_rx)).await
+    });
+    let unexpected = tokio::select! {
+        result = shutdown_signal() => { result?; None },
+        result = tasks.join_next() => Some(format!("listener exited: {result:?}")),
+        result = &mut connector_task => Some(format!("connector exited: {result:?}")),
+        result = &mut reconciler_task => Some(format!("reconciler exited: {result:?}")),
+    };
+    app.shutting_down.store(true, std::sync::atomic::Ordering::Relaxed);
+    app.reconcile_now.notify_one();
+    let _ = shutdown_tx.send(true);
+    connector_task.abort();
+    // Allow in-progress requests/control actions to finish, but never hang
+    // indefinitely on SSE/WS. A service manager can safely restart afterwards.
+    let graceful = async {
+        while tasks.join_next().await.is_some() {}
+        if unexpected.is_none() { let _ = (&mut reconciler_task).await; }
+    };
+    if tokio::time::timeout(std::time::Duration::from_secs(30), graceful).await.is_err() {
+        tracing::warn!("shutdown drain timed out after 30 seconds");
     }
+    tasks.abort_all();
+    reconciler_task.abort();
+    if let Some(reason) = unexpected { anyhow::bail!(reason); }
     Ok(())
+}
+
+async fn wait_shutdown(mut rx: tokio::sync::watch::Receiver<bool>) {
+    if !*rx.borrow() { let _ = rx.changed().await; }
+}
+
+async fn shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! { r = tokio::signal::ctrl_c() => r, _ = term.recv() => Ok(()) }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await
 }
 
 fn static_dir() -> std::path::PathBuf {

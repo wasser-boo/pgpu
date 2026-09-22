@@ -17,7 +17,7 @@ use std::path::{Path as StdPath, PathBuf};
 
 /// Assets über die Agent-WS-Session PUSHEN — der HTTP-Pull der Boxen ist auf
 /// Vast blockiert (Outbound bräuchte eBPF). Ablauf: Manifest schicken →
-/// Agent antwortet mit fehlenden IDs → Bytes Base64 (kleine Dateien ≤ 48 MB;
+/// Agent antwortet mit fehlenden IDs → Bytes Base64 (kleine Dateien ≤ 32 MiB;
 /// große Caches bleiben bewusst außen vor). Idempotent, aufrufbar nach
 /// Session-Aufbau und nach Dashboard-Uploads.
 pub async fn push_assets(app: &SharedApp, vast_id: i64) -> anyhow::Result<serde_json::Value> {
@@ -26,9 +26,8 @@ pub async fn push_assets(app: &SharedApp, vast_id: i64) -> anyhow::Result<serde_
     };
     let role = crate::api::role_str(inst.role);
     let manifest = manifest_for_role(app, &role);
-    if manifest.assets.is_empty() {
-        return Ok(serde_json::json!({"pushed": 0, "note": "keine Assets konfiguriert"}));
-    }
+    // Even an empty manifest is an explicit readiness handshake. New agents
+    // must not trust a stale gate file from a previous connection.
 
     // Dateipfade parallel zu den Manifest-IDs (id = "<gruppenlabel>:<name>").
     let mut paths: HashMap<String, PathBuf> = HashMap::new();
@@ -53,14 +52,8 @@ pub async fn push_assets(app: &SharedApp, vast_id: i64) -> anyhow::Result<serde_
         })
         .await
         .map_err(anyhow::Error::msg)?;
-    let needed: Vec<String> = data
-        .get("needed")
-        .and_then(|n| serde_json::from_value(n.clone()).ok())
-        .unwrap_or_default();
-    let required_missing: Vec<String> = data
-        .get("required_missing")
-        .and_then(|n| serde_json::from_value(n.clone()).ok())
-        .unwrap_or_default();
+    let needed: Vec<String> = serde_json::from_value(data.get("needed").cloned().ok_or_else(|| anyhow::anyhow!("agent omitted needed assets"))?)?;
+    let mut required_missing: Vec<String> = serde_json::from_value(data.get("required_missing").cloned().ok_or_else(|| anyhow::anyhow!("agent omitted required assets"))?)?;
 
     // 2. Fehlende Dateien einzeln pushen (Base64 über WS).
     let mut pushed = 0usize;
@@ -74,17 +67,13 @@ pub async fn push_assets(app: &SharedApp, vast_id: i64) -> anyhow::Result<serde_
             failed.push(format!("{id}: Datei fehlt im Router-Volume"));
             continue;
         };
-        let bytes = match std::fs::read(path) {
+        let bytes = match read_push_asset(path) {
             Ok(b) => b,
             Err(e) => {
                 failed.push(format!("{id}: lesen fehlgeschlagen: {e}"));
                 continue;
             }
         };
-        if bytes.len() > 48 * 1024 * 1024 {
-            failed.push(format!("{id}: {} MB — zu groß für WS-Push (bleibt lokal/HTTP)", bytes.len() / 1_048_576));
-            continue;
-        }
         let data_b64 = {
             use base64::Engine;
             base64::engine::general_purpose::STANDARD.encode(&bytes)
@@ -105,6 +94,13 @@ pub async fn push_assets(app: &SharedApp, vast_id: i64) -> anyhow::Result<serde_
         }
     }
 
+    if pushed > 0 {
+        // Report the FINAL gate, not the expected missing list before delivery.
+        let checked = app.hub.command(vast_id, |id| RouterCommand::Cmd {
+            id, command: Command::PushAssetsManifest { manifest: manifest.assets.clone() },
+        }).await.map_err(anyhow::Error::msg)?;
+        required_missing = serde_json::from_value(checked.get("required_missing").cloned().ok_or_else(|| anyhow::anyhow!("agent omitted final required assets"))?)?;
+    }
     let summary = serde_json::json!({
         "pushed": pushed,
         "needed": needed.len(),
@@ -128,6 +124,23 @@ pub async fn push_assets(app: &SharedApp, vast_id: i64) -> anyhow::Result<serde_
     }
     Ok(summary)
 }
+
+// Leave room for Base64 + JSON within the agent's 64 MiB WS message limit.
+const MAX_PUSH_BYTES: u64 = 32 * 1024 * 1024;
+fn read_push_asset(path: &StdPath) -> anyhow::Result<Vec<u8>> {
+    use std::io::Read;
+    let file = std::fs::File::open(path)?;
+    let meta = file.metadata()?;
+    anyhow::ensure!(meta.is_file() && meta.len() <= MAX_PUSH_BYTES, "asset exceeds 32 MiB WS limit or is not a regular file");
+    let mut bytes = Vec::new();
+    file.take(MAX_PUSH_BYTES + 1).read_to_end(&mut bytes)?;
+    anyhow::ensure!(bytes.len() as u64 <= MAX_PUSH_BYTES, "asset grew beyond WS limit");
+    Ok(bytes)
+}
+
+#[cfg(test)]
+#[path = "assets_tests.rs"]
+mod tests;
 
 const ALL: &str = "all";
 
@@ -217,7 +230,7 @@ pub fn manifest_for_role(app: &SharedApp, role: &str) -> AssetManifest {
             if !path.is_file() {
                 continue }
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-            if name.ends_with(".meta.toml") {
+            if name.starts_with('.') || name.ends_with(".meta.toml") {
                 continue;
             }
             let meta = meta_for(&path);
@@ -383,7 +396,8 @@ pub async fn list(app: SharedApp) -> Response {
     axum::Json(out).into_response()
 }
 
-/// Dashboard: Upload (multipart) → /data/assets/<scope>/<name>.
+/// Bounded raw-body upload → /data/assets/<scope>/<filename>.
+/// Nested files/slot overrides are not implemented; reject unused paths.
 pub async fn upload(
     app: SharedApp,
     scope: String,
@@ -394,21 +408,32 @@ pub async fn upload(
     if !["llm", "media", ALL].contains(&scope.as_str()) {
         return (StatusCode::BAD_REQUEST, "scope must be llm|media|all").into_response();
     }
-    let safe: String = name.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '/')).collect();
-    if safe.is_empty() || safe.contains("..") {
-        return (StatusCode::BAD_REQUEST, "invalid name").into_response();
+    if name.is_empty() || name.len() > 255 || name.starts_with('.') || name.contains("..")
+        || !name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')) {
+        return (StatusCode::BAD_REQUEST, "invalid filename (flat ASCII names only)").into_response();
     }
-    let dir = assets_root(&app).join(&scope);
+    let safe = name;
+    let root = assets_root(&app);
+    let dir = root.join(&scope);
+    if std::fs::create_dir_all(&dir).is_err() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "asset directory unavailable").into_response();
+    }
+    let confined = root.canonicalize().ok().zip(dir.canonicalize().ok()).is_some_and(|(root, dir)| dir.starts_with(root));
+    if !confined { return (StatusCode::BAD_REQUEST, "asset scope escapes asset root").into_response(); }
     let target = dir.join(&safe);
-    if let Some(parent) = target.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let body = req.into_body();
-    use http_body_util::BodyExt;
-    match body.collect().await {
-        Ok(c) => {
-            let bytes = c.to_bytes();
-            if std::fs::write(&target, &bytes).is_err() {
+    match axum::body::to_bytes(req.into_body(), MAX_PUSH_BYTES as usize).await {
+        Ok(bytes) => {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let tmp = dir.join(format!(".upload-{:016x}.tmp", rand::random::<u64>()));
+            let stored = (|| -> std::io::Result<()> {
+                let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
+                file.write_all(&bytes)?;
+                file.sync_all()?;
+                std::fs::rename(&tmp, &target)
+            })();
+            if stored.is_err() {
+                let _ = std::fs::remove_file(&tmp);
                 return (StatusCode::INTERNAL_SERVER_ERROR, "write failed").into_response();
             }
             app.events.emit(
@@ -421,7 +446,7 @@ pub async fn upload(
             );
             (StatusCode::OK, format!("uploaded {}/{}", scope, safe)).into_response()
         }
-        Err(_) => (StatusCode::BAD_REQUEST, "body error").into_response(),
+        Err(_) => (StatusCode::PAYLOAD_TOO_LARGE, "body error or asset exceeds 32 MiB").into_response(),
     }
 }
 

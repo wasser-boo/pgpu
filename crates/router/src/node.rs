@@ -66,7 +66,6 @@ async fn node_session(app: SharedApp, socket: WebSocket) {
     let _ = app
         .db
         .update_instance_agent(vast_id, nb_ip.as_deref(), false, "agent_connected");
-    app.hub.register(vast_id, inst.slot_id, nb_ip.clone(), services.clone());
     rx = Some(app.hub.register(vast_id, inst.slot_id, nb_ip.clone(), services));
     app.reconcile_now.notify_one();
 
@@ -118,11 +117,11 @@ async fn node_session(app: SharedApp, socket: WebSocket) {
                                 app.events.emit(&app.db, &kind, Some(inst.slot_id), Some(vast_id), &format!("{kind} von Agent {vast_id}"), &payload);
                             }
                             Ok(NodeMessage::CmdResult { id, ok, data }) => {
-                                app.hub.resolve(id, if ok { Ok(data) } else { Err(data.get("error").and_then(|e| e.as_str()).unwrap_or("command failed").to_string()) });
+                                app.hub.resolve(vast_id, id, if ok { Ok(data) } else { Err(data.get("error").and_then(|e| e.as_str()).unwrap_or("command failed").to_string()) });
                             }
                             Ok(NodeMessage::Term { .. }) | Ok(NodeMessage::TermEnd { .. }) => {
                                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
-                                    app.hub.relay_term(v);
+                                    app.hub.relay_term(vast_id, v);
                                 }
                             }
                             Err(e) => {

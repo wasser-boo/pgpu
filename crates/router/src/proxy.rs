@@ -9,6 +9,10 @@
 //! STT (`2700`) zeigt bei `stt.mode = "local"` auf den Router-eigenen
 //! Sidecar statt auf den media-Slot.
 
+#[cfg(test)]
+#[path = "proxy_tests.rs"]
+mod tests;
+
 use crate::state::{AppCtx, SharedApp};
 use axum::body::Body;
 use axum::extract::ws::Message;
@@ -22,7 +26,49 @@ use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::TokioExecutor;
 use std::time::Duration;
 
-type HttpClient = Client<HttpConnector, Body>;
+pub type HttpClient = Client<HttpConnector, Body>;
+
+/// Keep the traffic lease for the lifetime of the streamed body, including
+/// early client disconnects. Response headers do NOT mean the request is done.
+struct TrackedBody {
+    body: Body,
+    guard: Option<crate::state::InFlightGuard>,
+    observer: Option<crate::performance::UsageObserver>,
+}
+
+impl Drop for TrackedBody {
+    fn drop(&mut self) {
+        if let Some(observer) = self.observer.take() {observer.finish(false);}
+    }
+}
+
+impl hyper::body::Body for TrackedBody {
+    type Data = bytes::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>)
+        -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>>
+    {
+        let result = std::pin::Pin::new(&mut self.body).poll_frame(cx);
+        if let std::task::Poll::Ready(Some(Ok(ref frame))) = result {
+            if let (Some(observer), Some(data)) = (self.observer.as_mut(), frame.data_ref()) {observer.feed(data);}
+        }
+        let failed = matches!(result, std::task::Poll::Ready(Some(Err(_))));
+        if matches!(result, std::task::Poll::Ready(None | Some(Err(_)))) || self.body.is_end_stream() {
+            if let Some(observer) = self.observer.take() {observer.finish(!failed);}
+            self.guard.take();
+        }
+        result
+    }
+
+    fn is_end_stream(&self) -> bool { self.body.is_end_stream() }
+    fn size_hint(&self) -> hyper::body::SizeHint { self.body.size_hint() }
+}
+
+#[cfg(test)]
+fn tracked_body(body: Body, guard: Option<crate::state::InFlightGuard>) -> Body {
+    Body::new(TrackedBody { body, guard, observer: None })
+}
 
 pub fn http_client() -> HttpClient {
     let mut connector = HttpConnector::new();
@@ -37,12 +83,11 @@ const HOP_HEADERS: &[&str] = &[
     "proxy-authenticate",
     "proxy-authorization",
     "te",
-    "trailers",
+    "trailer",
     "transfer-encoding",
     "upgrade",
 ];
 
-#[allow(dead_code)]
 fn strip_hop_by_hop(headers: &mut HeaderMap, connection_tokens: &[String]) {
     for h in HOP_HEADERS {
         headers.remove(HeaderName::from_static(h));
@@ -55,16 +100,12 @@ fn strip_hop_by_hop(headers: &mut HeaderMap, connection_tokens: &[String]) {
 }
 
 fn connection_tokens(headers: &HeaderMap) -> Vec<String> {
-    headers
-        .get(header::CONNECTION)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| {
-            v.split(',')
-                .map(|s| s.trim().to_ascii_lowercase())
-                .filter(|s| !s.is_empty() && s != "keep-alive")
-                .collect()
-        })
-        .unwrap_or_default()
+    headers.get_all(header::CONNECTION).iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 pub struct UpstreamTarget {
@@ -122,12 +163,14 @@ async fn proxy_to_target(
     slot_id: Option<i64>,
     req: Request,
     path_and_query: String,
+    routed: bool,
 ) -> Response {
     let (mut parts, body) = req.into_parts();
     let is_websocket = wants_upgrade(&parts.headers, &parts.method);
     let tokens = connection_tokens(&parts.headers);
     // Origin strippen: nginx im llama-Fork und Vosk-WS antworten sonst 403.
     parts.headers.remove(header::ORIGIN);
+    strip_hop_by_hop(&mut parts.headers, &tokens);
 
     let authority = format!("{}:{}", target.nb_ip, target.port);
     let uri = format!("http://{authority}{path_and_query}");
@@ -145,7 +188,7 @@ async fn proxy_to_target(
             if k == header::HOST {
                 continue;
             }
-            h.insert(k, v.clone());
+            h.append(k, v.clone());
         }
         h.insert(header::HOST, HeaderValue::from_str(&authority).unwrap_or(HeaderValue::from_static("upstream")));
     }
@@ -156,34 +199,49 @@ async fn proxy_to_target(
     }
 
     let up_req = up_req.body(body).expect("upstream request");
-    let slot_guard = slot_id.map(|s| app.traffic.begin(s));
-
-    let resp = match client.request(up_req).await {
-        Ok(r) => r,
-        Err(e) => {
-            drop(slot_guard);
-            tracing::warn!(%e, %authority, "upstream request failed");
-            return bad_gateway(&format!("upstream {authority} unreachable: {e}"));
+    let slot_guard = match slot_id {
+        Some(id) => match app.traffic.try_begin(id) {
+            Some(guard) => Some(guard),
+            None => return service_unavailable(id, "benchmarking"),
+        },
+        None => None,
+    };
+    // Target selection happens before admission (and can await warming). A
+    // flip may have happened meanwhile. With the lease held, reject stale
+    // routing before sending ANY bytes upstream; /inst debug remains explicit.
+    if routed {
+        if let Some(id) = slot_id {
+            let current = app.targets.get(id).is_some_and(|(v, _, healthy)| healthy && v == target.vast_id)
+                || app.pool_routes.healthy(id).iter().any(|(v, _)| *v == target.vast_id);
+            if !current { return service_unavailable(id, "routing_changed"); }
         }
+    }
+    let mut observer = crate::performance::UsageObserver::new(app, target.vast_id, &path_and_query, &parts.method);
+
+    let resp = match tokio::time::timeout(Duration::from_secs(120), client.request(up_req)).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            tracing::warn!(%e, %authority, "upstream request failed");
+            if let Some(observer) = observer.take() {observer.finish(false);}
+            return bad_gateway("upstream unreachable");
+        }
+        Err(_) => {
+            if let Some(observer) = observer.take() {observer.finish(false);}
+            return Response::builder().status(StatusCode::GATEWAY_TIMEOUT)
+                .body(Body::from("upstream response headers timed out")).unwrap();
+        },
     };
 
     if resp.status() == StatusCode::SWITCHING_PROTOCOLS {
         return websocket_tunnel(target.vast_id, slot_id, resp, parts, tokens, slot_guard);
     }
 
-    let status = resp.status();
-    let mut builder = Response::builder().status(status);
-    {
-        let h = builder.headers_mut().unwrap();
-        for (k, v) in resp.headers().iter() {
-            if !HOP_HEADERS.contains(&k.as_str()) {
-                h.insert(k, v.clone());
-            }
-        }
-    }
-    let body = Body::new(resp.into_body());
-    let resp = builder.body(body).expect("response");
-    drop(slot_guard);
+    let (mut response_parts, body) = resp.into_parts();
+    let tokens = connection_tokens(&response_parts.headers);
+    strip_hop_by_hop(&mut response_parts.headers, &tokens);
+    if let Some(observer) = observer.as_mut() {observer.response(response_parts.status, &response_parts.headers);}
+    let body = Body::new(TrackedBody { body: Body::new(body), guard: slot_guard, observer });
+    let resp = Response::from_parts(response_parts, body);
     tag_response(resp, slot_id, Some(target.vast_id), "proxy")
 }
 
@@ -388,9 +446,8 @@ pub async fn passthrough(
         Ok(t) => t,
         Err(resp) => return resp,
     };
-    let client = http_client();
     let req = Request::from_parts(parts, body);
-    proxy_to_target(&app, &client, &target, Some(slot_id), req, path).await
+    proxy_to_target(&app, &app.proxy_client, &target, Some(slot_id), req, path, true).await
 }
 
 /// `/gpu/<slot>/<svc>/...` — Präfix strippen, Rest als Pfad an den Service.
@@ -430,9 +487,8 @@ pub async fn inst_path(
     let (parts, body) = req.into_parts();
     let path = parts.uri.path_and_query().map(|p| p.as_str().to_string()).unwrap_or_else(|| "/".into());
     let target = UpstreamTarget { vast_id, nb_ip, port: svc.port };
-    let client = http_client();
     let req = Request::from_parts(parts, body);
-    proxy_to_target(&app.0, &client, &target, Some(inst.slot_id), req, path).await
+    proxy_to_target(&app.0, &app.proxy_client, &target, Some(inst.slot_id), req, path, false).await
 }
 
 /// Entfernt die ersten `n` Pfad-Segmente (plus führenden Slash) aus der
@@ -447,8 +503,7 @@ fn strip_path_segments(req: Request, n: usize) -> Request {
             .splitn(n + 2, '/')
             .skip(n + 1)
             .next()
-            .unwrap_or("")
-            .trim_end_matches('/');
+            .unwrap_or("");
         let new_path = if rest.is_empty() { "/".to_string() } else { format!("/{rest}") };
         let new_uri = match query {
             Some(q) => format!("{new_path}?{q}"),
@@ -493,15 +548,8 @@ async fn proxy_stt_local(
         }
     }
     rreq = rreq.headers(hm);
-    // Body durchstreamen (Transcribe-Uploads).
-    let stream = futures::stream::once(async {
-        use http_body_util::BodyExt;
-        match body.collect().await {
-            Ok(c) => Ok::<_, std::io::Error>(c.to_bytes()),
-            Err(_) => Ok(bytes::Bytes::new()),
-        }
-    });
-    rreq = rreq.body(reqwest::Body::wrap_stream(stream));
+    // Forward upload chunks with backpressure; never buffer the entire audio file.
+    rreq = rreq.body(reqwest::Body::wrap_stream(body.into_data_stream()));
 
     match rreq.send().await {
         Ok(resp) => {
@@ -532,67 +580,50 @@ async fn stt_ws_relay(app: &SharedApp, parts: axum::http::request::Parts, _body:
         return bad_gateway("expected websocket upgrade");
     };
     let stt_base = app.cfg().stt.url.trim_end_matches('/').to_string();
+    let stt_base = stt_base.replacen("http://", "ws://", 1).replacen("https://", "wss://", 1);
     let path_owned = path.trim_start_matches('/').to_string();
     let app2 = app.clone();
     ws.on_upgrade(move |client_ws| async move {
+        use futures::SinkExt;
+        use tokio_tungstenite::tungstenite::Message as TMsg;
+        struct Session(SharedApp);
+        impl Drop for Session {
+            fn drop(&mut self) { self.0.stt_sessions.fetch_sub(1, Ordering::Relaxed); }
+        }
         app2.stt_sessions.fetch_add(1, Ordering::Relaxed);
+        let _session = Session(app2);
         let ws_url = format!("{}/{}", stt_base, path_owned);
-        let Ok((up_ws, _)) = tokio_tungstenite::connect_async(&ws_url).await else {
-            app2.stt_sessions.fetch_sub(1, Ordering::Relaxed);
-            return;
+        let Ok(Ok((up_ws, _))) = tokio::time::timeout(Duration::from_secs(10), tokio_tungstenite::connect_async(&ws_url)).await else { return; };
+        let (mut up_sink, mut up_stream) = up_ws.split();
+        let (mut sink, mut stream) = client_ws.split();
+        // Preserve frame types, apply backpressure, cancel the other direction
+        // as soon as either peer closes. No detached tasks/unbounded queues.
+        let upstream = async {
+            while let Some(Ok(msg)) = up_stream.next().await {
+                let msg = match msg {
+                    TMsg::Binary(b) => Message::Binary(b),
+                    TMsg::Text(t) => Message::Text(t),
+                    TMsg::Ping(p) => Message::Ping(p),
+                    TMsg::Pong(p) => Message::Pong(p),
+                    TMsg::Close(_) => break,
+                    TMsg::Frame(_) => continue,
+                };
+                if sink.send(msg).await.is_err() { break; }
+            }
         };
-        let (mut up_sink, mut up_stream) = futures::StreamExt::split(up_ws);
-        let (mut sink, mut stream) = futures::StreamExt::split(client_ws);
-
-        // up (Vosk) → client (Browser)
-        let up_task = {
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-            let reader = tokio::spawn(async move {
-                use tokio_tungstenite::tungstenite::Message as TMsg;
-                use futures::StreamExt;
-                while let Some(Ok(msg)) = up_stream.next().await {
-                    let bytes = match msg {
-                        TMsg::Binary(b) => b,
-                        TMsg::Text(t) => t.into_bytes(),
-                        TMsg::Ping(p) => p,
-                        TMsg::Pong(p) => p,
-                        TMsg::Close(_) => break,
-                        TMsg::Frame(_) => continue,
-                    };
-                    if tx.send(bytes).is_err() {
-                        break;
-                    }
-                }
-            });
-            tokio::spawn(async move {
-                use futures::SinkExt;
-                while let Some(bytes) = rx.recv().await {
-                    if sink.send(Message::Binary(bytes)).await.is_err() {
-                        break;
-                    }
-                }
-            });
-            reader
-        };
-
-        // client → up
-        let down_task = tokio::spawn(async move {
-            use futures::SinkExt;
-            use tokio_tungstenite::tungstenite::Message as TMsg;
+        let downstream = async {
             while let Some(Ok(msg)) = stream.next().await {
-                let bytes = match msg {
-                    Message::Binary(b) => b,
-                    Message::Text(t) => t.into_bytes(),
-                    Message::Ping(b) => b,
-                    Message::Pong(b) => b,
+                let msg = match msg {
+                    Message::Binary(b) => TMsg::Binary(b),
+                    Message::Text(t) => TMsg::Text(t),
+                    Message::Ping(p) => TMsg::Ping(p),
+                    Message::Pong(p) => TMsg::Pong(p),
                     Message::Close(_) => break,
                 };
-                if up_sink.send(TMsg::Binary(bytes)).await.is_err() {
-                    break;
-                }
+                if up_sink.send(msg).await.is_err() { break; }
             }
-        });
-        let _ = tokio::join!(up_task, down_task);
-        app2.stt_sessions.fetch_sub(1, Ordering::Relaxed);
+        };
+        tokio::select! { _ = upstream => {}, _ = downstream => {} }
+        // Dropping both sockets also covers a stalled/abruptly disconnected peer.
     })
 }

@@ -49,6 +49,8 @@
       <input type="hidden" name="command" value="run_acceptance">
       <button>Acceptance</button>
     </form>
+    <form method="post" action="/do/instances/{{ inst.vast_id }}/benchmark" onsubmit="return confirm('Begrenzten Benchmark starten? Slot bleibt währenddessen für neue Requests gesperrt (503). Config und Agent müssen Benchmarks erlauben.')"><button>Performance-Benchmark</button></form>
+    <a class="btn" href="/performance">Messdaten</a>
   </div>
   {% match cmd_output %}{% when Some with (o) %}<pre>{{ o }}</pre>{% when None %}{% endmatch %}
 </div>

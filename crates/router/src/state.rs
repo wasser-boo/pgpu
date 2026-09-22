@@ -19,17 +19,42 @@ pub struct Traffic {
 #[derive(Default, Clone, Copy)]
 pub struct SlotTraffic {
     pub in_flight: u32,
+    pub benchmarking: bool,
     /// Unix-Sekunden des letzten Requests.
     pub last_request: i64,
 }
 
 impl Traffic {
+    #[cfg(test)]
     pub fn begin(&self, slot_id: i64) -> InFlightGuard {
+        self.try_begin(slot_id).expect("test slot is not benchmarking")
+    }
+
+    /// Atomically exclude benchmark vs. new proxy requests; no check-then-act race.
+    pub fn try_begin(&self, slot_id: i64) -> Option<InFlightGuard> {
         let mut map = self.per_slot.lock().unwrap();
         let e = map.entry(slot_id).or_default();
+        if e.benchmarking { return None; }
         e.in_flight = e.in_flight.saturating_add(1);
         e.last_request = chrono::Utc::now().timestamp();
-        InFlightGuard { traffic: Arc::clone(&self.per_slot), slot_id }
+        Some(InFlightGuard { traffic: self.per_slot.clone(), slot_id, exclusive: false })
+    }
+    pub fn try_benchmark(&self, slot_id: i64) -> Option<InFlightGuard> {
+        let mut map = self.per_slot.lock().unwrap();
+        let e = map.entry(slot_id).or_default();
+        if e.in_flight > 0 || e.benchmarking { return None; }
+        e.in_flight = 1;
+        e.benchmarking = true;
+        Some(InFlightGuard { traffic: self.per_slot.clone(), slot_id, exclusive: true })
+    }
+
+    /// Run a synchronous routing mutation under the same gate as request and
+    /// benchmark admission. The callback must not call back into Traffic.
+    pub fn when_idle<T>(&self, slot_id: i64, change: impl FnOnce(SlotTraffic) -> T) -> Option<T> {
+        let map = self.per_slot.lock().unwrap();
+        let traffic = map.get(&slot_id).copied().unwrap_or_default();
+        if traffic.in_flight > 0 || traffic.benchmarking { return None; }
+        Some(change(traffic))
     }
 
     pub fn mark(&self, slot_id: i64) {
@@ -51,6 +76,7 @@ impl Traffic {
 pub struct InFlightGuard {
     traffic: Arc<Mutex<HashMap<i64, SlotTraffic>>>,
     slot_id: i64,
+    exclusive: bool,
 }
 
 impl Drop for InFlightGuard {
@@ -58,6 +84,7 @@ impl Drop for InFlightGuard {
         let mut map = self.traffic.lock().unwrap();
         if let Some(e) = map.get_mut(&self.slot_id) {
             e.in_flight = e.in_flight.saturating_sub(1);
+            if self.exclusive { e.benchmarking = false; }
             e.last_request = chrono::Utc::now().timestamp();
         }
     }
@@ -194,6 +221,11 @@ pub struct App {
     /// Pfad der config.toml — für Reload/Schreiben aus dem Dashboard.
     pub config_path: String,
     pub db: Db,
+    /// Serialize lifecycle/rental admission across API and reconciliation.
+    pub management: tokio::sync::Mutex<()>,
+    pub proxy_client: crate::proxy::HttpClient,
+    pub last_reconcile: std::sync::atomic::AtomicI64,
+    pub shutting_down: std::sync::atomic::AtomicBool,
     pub events: EventBus,
     pub traffic: Traffic,
     pub jobs: JobBatches,

@@ -9,31 +9,35 @@ FROM rust:1-bookworm AS agent-builder
 # Plattform — amd64 läuft auf den Vast-Boxen, arm64 fürs NAS (Multi-Arch).
 # Ohne buildx (plain docker build) bleibt x86_64-musl wie bisher.
 ARG TARGETPLATFORM
-RUN T=$([ "${TARGETPLATFORM:-linux/amd64}" = "linux/arm64" ] && echo aarch64-unknown-linux-musl || echo x86_64-unknown-linux-musl) && \
+RUN case "${TARGETPLATFORM:-linux/amd64}" in \
+      linux/amd64) T=x86_64-unknown-linux-musl ;; \
+      linux/arm64) T=aarch64-unknown-linux-musl ;; \
+      *) echo "unsupported platform" >&2; exit 1 ;; \
+    esac && \
     rustup target add "$T" && \
     apt-get update && apt-get install -y --no-install-recommends musl-tools && rm -rf /var/lib/apt/lists/* && \
     echo "$T" > /rusttarget
 ARG TARGETARCH=""
 WORKDIR /agent
-COPY --from=agent Cargo.toml ./
+COPY --from=agent Cargo.toml Cargo.lock ./
 COPY --from=agent src ./src
 # Cache-Mounts pro Arch (Multi-Arch-Parallel-Build darf target/Registry nicht
 # ungeschützt teilen — Race beim Entpacken, s. praxis-Dockerfile 21.09.):
 RUN --mount=type=cache,target=/agent-tgt \
     --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     T=$(cat /rusttarget) && \
-    CARGO_TARGET_DIR=/agent-tgt/${TARGETARCH:-host} cargo build --release --target "$T" && \
+    CARGO_TARGET_DIR=/agent-tgt/${TARGETARCH:-host} cargo build --locked --release --target "$T" && \
     cp "/agent-tgt/${TARGETARCH:-host}/$T/release/praxis-gpu-agent" /gpu-agent
 
 FROM rust:1-bookworm AS router-builder
 ARG TARGETARCH=""
 WORKDIR /build
 # Workspace-Metadaten zuerst (Layer-Cache für Deps), dann echte Quellen.
-COPY Cargo.toml Cargo.lock* ./
+COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 RUN --mount=type=cache,target=/build-tgt \
     --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
-    CARGO_TARGET_DIR=/build-tgt/${TARGETARCH:-host} cargo build --release && \
+    CARGO_TARGET_DIR=/build-tgt/${TARGETARCH:-host} cargo build --locked --release && \
     cp "/build-tgt/${TARGETARCH:-host}/release/praxis-router" /praxis-router
 
 FROM debian:bookworm-slim

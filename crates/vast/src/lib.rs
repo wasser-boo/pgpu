@@ -11,26 +11,36 @@ use reqwest::Client;
 use serde::de::DeserializeOwned;
 use std::time::Duration;
 
-const BASE: &str = "https://console.vast.ai/api/v0";
-const BASE_V1: &str = "https://console.vast.ai/api/v1";
+const API_ROOT: &str = "https://console.vast.ai";
 
 #[derive(Clone)]
 pub struct Vast {
     key: String,
     http: Client,
+    api_root: String,
     /// Vast Rate-Limit ~5 req/s (429 Too Many Requests): mind. 350 ms Abstand.
     last: std::sync::Arc<std::sync::Mutex<std::time::Instant>>,
 }
 
 impl Vast {
     pub fn new(key: impl Into<String>) -> Result<Self> {
+        Self::with_api_root(key, API_ROOT)
+    }
+
+    /// Alternate endpoint for local contract tests or a trusted API gateway.
+    /// Never derive this URL from untrusted request input (it receives the API key).
+    pub fn with_api_root(key: impl Into<String>, root: &str) -> Result<Self> {
+        let url = reqwest::Url::parse(root).context("Vast API root")?;
+        anyhow::ensure!(matches!(url.scheme(), "http" | "https") && url.host_str().is_some(), "invalid Vast API root");
         let http = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(30))
             .build()
             .context("http client")?;
         Ok(Self {
             key: key.into(),
             http,
+            api_root: root.trim_end_matches('/').to_string(),
             last: std::sync::Arc::new(std::sync::Mutex::new(
                 std::time::Instant::now() - Duration::from_secs(10),
             )),
@@ -64,11 +74,10 @@ impl Vast {
 
     /// `path`: v0-relativ ("/instances/…") oder absolut ("/api/v1/…").
     fn url_for(&self, path: &str) -> String {
-        const ROOT: &str = "https://console.vast.ai";
         if path.starts_with("/api/") {
-            format!("{ROOT}{path}")
+            format!("{}{path}", self.api_root)
         } else {
-            format!("{ROOT}{BASE}{path}")
+            format!("{}/api/v0{path}", self.api_root)
         }
     }
 
@@ -106,7 +115,7 @@ impl Vast {
     }
 
     async fn put<T: DeserializeOwned>(&self, path: &str, body: &impl serde::Serialize) -> Result<T> {
-        let url = format!("{BASE}{path}");
+        let url = self.url_for(path);
         for attempt in 0..3 {
             self.throttle().await;
             let resp = self.http.put(url.clone()).bearer_auth(&self.key).json(body).send().await.context("PUT request")?;
@@ -127,7 +136,7 @@ impl Vast {
     }
 
     async fn put_ok(&self, path: &str, body: &impl serde::Serialize) -> Result<()> {
-        let url = format!("{BASE}{path}");
+        let url = self.url_for(path);
         for attempt in 0..3 {
             self.throttle().await;
             let resp = self.http.put(url.clone()).bearer_auth(&self.key).json(body).send().await.context("PUT request")?;
@@ -148,10 +157,14 @@ impl Vast {
     }
 
     async fn delete_ok(&self, path: &str) -> Result<()> {
-        let url = format!("{BASE}{path}");
+        let url = self.url_for(path);
         for attempt in 0..3 {
             self.throttle().await;
             let resp = self.http.delete(url.clone()).bearer_auth(&self.key).send().await.context("DELETE request")?;
+            // DELETE is idempotent: an already absent contract is success.
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                return Ok(());
+            }
             if resp.status().as_u16() == 429 && attempt < 2 {
                 let ra: f64 = resp
                     .json::<serde_json::Value>()
@@ -172,7 +185,10 @@ impl Vast {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            anyhow::bail!("vast {what}: {status} {text}");
+            anyhow::bail!("vast {what}: {status} {text:.400}");
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+            anyhow::ensure!(v.get("success").and_then(|v| v.as_bool()) != Some(false), "vast {what}: rejected: {text:.400}");
         }
         Ok(())
     }
@@ -212,7 +228,7 @@ impl Vast {
             q[&k] = v;
         }
         q["type"] = if interruptible { "bid".into() } else { "on-demand".into() };
-        let url = format!("{BASE}/bundles/");
+        let url = self.url_for("/bundles/");
         // Wie alle anderen Calls durch den Throttle + 429-Retry — sonst wirft
         // der Reconciler-Burst (2 Slots × 2 Modi) die Suche gegen das
         // Vast-Ratelimit (5 req/s) und Create-Actions sterben an 429.
@@ -250,7 +266,6 @@ impl Vast {
     pub async fn instances(&self) -> Result<Vec<Instance>> {
         #[derive(serde::Deserialize)]
         struct V1 {
-            #[serde(default)]
             instances: Vec<Instance>,
             #[serde(default)]
             next_token: Option<String>,
@@ -267,17 +282,18 @@ impl Vast {
             out.extend(page.instances);
             match page.next_token {
                 Some(t) if !t.is_empty() => token = Some(t),
-                _ => break,
+                _ => return Ok(out),
             }
         }
-        Ok(out)
+        // A partial inventory must NEVER be interpreted as deleted instances.
+        anyhow::bail!("vast instances: pagination limit exceeded; refusing partial inventory")
     }
 
     /// Instanz mieten (`PUT /asks/{offer_id}/`).
     /// Antwortformat variiert → ID aus allen bekannten Feldern ziehen,
     /// Fallback: eigene Instanzliste nach Label durchsuchen.
     pub async fn create(&self, offer_id: i64, params: &CreateInstanceParams<'_>) -> Result<i64> {
-        let url = format!("{BASE}/asks/{offer_id}/");
+        let url = self.url_for(&format!("/asks/{offer_id}/"));
         let mut resp = None;
         for attempt in 0..3 {
             self.throttle().await;
@@ -374,10 +390,15 @@ impl Vast {
         if let Some(url) = f.result_url {
             for _ in 0..10 {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                let resp = self
-                    .http
-                    .get(&url)
-                    .bearer_auth(&self.key)
+                let parsed = reqwest::Url::parse(&url).context("logs result_url")?;
+                let root = reqwest::Url::parse(&self.api_root)?;
+                anyhow::ensure!(matches!(parsed.scheme(), "http" | "https"), "invalid logs URL scheme");
+                let mut request = self.http.get(parsed.clone());
+                // Signed log URLs can be hosted elsewhere; never leak the Vast key.
+                if parsed.origin() == root.origin() {
+                    request = request.bearer_auth(&self.key);
+                }
+                let resp = request
                     .send()
                     .await
                     .context("poll result_url")?;

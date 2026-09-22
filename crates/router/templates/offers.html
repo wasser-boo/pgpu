@@ -2,6 +2,8 @@
 {% block title %}pgpu — Offers{% endblock %}
 {% block content %}
 <h1>Angebote</h1>
+<p>Blacklist: <b>{% if activate_blacklist %}AN{% else %}AUS{% endif %}</b> · Whitelist: <b>{% if activate_whitelist %}AN — nur freigegebene Hosts{% else %}AUS{% endif %}</b> · Schalter unter <a href="/settings">Settings → [vast]</a>.</p>
+<p class="mut">Whitelist übergeht keine Hardware-/Preislimits. Score: aktuelle vergleichbare Benchmarks, kein universelles GPU-Rating. <a href="/performance">Messdaten-Katalog</a></p>
 <form method="get" action="/offers" class="card">
   <select name="slot">
     {% for s in slot_names %}<option value="{{ s.0 }}" {% if s.0 == slot_id %}selected{% endif %}>Slot {{ s.0 }} · {{ s.1 }}</option>{% endfor %}
@@ -17,12 +19,14 @@
 
 <div class="card">
 <table>
-<tr><th>ID</th><th>Host</th><th>GPU</th><th>RAM</th><th>Disk</th><th>inet ↓</th><th>Reliab.</th><th>min_bid</th><th>on-demand</th><th>Storage</th><th></th></tr>
+<tr><th>ID</th><th>Host</th><th>GPU / VRAM</th><th>RAM</th><th>Disk</th><th>inet ↓</th><th>Reliab.</th><th>min_bid</th><th>on-demand</th><th>Storage</th><th>Score</th><th>Prüfung</th><th></th></tr>
 {% for o in offers %}
-<tr{% if o.blacklisted %} style="opacity:0.45"{% endif %}>
+<tr{% if !o.eligible %} style="opacity:0.65"{% endif %}>
   <td class="mono">{{ o.id }}</td>
   <td class="mono">{% if o.blacklisted %}<span class="badge b-bad" title="Host blacklisted: {{ o.machine_fails }} Fails">⛔ {{ o.machine_id }}</span>{% else %}{{ o.machine_id }}{% if o.machine_fails > 0 %} <span class="badge b-warn" title="Fails">{{ o.machine_fails }}✗</span>{% endif %}{% endif %}</td>
-  <td>{{ o.gpu_name }}</td>
+  <td>{{ o.gpu_name }} · {{ o.gpu_ram_gb|fmt1 }} GiB{% if o.whitelisted %}<br><span class="badge b-ok">Whitelist</span>{% endif %}
+    <form method="post" action="/do/machines/{{ o.machine_id }}/whitelist"><button>Host freigeben</button></form>
+  </td>
   <td class="mono">{{ o.cpu_ram_gb|fmt1 }} GB</td>
   <td class="mono">{{ o.disk_gb|fmt0 }} GB</td>
   <td class="mono">{{ o.inet_down|fmt0 }} Mbps</td>
@@ -30,13 +34,15 @@
   <td class="mono">{{ o.min_bid|fmt4 }} $/h</td>
   <td class="mono">{{ o.dph_total|fmt4 }} $/h</td>
   <td class="mono">{{ o.storage_cost|fmt3 }} $/GB·Mo</td>
+  <td>{{ o.score }}</td>
+  <td>{% if o.eligible %}<span class="badge b-ok">geeignet</span>{% else %}{{ o.rejection }}{% endif %}</td>
   <td>
     <form method="post" action="/do/rent">
       <input type="hidden" name="offer_id" value="{{ o.id }}">
       <input type="hidden" name="slot_id" value="{{ slot_id }}">
       <input type="hidden" name="mode" value="{{ mode }}">
       Disk <input name="disk_gb" size="4" value="{{ default_disk_gb }}">
-      <button>{% if o.blacklisted %}Trotzdem mieten{% else %}Mieten{% endif %}</button>
+      <button {% if !o.eligible %}disabled{% endif %}>Mieten</button>
     </form>
   </td>
 </tr>
@@ -46,10 +52,10 @@
 {% if offers.is_empty() %}<p class="mut">Keine Angebote — Suche fehlgeschlagen oder Filter zu eng. Vast-Key gesetzt?</p>{% endif %}
 
 {% if !machines.is_empty() %}
-<h2>Host-Bilanz (Fails → Blacklist)</h2>
+<h2>Host-Bilanz (Whitelist / Blacklist)</h2>
 <div class="card">
 <table>
-<tr><th>Machine</th><th>Fails</th><th>Blacklist</th><th>Letzter Fail</th><th>Grund</th><th></th></tr>
+<tr><th>Machine</th><th>Fails</th><th>Listen</th><th>Letzter Fail</th><th>Grund</th><th></th></tr>
 {% for m in machines %}
 <tr>
   <td class="mono">{{ m.machine_id }}</td>
@@ -58,6 +64,11 @@
   <td class="mono">{% match m.last_fail_at %}{% when Some with (t) %}{{ t }}{% when None %}—{% endmatch %}</td>
   <td>{{ m.note }}</td>
   <td>
+    {% if m.whitelisted %}
+    <span class="badge b-ok">Whitelist</span><form method="post" action="/do/machines/{{ m.machine_id }}/unwhitelist"><button>Freigabe entfernen</button></form>
+    {% else %}
+    <form method="post" action="/do/machines/{{ m.machine_id }}/whitelist"><button>Freigeben</button></form>
+    {% endif %}
     {% if m.blacklisted %}
     <form method="post" action="/do/machines/{{ m.machine_id }}/unblacklist"><button>Entsperren</button></form>
     {% else %}

@@ -10,12 +10,15 @@ use chrono::{Datelike, Timelike};
 use rand::RngCore;
 use std::collections::HashMap;
 
+pub use crate::operations::{destroy_instance, start_instance, stop_instance};
+
 pub async fn run(app: SharedApp) {
     let poll = std::time::Duration::from_secs(app.cfg().vast.poll_interval_s.max(5));
     let offer_every = std::time::Duration::from_secs(app.cfg().vast.offer_poll_s.max(15));
     let mut offer_due = tokio::time::Instant::now();
     let mut meter_hour = tokio::time::Instant::now() + std::time::Duration::from_secs(3600);
     loop {
+        if app.shutting_down.load(std::sync::atomic::Ordering::Relaxed) { return; }
         tokio::select! {
             _ = tokio::time::sleep(poll) => {},
             _ = app.reconcile_now.notified() => {
@@ -31,8 +34,10 @@ pub async fn run(app: SharedApp) {
                 offer_due = tokio::time::Instant::now() + offer_every;
             }
         }
-        if let Err(e) = tick(&app).await {
-            tracing::warn!(error = format!("{e:#}"), "reconcile tick failed");
+        if app.shutting_down.load(std::sync::atomic::Ordering::Relaxed) { return; }
+        match tick(&app).await {
+            Ok(()) => app.last_reconcile.store(chrono::Utc::now().timestamp(), std::sync::atomic::Ordering::Relaxed),
+            Err(e) => tracing::warn!(error = format!("{e:#}"), "reconcile tick failed"),
         }
         if tokio::time::Instant::now() >= meter_hour {
             meter_hour = tokio::time::Instant::now() + std::time::Duration::from_secs(3600);
@@ -42,6 +47,9 @@ pub async fn run(app: SharedApp) {
 }
 
 pub async fn tick(app: &SharedApp) -> anyhow::Result<()> {
+    // Account elapsed time even if the provider inventory request fails.
+    meter(app)?;
+    crate::operations::retry_pending(app).await?;
     // 0. Zeitpläne ([[schedule]]-Regeln) — vor allem anderen, damit eine
     //    18:00-Destroy-All-Regel die Boxen weg räumt, bevor der Tick sie
     //    wieder als "soll laufen" betrachtet.
@@ -89,18 +97,21 @@ pub async fn tick(app: &SharedApp) -> anyhow::Result<()> {
         // 2b. Unreachable-Stopper: Vast sagt running (= GPU-Geld brennt),
         //     Agent bleibt tot → stoppen (Disk bleibt warm), damit die Box
         //     nicht unmetered weiterläuft. Fail wurde beim Übergang gezählt.
-        if inst.state == "unreachable" && inst.actual_status == "running" {
+        if inst.state == "unreachable" && inst.actual_status == "running" && !inst.pinned && inst.mode != Mode::Manual
+            && !app.db.slot_pins().iter().any(|(slot, pin)| *slot == inst.slot_id && pin.is_some()) {
             let connected = app.hub.heartbeat(inst.vast_id).is_some();
             let silence = app.hub.last_seen(inst.vast_id).map(|s| now_ts - s).unwrap_or(i64::MAX);
             if !connected && silence > app.cfg().vast.unreachable_stop_after_s.max(180) {
-                let _ = stop_instance(
-                    app,
-                    inst.vast_id,
-                    "unreachable: Vast running, Agent tot — gestoppt, Disk bleibt (Wake startet neu)",
-                );
+                let _ = crate::operations::automatic_request(
+                    app, inst.vast_id, "stop",
+                    "unreachable: Vast running, Agent tot — Stop angefordert, Disk bleibt",
+                ).await;
             }
         }
     }
+
+    // Explicit opt-in only; attempt/cooldown persisted before any workload.
+    crate::performance::auto_benchmarks(app).await;
 
     // 3. Busy pro Instanz (Agent-Busy, Service-Probes, In-flight).
     for inst in app.db.instances(false) {
@@ -113,51 +124,11 @@ pub async fn tick(app: &SharedApp) -> anyhow::Result<()> {
         }
     }
 
-    // 4. Targets-Cache aktualisieren (hot fürs Proxy).
-    for slot in &app.cfg().slots {
-        // Invariante heilen: Active darf nie auf eine zerstörte Instanz
-        // zeigen. Alte mark_destroyed-Pfade (vor 20.09.-Fix) ließen sie
-        // stehen → Proxy 502t auf die tote Box statt 503+Wake zu antworten.
-        let active = match app.db.active_instance(slot.id) {
-            Some(id) => match app.db.instance(id) {
-                Some(inst) if inst.destroyed_at.is_none() => Some(id),
-                _ => {
-                    let _ = app.db.clear_active_instance(slot.id, id);
-                    tracing::info!(slot_id = slot.id, vast_id = id, "Active-Invariante geheilt: zerstörte Instanz ausgetragen");
-                    None
-                }
-            },
-            None => None,
-        };
-        let mut target: Option<(i64, Option<String>, bool)> = None;
-        if let Some(vast_id) = active {
-            if let Some(inst) = app.db.instance(vast_id) {
-                let nb_ip = inst.nb_ip.clone().or_else(|| app.hub.nb_ip(vast_id));
-                target = Some((vast_id, nb_ip, inst.healthy));
-            }
-        }
-        match target {
-            Some((v, n, h)) => app.targets.set(slot.id, Some(v), n, h),
-            None => app.targets.set(slot.id, None, None, false),
-        }
-        // Pool-Routing: ALLE healthy Instanzen des Slots (Multi-Instanz-
-        // Slots, Round-Robin + Job-Affinität im Proxy). Die aktive (primäre)
-        // Box bleibt davon unberührt — sie ist einfach mit dabei.
-        let healthy_targets: Vec<(i64, String)> = app
-            .db
-            .instances(false)
-            .into_iter()
-            .filter(|r| r.slot_id == slot.id && r.healthy && r.state == "healthy" && r.actual_status == "running")
-            .filter_map(|r| {
-                let ip = r.nb_ip.clone().or_else(|| app.hub.nb_ip(r.vast_id))?;
-                Some((r.vast_id, ip))
-            })
-            .collect();
-        app.pool_routes.set_healthy(slot.id, healthy_targets);
+    // Do not race cache publication with a confirmed stop/destroy or flip.
+    {
+        let _lock = app.management.lock().await;
+        for slot in &app.cfg().slots { refresh_slot_routes(app, slot.id)?; }
     }
-
-    // 5. Metering (dt × Rate).
-    meter(app).await;
 
     // 6. Snapshot bauen + Policy.
     let snap = build_snapshot(app).await?;
@@ -170,7 +141,35 @@ pub async fn tick(app: &SharedApp) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Caller holds management lock. A warm=1 replacement MUST NOT receive
+/// traffic before FlipSlot admits it; otherwise pool routing bypasses idle-only.
+pub fn refresh_slot_routes(app: &SharedApp, slot_id: i64) -> anyhow::Result<()> {
+    let cfg = app.cfg();
+    let slot = cfg.slot(slot_id).ok_or_else(|| anyhow::anyhow!("unknown slot"))?;
+    let pending = app.db.pending_operations()?;
+    let usable = |r: &crate::db::InstanceRow| r.slot_id == slot_id && r.role == slot.role
+        && r.destroyed_at.is_none() && r.healthy && r.state == "healthy" && r.actual_status == "running"
+        && r.intended_status == "running" && !pending.iter().any(|p| p.0 == r.vast_id);
+    let active = app.db.active_instance(slot_id);
+    let row = active.and_then(|id| app.db.instance(id));
+    if row.as_ref().is_none_or(|r| r.destroyed_at.is_some()) {
+        if let Some(id) = active { app.db.clear_active_instance(slot_id, id)?; }
+    }
+    if let Some(r) = row.as_ref().filter(|r| r.destroyed_at.is_none()) {
+        app.targets.set(slot_id, Some(r.vast_id), r.nb_ip.clone().or_else(|| app.hub.nb_ip(r.vast_id)), usable(r));
+    } else {
+        app.targets.set(slot_id, None, None, false);
+    }
+    let targets = app.db.instances(false).into_iter().filter(usable)
+        .filter(|r| slot.pool.warm > 1 || Some(r.vast_id) == active)
+        .filter_map(|r| r.nb_ip.clone().or_else(|| app.hub.nb_ip(r.vast_id)).map(|ip| (r.vast_id, ip))).collect();
+    app.pool_routes.set_healthy(slot_id, targets);
+    Ok(())
+}
+
 async fn sync_vast(app: &SharedApp, list: &[praxis_vast::Instance]) -> anyhow::Result<()> {
+    let _lock = app.management.lock().await;
+    meter(app)?;
     let by_id: HashMap<i64, &praxis_vast::Instance> = list.iter().map(|i| (i.id, i)).collect();
     for row in app.db.instances(true) {
         let Some(v) = by_id.get(&row.vast_id) else {
@@ -188,7 +187,16 @@ async fn sync_vast(app: &SharedApp, list: &[praxis_vast::Instance]) -> anyhow::R
         };
         // machine_id nicht wischen, wenn Vast ihn diesmal nicht liefert.
         let machine_id = v.machine_id.unwrap_or(row.machine_id);
-        let _ = app.db.update_instance_vast(row.vast_id, &v.actual_or("loading"), v.min_bid.unwrap_or(0.0), v.dph_total.unwrap_or(0.0), machine_id, v.gpu_or(""));
+        app.db.update_instance_vast(row.vast_id, &v.actual_or("loading"), v.min_bid.unwrap_or(row.min_bid), v.dph_total.unwrap_or(row.dph_total), machine_id, v.gpu_or(&row.gpu_name))?;
+        // Provider acknowledgement is not always immediate convergence. Retry
+        // stopped intent if the next inventory still reports a running GPU.
+        if row.state != "destroyed" && row.intended_status == "stopped" {
+            if v.actual_or("") == "running" {
+                app.db.queue_operation(row.vast_id, "stop", "reconcile: provider still running")?;
+            } else if v.actual_or("") == "stopped" {
+                app.db.complete_stop(row.vast_id)?;
+            }
+        }
 
         // Preemption: wir WOLLEN running, Vast sagt nein.
         let intended_run = v.intended_or("").is_empty() || v.intended_or("") == "running" || row.intended_status == "running";
@@ -207,7 +215,7 @@ async fn sync_vast(app: &SharedApp, list: &[praxis_vast::Instance]) -> anyhow::R
             // Weg hoch = wackliger Host (Spike: 3× 3090 hintereinander),
             // kein normaler Outbid einer laufenden Instanz.
             // Von unreachable kommend wurde die Episode schon gezählt.
-            if !row.healthy && row.state != "unreachable" {
+            if !row.ever_healthy && row.state != "unreachable" {
                 record_machine_fail(app, row.slot_id, row.vast_id, machine_id, "preempt während warmup");
             }
             app.events.emit(
@@ -311,7 +319,7 @@ fn record_machine_fail(app: &SharedApp, slot_id: i64, instance_id: i64, machine_
     };
     let threshold = app.cfg().vast.blacklist_after_fails;
     let already = app.db.machine_stat(machine_id).map(|m| m.blacklisted).unwrap_or(false);
-    if threshold >= 1 && !already && fails >= threshold {
+    if app.cfg().vast.activate_blacklist && threshold >= 1 && !already && fails >= threshold {
         let _ = app.db.set_machine_blacklist(machine_id, true, kind);
         app.events.emit(
             &app.db,
@@ -384,27 +392,9 @@ async fn compute_busy(app: &SharedApp, inst: &crate::db::InstanceRow) -> (bool, 
     (false, String::new())
 }
 
-async fn meter(app: &SharedApp) {
-    let date = crate::node::local_date(app);
-    for inst in app.db.instances(false) {
-        let Some(created) = crate::db::parse_iso(&inst.created_at) else { continue };
-        let now = chrono::Utc::now();
-        let last = app.hub.last_seen(inst.vast_id).map(|t| chrono::DateTime::from_timestamp(t, 0).unwrap_or(created)).unwrap_or(created);
-        let dt_h = (now - last).num_milliseconds() as f64 / 3_600_000.0;
-        if dt_h <= 0.0 {
-            continue;
-        }
-        let running = inst.actual_status == "running" && matches!(inst.state.as_str(), "healthy" | "agent_connected" | "booting" | "provisioning" | "draining" | "unreachable");
-        let rate = match inst.mode {
-            Mode::Interruptible => inst.bid_usd_h,
-            _ => inst.dph_total,
-        };
-        let metered = if running { rate * dt_h } else { 0.0 };
-        let storage = inst.storage_usd_h * dt_h;
-        if metered > 0.0 || storage > 0.0 {
-            let _ = app.db.meter(&date, inst.vast_id, metered, storage);
-        }
-    }
+pub(crate) fn meter(app: &SharedApp) -> anyhow::Result<()> {
+    let tz = app.cfg().router.tz.parse::<chrono_tz::Tz>()?;
+    app.db.meter_until(chrono::Utc::now(), tz)
 }
 
 async fn reconcile_credit(app: &SharedApp) {
@@ -413,24 +403,14 @@ async fn reconcile_credit(app: &SharedApp) {
     let Ok(user) = vast.current_user().await else { return };
     let date = crate::node::local_date(app);
     let metered = app.db.spent_today(&date);
-    match app.db.last_credit(&date) {
-        Some(start) => {
-            let spent = (start - user.credit).max(0.0);
-            let _ = app.db.set_reconciled(&date, spent, user.credit);
-            if metered > 0.05 && (spent - metered).abs() / metered.max(0.05) > 0.25 {
-                app.events.emit(
-                    &app.db,
-                    "budget_drift",
-                    None,
-                    None,
-                    &format!("Metering {metered:.2} $ vs. Kontostand {spent:.2} $ — Differenz > 25 %"),
-                    &serde_json::json!({"metered": metered, "reconciled": spent}),
-                );
-            }
+    match app.db.record_credit(&date, user.credit) {
+        Ok(spent) if metered > 0.05 && (spent - metered).abs() / metered.max(0.05) > 0.25 => {
+            app.events.emit(&app.db, "budget_drift", None, None,
+                &format!("Metering {metered:.2} $ vs. Kontostand-Deltas {spent:.2} $ — Differenz > 25 %"),
+                &serde_json::json!({"metered":metered,"reconciled":spent}));
         }
-        None => {
-            let _ = app.db.set_reconciled(&date, 0.0, user.credit);
-        }
+        Err(e) => tracing::warn!(%e, "balance reconciliation failed"),
+        _ => {}
     }
 }
 
@@ -483,6 +463,9 @@ pub async fn search_slot_offers(
         inet_down: o.inet_down,
         reliability2: o.reliability2.unwrap_or(0.0),
         disk_bw: o.disk_bw,
+        num_gpus: o.num_gpus,
+        cuda_max_good: o.cuda_max_good,
+        cpu_cores: o.cpu_cores,
     };
     for o in &interruptible {
         let snap = snap_from(o, o.min_bid_or(0.0).max(0.0), o.dph_or(0.0));
@@ -498,22 +481,27 @@ pub async fn search_slot_offers(
         }
     }
     let offers: Vec<OfferSnapshot> = by_id.into_values().collect();
-    let _ = app.db.cache_offers(slot_id, &slot.search_query, &serde_json::to_string(&offers)?);
+    app.db.observe_offers(&offers)?;
+    app.db.cache_offers(slot_id, &slot.search_query, &serde_json::to_string(&offers)?)?;
     Ok(offers)
 }
 
-fn best_candidate(app: &SharedApp, slot_id: i64) -> Option<OfferSnapshot> {
+pub(crate) fn best_candidate(app: &SharedApp, slot_id: i64) -> Option<OfferSnapshot> {
     let (_, json) = app.db.cached_offers(slot_id)?;
     let offers: Vec<OfferSnapshot> = serde_json::from_str(&json).ok()?;
     let slot = app.cfg().slot(slot_id)?.clone();
     let on_demand = slot.policy().mode == praxis_policy::SlotMode::OnDemand;
+    let mode = if on_demand {Mode::OnDemand} else {Mode::Interruptible};
+    let scores = if slot.performance.enabled && slot.performance.score.enabled {
+        crate::performance::host_scores(app, &slot).unwrap_or_default()
+    } else {HashMap::new()};
     // Blacklist: Hosts mit ≥ blacklist_after_fails Fails werden nie mehr
     // automatisch gemietet (machine_id 0 = unbekannt/alter Cache → neutral).
     let blacklisted: std::collections::HashSet<i64> = app
         .db
         .machine_stats()
         .into_iter()
-        .filter(|m| m.blacklisted)
+        .filter(|m| app.cfg().vast.activate_blacklist && m.blacklisted)
         .map(|m| m.machine_id)
         .collect();
     // Pool-Redundanz: Maschinen, auf denen schon eine LIVE-Instanz dieses
@@ -528,6 +516,8 @@ fn best_candidate(app: &SharedApp, slot_id: i64) -> Option<OfferSnapshot> {
         .collect();
     offers
         .into_iter()
+        .filter(|o| crate::catalog::assess(app, &slot, o, mode,
+            praxis_policy::eligibility::rental_price(o, mode, &slot.bid), slot.disk_gb).eligible)
         // Preisfenster [rent_min_usd_h, ceiling_usd_h]: hartes Budget —
         // Offers außerhalb tauchen weder im Ranking noch im Dashboard-
         // Picker auf („20-€/h-Boxen" unmöglich, 21.09.).
@@ -549,9 +539,11 @@ fn best_candidate(app: &SharedApp, slot_id: i64) -> Option<OfferSnapshot> {
             }
         })
         .min_by(|a, b| {
-            a.score(slot.disk_gb, slot.traffic_gb, 4.0)
-                .partial_cmp(&b.score(slot.disk_gb, slot.traffic_gb, 4.0))
-                .unwrap()
+            let rank = |o: &OfferSnapshot| {
+                let score = scores.get(&(o.machine_id, crate::performance::allocation_key(o, slot.disk_gb))).copied();
+                slot.performance.score.rank_cost(o.score(slot.disk_gb, slot.traffic_gb, 4.0), score)
+            };
+            rank(a).total_cmp(&rank(b)).then_with(|| a.id.cmp(&b.id))
         })
 }
 
@@ -619,6 +611,12 @@ pub async fn build_snapshot(app: &SharedApp) -> anyhow::Result<Snapshot> {
                     (lr, h) => lr.or(h),
                 }
             };
+            let lifecycle: praxis_common::Lifecycle = serde_json::from_str(&row.lifecycle).unwrap_or_default();
+            let resume_at = match &lifecycle {
+                praxis_common::Lifecycle::Sleep { resume_at: Some(at), .. } => row.stopped_since.as_deref()
+                    .and_then(crate::db::parse_iso).and_then(|since| crate::schedule_time::next_resume(since, at, app.cfg().router.tz.parse().unwrap_or(chrono_tz::UTC))),
+                _ => None,
+            };
             instances.push(InstanceSnapshot {
                 vast_id: row.vast_id,
                 offer_id: row.offer_id,
@@ -627,11 +625,11 @@ pub async fn build_snapshot(app: &SharedApp) -> anyhow::Result<Snapshot> {
                 role: row.role,
                 slot_id: row.slot_id,
                 mode: row.mode,
-                lifecycle: serde_json::from_str(&row.lifecycle).unwrap_or_default(),
+                lifecycle,
                 state,
                 actual_status: row.actual_status.clone(),
                 intended_status: row.intended_status.clone(),
-                healthy: row.healthy,
+                healthy: row.ever_healthy,
                 busy: row.busy,
                 busy_reason: row.busy_reason.clone(),
                 min_bid: row.min_bid,
@@ -639,6 +637,8 @@ pub async fn build_snapshot(app: &SharedApp) -> anyhow::Result<Snapshot> {
                 dph_total: row.dph_total,
                 storage_usd_h: row.storage_usd_h,
                 created_at: crate::db::parse_iso(&row.created_at).unwrap_or_default(),
+                boot_started_at: app.db.boot_started_at(row.vast_id)?.unwrap_or_else(chrono::Utc::now),
+                resume_at,
                 idle_since,
                 stopped_since: row.stopped_since.as_deref().and_then(crate::db::parse_iso),
                 last_seen: None,
@@ -695,6 +695,9 @@ fn parse_state(s: &str) -> InstanceState {
 // ---------------------------------------------------------------- Actions
 
 pub async fn apply_action(app: &SharedApp, action: &Action) -> anyhow::Result<()> {
+    if !app.db.auto_rent_enabled() && matches!(action, Action::Create { .. } | Action::Start { .. }) {
+        return Ok(());
+    }
     match action {
         Action::Create { slot_id, offer_id, mode, price_usd_h, disk_gb, reason } => {
             // Kein Doppel-Create über das Pool-Ziel hinaus: Aktive Instanzen
@@ -715,7 +718,9 @@ pub async fn apply_action(app: &SharedApp, action: &Action) -> anyhow::Result<()
                         )
                 })
                 .count();
-            if actives >= pool_warm {
+            let replacement = reason.starts_with("bid pressure") || reason.starts_with("optimize cost");
+            let target = pool_warm + usize::from(replacement);
+            if actives >= target {
                 tracing::debug!(slot_id, actives, pool_warm, "create skipped: Pool-Ziel schon unterwegs/erreicht");
                 return Ok(());
             }
@@ -743,16 +748,16 @@ pub async fn apply_action(app: &SharedApp, action: &Action) -> anyhow::Result<()
             let slot = app.cfg().slot(*slot_id).ok_or_else(|| anyhow::anyhow!("slot {slot_id} fehlt"))?.clone();
             let price = price_usd_h.unwrap_or(offer.min_bid * (1.0 + slot.bid.margin));
             let disk = disk_gb.unwrap_or(slot.disk_gb);
-            let vast_id = create_instance(app, *slot_id, &offer, *mode, price, disk, praxis_common::Lifecycle::Auto, reason).await?;
+            let vast_id = create_instance(app, *slot_id, &offer, *mode, price, disk, praxis_common::Lifecycle::Auto, true, reason).await?;
             let _ = vast_id;
             Ok(())
         }
         Action::Start { instance_id, reason } => {
-            start_instance(app, *instance_id, reason).await?;
+            crate::operations::start_automatic_instance(app, *instance_id, reason).await?;
             Ok(())
         }
         Action::Stop { instance_id, reason } => {
-            stop_instance(app, *instance_id, reason)?;
+            crate::operations::automatic_request(app, *instance_id, "stop", reason).await?;
             Ok(())
         }
         Action::Destroy { instance_id, reason } => {
@@ -773,46 +778,27 @@ pub async fn apply_action(app: &SharedApp, action: &Action) -> anyhow::Result<()
                     .await;
                 }
             }
-            destroy_instance(app, *instance_id, reason).await?;
+            crate::operations::automatic_request(app, *instance_id, "destroy", reason).await?;
             Ok(())
         }
         Action::ChangeBid { instance_id, price_usd_h, reason } => {
-            let vast_client = app.vast.lock().unwrap().clone();
-            let Some(vast) = vast_client else {
-                anyhow::bail!("vast api not configured");
-            };
-            vast.set_bid(*instance_id, *price_usd_h).await?;
-            let _ = app.db.set_instance_bid(*instance_id, *price_usd_h);
-            app.events.emit(
-                &app.db,
-                "bid_changed",
-                app.db.instance(*instance_id).map(|i| i.slot_id),
-                Some(*instance_id),
-                reason,
-                &serde_json::json!({"price": price_usd_h}),
-            );
-            Ok(())
+            crate::operations::change_automatic_bid(app, *instance_id, *price_usd_h, reason).await
         }
-        Action::FlipSlot { slot_id, to_instance, reason, .. } => {
-            let nb = app.db.instance(*to_instance).and_then(|i| i.nb_ip.clone().or_else(|| app.hub.nb_ip(*to_instance)));
-            app.db.set_active_instance(*slot_id, Some(*to_instance))?;
-            app.targets.set(*slot_id, Some(*to_instance), nb, true);
-            app.events.emit(&app.db, "slot_flipped", Some(*slot_id), Some(*to_instance), reason, &serde_json::json!({}));
-            Ok(())
+        Action::FlipSlot { slot_id, from_instance, to_instance, reason } => {
+            crate::operations::flip_slot(app, *slot_id, *from_instance, *to_instance, reason).await
         }
         Action::SwapOut { instance_id, destroy, reason } => {
-            let traffic = app
-                .db
-                .instance(*instance_id)
-                .map(|i| app.traffic.snapshot(i.slot_id).in_flight)
-                .unwrap_or(0);
-            if traffic > 0 {
-                let _ = app.db.set_instance_state(*instance_id, "draining");
+            let inst = app.db.instance(*instance_id).ok_or_else(|| anyhow::anyhow!("unknown instance"))?;
+            // A rejected/deferred FlipSlot must NEVER retire the still-active box.
+            anyhow::ensure!(app.db.active_instance(inst.slot_id) != Some(*instance_id), "swap deferred: instance is still active");
+            anyhow::ensure!(!inst.pinned && inst.mode != Mode::Manual, "swap blocked by pin/manual mode");
+            if app.traffic.snapshot(inst.slot_id).in_flight > 0 || inst.busy {
+                app.db.set_instance_state(*instance_id, "draining")?;
                 Ok(())
             } else if *destroy {
-                destroy_instance(app, *instance_id, reason).await
+                crate::operations::automatic_request(app, *instance_id, "destroy", reason).await
             } else {
-                stop_instance(app, *instance_id, reason)
+                crate::operations::automatic_request(app, *instance_id, "stop", reason).await
             }
         }
         Action::Alert { kind, message } => {
@@ -903,10 +889,17 @@ pub async fn run_schedules(app: &SharedApp) {
         };
         match action.as_str() {
             // Aus: Auto-Miete stoppt laufende Boxen (Disk bleibt).
-            "sleep" | "sleep_all" => set_auto_rent(app, false, "schedule").await,
+            "sleep" | "sleep_all" => {
+                if let Err(e) = set_auto_rent(app, false, "schedule").await {
+                    tracing::warn!(%e, "scheduled sleep incomplete; provider operations remain pending");
+                }
+            }
             // An: Slots gewünscht → Reconciler mietet/warmt im selben Tick.
             "wake" | "rent" => {
-                set_auto_rent(app, true, "schedule").await;
+                if let Err(e) = set_auto_rent(app, true, "schedule").await {
+                    tracing::warn!(%e, "scheduled wake failed");
+                    continue;
+                }
                 for slot in &app.cfg().slots {
                     if slots.as_ref().is_none_or(|ids| ids.contains(&slot.id)) {
                         let _ = app.db.set_slot_desired_audited(slot.id, true, "schedule wake");
@@ -917,8 +910,13 @@ pub async fn run_schedules(app: &SharedApp) {
             // Alles weg: zerstört ALLE nicht gepinnten Instanzen und schaltet
             // die Auto-Miete aus (kein Nachmietschritt im selben Atemzug).
             "destroy_all" => {
-                let n = destroy_all_instances(app, slots.as_deref(), "schedule destroy_all").await;
-                set_auto_rent(app, false, "schedule destroy_all").await;
+                if let Err(e) = set_auto_rent(app, false, "schedule destroy_all").await {
+                    tracing::warn!(%e, "scheduled auto-rent off incomplete");
+                }
+                let n = match destroy_all_instances(app, slots.as_deref(), "schedule destroy_all").await {
+                    Ok(n) => n,
+                    Err(e) => { tracing::warn!(%e, "scheduled destroy incomplete; retries pending"); continue; }
+                };
                 app.events.emit(
                     &app.db,
                     "schedule_destroy_all",
@@ -932,6 +930,7 @@ pub async fn run_schedules(app: &SharedApp) {
             // Auto-Rent/Replace/Destroy bis unlock. Für „Box soll über
             // Nacht genau SO bleiben"-Szenarien.
             "lock" => {
+                let _lock = app.management.lock().await;
                 for sid in slot_ids(&slots) {
                     let insts = app.db.instances(false);
                     let cand = app
@@ -959,6 +958,7 @@ pub async fn run_schedules(app: &SharedApp) {
                 }
             }
             "unlock" => {
+                let _lock = app.management.lock().await;
                 for sid in slot_ids(&slots) {
                     let _ = app.db.set_slot_pin(sid, None);
                     for inst in app.db.instances(false) {
@@ -971,6 +971,7 @@ pub async fn run_schedules(app: &SharedApp) {
             }
             // Pin/unpin = Slot-Pin ohne Instanz-Brandsatz (klassisches Pin).
             "pin" => {
+                let _lock = app.management.lock().await;
                 for sid in slot_ids(&slots) {
                     if let Some(active) = app.db.active_instance(sid) {
                         let _ = app.db.update_instance_pinned(active, true);
@@ -980,6 +981,7 @@ pub async fn run_schedules(app: &SharedApp) {
                 }
             }
             "unpin" => {
+                let _lock = app.management.lock().await;
                 for sid in slot_ids(&slots) {
                     let _ = app.db.set_slot_pin(sid, None);
                     for inst in app.db.instances(false) {
@@ -1049,8 +1051,14 @@ pub async fn destroy_all_instances(
     app: &SharedApp,
     slot_ids: Option<&[i64]>,
     reason: &str,
-) -> usize {
+) -> anyhow::Result<usize> {
     let mut n = 0;
+    let mut failures = Vec::new();
+    for slot in &app.cfg().slots {
+        if slot_ids.is_none_or(|ids| ids.contains(&slot.id)) {
+            app.db.set_slot_desired_audited(slot.id, false, reason)?;
+        }
+    }
     for inst in app.db.instances(false) {
         if inst.destroyed_at.is_some() || inst.pinned {
             continue;
@@ -1060,21 +1068,21 @@ pub async fn destroy_all_instances(
                 continue;
             }
         }
-        if destroy_instance(app, inst.vast_id, reason).await.is_ok() {
-            n += 1;
+        match destroy_instance(app, inst.vast_id, reason).await {
+            Ok(()) => n += 1,
+            Err(e) => failures.push(format!("{}: {e}", inst.vast_id)),
         }
     }
-    n
+    anyhow::ensure!(failures.is_empty(), "destroyed {n}; pending failures: {}", failures.join("; "));
+    Ok(n)
 }
 
-pub async fn set_auto_rent(app: &SharedApp, enabled: bool, source: &str) {
-    let was = app.db.auto_rent_enabled();
-    if enabled == was {
-        return;
-    }
-    if let Err(e) = app.db.set_auto_rent(enabled) {
-        tracing::warn!(%e, "auto_rent persist fehlgeschlagen");
-        return;
+pub async fn set_auto_rent(app: &SharedApp, enabled: bool, source: &str) -> anyhow::Result<()> {
+    {
+        // Wait for any admitted rental/start to become visible before stopping it.
+        let _lock = app.management.lock().await;
+        if enabled && app.db.auto_rent_enabled() { return Ok(()); }
+        app.db.set_auto_rent(enabled)?;
     }
     if enabled {
         app.events.emit(
@@ -1086,11 +1094,12 @@ pub async fn set_auto_rent(app: &SharedApp, enabled: bool, source: &str) {
             &serde_json::json!({}),
         );
         app.reconcile_now.notify_one();
-        return;
+        return Ok(());
     }
     for slot in &app.cfg().slots {
-        let _ = app.db.set_slot_desired_audited(slot.id, false, "auto_rent off");
+        app.db.set_slot_desired_audited(slot.id, false, "auto_rent off")?;
     }
+    let mut failures = Vec::new();
     for inst in app.db.instances(false) {
         if inst.pinned {
             continue;
@@ -1099,12 +1108,10 @@ pub async fn set_auto_rent(app: &SharedApp, enabled: bool, source: &str) {
             inst.state.as_str(),
             "requested" | "provisioning" | "booting" | "agent_connected" | "healthy" | "draining"
         );
-        if runningish && inst.destroyed_at.is_none() {
-            let _ = stop_instance(
-                app,
-                inst.vast_id,
-                "auto-rent aus: Box gestoppt (Disk bleibt, Zerstörung übernimmt die Idle-Regel)",
-            );
+        if (runningish || inst.actual_status == "running") && inst.destroyed_at.is_none() {
+            if let Err(e) = stop_instance(app, inst.vast_id, "auto-rent off: stop requested, disk retained").await {
+                failures.push(format!("{}: {e}", inst.vast_id));
+            }
         }
     }
     app.events.emit(
@@ -1112,9 +1119,11 @@ pub async fn set_auto_rent(app: &SharedApp, enabled: bool, source: &str) {
         "auto_rent_disabled",
         None,
         None,
-        &format!("Auto-Miete ausgeschaltet ({source}) — laufende Boxen gestoppt, Wake/Proxy-Anfragen bleiben kalt"),
-        &serde_json::json!({}),
+        &format!("Auto-Miete ausgeschaltet ({source}) — Stop angefordert, {} Fehler bleiben zur Wiederholung", failures.len()),
+        &serde_json::json!({"pending_errors": failures}),
     );
+    anyhow::ensure!(failures.is_empty(), "auto-rent off; stops pending: {}", failures.join("; "));
+    Ok(())
 }
 
 pub fn mint_node_token() -> String {
@@ -1227,9 +1236,19 @@ pub async fn create_instance(
     price_usd_h: f64,
     disk_gb: i64,
     lifecycle: praxis_common::Lifecycle,
+    automatic: bool,
     reason: &str,
 ) -> anyhow::Result<i64> {
+    let _lock = app.management.lock().await;
+    anyhow::ensure!(!automatic || app.db.auto_rent_enabled(), "auto-rent disabled");
+    meter(app)?;
+    anyhow::ensure!(disk_gb > 0 && price_usd_h.is_finite() && price_usd_h > 0.0, "invalid rental price/disk");
+    let rate = if mode == Mode::Interruptible { price_usd_h } else { offer.dph_total };
+    let storage_usd_h = offer.storage_cost * disk_gb as f64 / 720.0;
     let slot = app.cfg().slot(slot_id).ok_or_else(|| anyhow::anyhow!("slot {slot_id} fehlt"))?.clone();
+    let eligibility = crate::catalog::assess(app, &slot, offer, mode, price_usd_h, disk_gb);
+    anyhow::ensure!(eligibility.eligible, "offer rejected: {}", eligibility.reasons.join("; "));
+    crate::operations::check_admission_with_startup(app, slot_id, rate, storage_usd_h, None, eligibility.startup_traffic_usd)?;
     let vast_client = app.vast.lock().unwrap().clone();
     let Some(vast) = vast_client else {
         anyhow::bail!("vast api not configured");
@@ -1268,7 +1287,12 @@ pub async fn create_instance(
     for (k, v) in &slot.env {
         env.insert(k.clone(), serde_json::json!(v));
     }
+    if slot.performance.enabled && slot.performance.benchmark.enabled {
+        env.insert("PRAXIS_AGENT_ALLOW_BENCHMARK".into(), serde_json::json!("1"));
+    }
 
+    // Unique per rental: label-based recovery must not select an old contract.
+    let label = format!("praxis-{}-s{}-{tok8}", slot.role, slot_id);
     let params = CreateInstanceParams {
         client: "me",
         image: &slot.image,
@@ -1277,7 +1301,7 @@ pub async fn create_instance(
         // weiterhin interruptible (is_bid=True, s. vastai-SDK-Doku).
         price: (mode == praxis_common::Mode::Interruptible).then_some(price_usd_h),
         disk: Some(disk_gb),
-        label: Some(&format!("praxis-{}-s{}", slot.role, slot_id)),
+        label: Some(&label),
         template_hash_id: None,
         onstart_cmd: None,
         runtype: Some("args"), // Plain-Docker-Run des Image-Entrypoints
@@ -1294,14 +1318,13 @@ pub async fn create_instance(
     };
 
     let vast_id = vast.create(offer.id, &params).await?;
-    let storage_usd_h = offer.storage_cost * disk_gb as f64 / 30.0 / 24.0;
     let row = crate::db::InstanceRow {
         vast_id,
         slot_id,
         role: slot.role,
         node_token,
         offer_id: offer.id,
-        machine_id: 0,
+        machine_id: offer.machine_id,
         gpu_name: offer.gpu_name.clone(),
         nb_ip: None,
         image: slot.image.clone(),
@@ -1312,6 +1335,7 @@ pub async fn create_instance(
         intended_status: "running".into(),
         state: "requested".into(),
         healthy: false,
+        ever_healthy: false,
         busy: false,
         busy_reason: String::new(),
         min_bid: offer.min_bid,
@@ -1322,9 +1346,10 @@ pub async fn create_instance(
         healthy_since: None,
         stopped_since: None,
         destroyed_at: None,
-        label: format!("praxis-{}-s{}", slot.role, slot_id),
+        label,
     };
     app.db.insert_instance(&row)?;
+    app.db.save_rental_facts(vast_id, &OfferSnapshot {disk_gb: disk_gb as f64, ..offer.clone()}, &crate::performance::runtime_key(&slot, &slot.image))?;
     let _ = app.db.set_slot_desired_audited(slot_id, true, "create_instance");
     app.events.emit(
         &app.db,
@@ -1341,100 +1366,9 @@ pub async fn create_instance(
     Ok(vast_id)
 }
 
-pub fn stop_instance(app: &SharedApp, vast_id: i64, reason: &str) -> anyhow::Result<()> {
-    let Some(inst) = app.db.instance(vast_id) else { return Ok(()) };
-    if inst.state == "destroyed" {
-        return Ok(());
-    }
-    let _ = app.db.set_instance_intended(vast_id, "stopped");
-    let _ = app.db.set_instance_state(vast_id, "stopped");
-    let _ = app.db.set_slot_desired_audited(inst.slot_id, false, "stop_instance");
-    app.events.emit(&app.db, "instance_stopped", Some(inst.slot_id), Some(vast_id), reason, &serde_json::json!({}));
-    let app2 = app.clone();
-    let vast_id2 = vast_id;
-    let reason2 = reason.to_string();
-    tokio::spawn(async move {
-        let vast_client = app2.vast.lock().unwrap().clone();
-        if let Some(vast) = vast_client {
-            if let Err(e) = vast.set_status(vast_id2, false).await {
-                tracing::warn!(%e, vast_id = vast_id2, "vast stop failed (ggf. schon gestoppt/preempted)");
-            }
-        }
-        let _ = reason2;
-    });
-    Ok(())
-}
-
-pub async fn start_instance(app: &SharedApp, vast_id: i64, reason: &str) -> anyhow::Result<()> {
-    let Some(inst) = app.db.instance(vast_id) else {
-        anyhow::bail!("unknown instance {vast_id}");
-    };
-    let vast_client = app.vast.lock().unwrap().clone();
-    let Some(vast) = vast_client else {
-        anyhow::bail!("vast api not configured");
-    };
-    // Backoff 3×: gestoppte Interruptibles starten nur, wenn die GPU frei ist.
-    let mut attempt = 0;
-    loop {
-        match vast.set_status(vast_id, true).await {
-            Ok(_) => break,
-            Err(e) => {
-                attempt += 1;
-                if attempt >= 3 {
-                    app.events.emit(&app.db, "resume_fallback_fresh", Some(inst.slot_id), Some(vast_id), &format!("start 3× fehlgeschlagen ({e}) — alte Box zerstört, Wake mietet frisch"), &serde_json::json!({}));
-                    // README-Entscheid: die unstartbare Box zerstören — sonst
-                    // blockiert sie den Wake-Pfad (Policy bevorzugt sie immer
-                    // wieder fürs Starten) und läuft Storage-Kosten auf.
-                    destroy_instance(
-                        app,
-                        vast_id,
-                        "resume_fallback_fresh: start 3× fehlgeschlagen",
-                    )
-                    .await?;
-                    anyhow::bail!("start failed: {e}");
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(15 * attempt as u64)).await;
-            }
-        }
-    }
-    let _ = app.db.set_instance_intended(vast_id, "running");
-    let _ = app.db.set_instance_state(vast_id, "booting");
-    let _ = app.db.set_slot_desired_audited(inst.slot_id, true, "start_instance");
-    app.events.emit(&app.db, "instance_started", Some(inst.slot_id), Some(vast_id), reason, &serde_json::json!({}));
-    Ok(())
-}
-
-pub async fn destroy_instance(app: &SharedApp, vast_id: i64, reason: &str) -> anyhow::Result<()> {
-    let Some(inst) = app.db.instance(vast_id) else { return Ok(()) };
-    if let Some(active) = app.db.active_instance(inst.slot_id) {
-        if active == vast_id {
-            let _ = app.db.set_active_instance(inst.slot_id, None);
-        }
-    }
-    let _ = app.db.mark_destroyed(vast_id);
-    app.events.emit(&app.db, "instance_destroyed", Some(inst.slot_id), Some(vast_id), reason, &serde_json::json!({}));
-    let app2 = app.clone();
-    let vast_id2 = vast_id;
-    let hostname2 = format!("gpu-{}-{}", crate::api::role_str(inst.role), &inst.node_token[..8]);
-    tokio::spawn(async move {
-        let vast_client = app2.vast.lock().unwrap().clone();
-        if let Some(vast) = vast_client {
-            if let Err(e) = vast.destroy(vast_id2).await {
-                tracing::warn!(%e, vast_id = vast_id2, "vast destroy failed (ggf. schon weg)");
-            }
-        }
-        // NetBird-Peer der Box aufräumen (nicht-ephemeral → bleibt sonst als
-        // Leiche: IP reserviert, Peer-Rauschen in tgrid).
-        if let Err(e) = netbird_delete_peer(&app2, &hostname2).await {
-            tracing::warn!(%e, vast_id = vast_id2, %hostname2, "netbird peer cleanup fehlgeschlagen");
-        }
-    });
-    Ok(())
-}
-
 /// NetBird-Peer nach Hostname (gpu-<role>-<tok8>) suchen und löschen.
 /// Match wie im Connector: name ODER hostname-Feld ODER dns_label-Präfix.
-async fn netbird_delete_peer(app: &SharedApp, hostname: &str) -> anyhow::Result<()> {
+pub(crate) async fn netbird_delete_peer(app: &SharedApp, hostname: &str) -> anyhow::Result<()> {
     let token = app.cfg().netbird_api_token();
     if token.is_empty() {
         return Ok(());

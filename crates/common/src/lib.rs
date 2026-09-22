@@ -4,6 +4,7 @@
 //! `node` als eigenes, kleines serde-Modul — die JSON-Formen sind stabil.
 
 pub mod node;
+pub mod performance;
 
 /// Rolle eines Slots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

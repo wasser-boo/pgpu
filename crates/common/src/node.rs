@@ -130,6 +130,7 @@ pub enum Command {
     /// lokal/HTTP). Agent schreibt, prüft SHA, chmod, restartet Service.
     PushAssetData { entry: AssetEntry, data_b64: String },
     RunAcceptance,
+    Benchmark { spec: crate::performance::BenchmarkSpec },
     /// Busy-Flag am Agent setzen (Router meint: Drain/Fertig).
     Drain,
     Undrain,

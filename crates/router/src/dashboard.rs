@@ -38,8 +38,14 @@ fn token_of(app: &SharedApp) -> String {
 pub fn session_ok(app: &SharedApp, headers: &axum::http::HeaderMap) -> bool {
     let token = token_of(app);
     if token.is_empty() {
+        return false;
+    }
+    if crate::node::bearer(headers).as_deref() == Some(token.as_str()) {
         return true;
     }
+    // Cookie-authenticated browser requests (including terminal WS) must not
+    // originate from another site, even a sibling host inside the same VPN.
+    if !same_origin(headers) { return false; }
     let cookies = headers.get_all(axum::http::header::COOKIE);
     for c in cookies.iter() {
         if let Ok(s) = c.to_str() {
@@ -66,6 +72,17 @@ pub fn session_ok(app: &SharedApp, headers: &axum::http::HeaderMap) -> bool {
     false
 }
 
+fn same_origin(headers: &axum::http::HeaderMap) -> bool {
+    if headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) == Some("cross-site") {
+        return false;
+    }
+    let Some(origin) = headers.get(axum::http::header::ORIGIN) else { return true; };
+    let Some(host) = headers.get(axum::http::header::HOST).and_then(|v| v.to_str().ok()) else { return false; };
+    let Ok(origin) = origin.to_str().unwrap_or("").parse::<url::Url>() else { return false; };
+    let Ok(expected) = format!("{}://{host}", origin.scheme()).parse::<url::Url>() else { return false; };
+    matches!(origin.scheme(), "http" | "https") && origin.origin() == expected.origin()
+}
+
 pub async fn login_page() -> Response {
     Html(r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>pgpu Login</title>
     <style>body{background:#101418;color:#dbe2ea;font:14px system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
@@ -76,7 +93,8 @@ pub async fn login_page() -> Response {
         .into_response()
 }
 
-pub async fn login_submit(app: AppCtx, Form(form): Form<HashMap<String, String>>) -> Response {
+pub async fn login_submit(app: AppCtx, headers: axum::http::HeaderMap, Form(form): Form<HashMap<String, String>>) -> Response {
+    if !same_origin(&headers) { return (StatusCode::FORBIDDEN, "cross-origin login denied").into_response(); }
     let token = form.get("token").cloned().unwrap_or_default();
     // Falscher Token: kein Cookie setzen — sonst endloser Login-Loop ohne
     // Fehlermeldung (Guard bounced ohnehin zurück).
@@ -91,11 +109,11 @@ pub async fn login_submit(app: AppCtx, Form(form): Form<HashMap<String, String>>
             .into_response();
     }
     let mut r = Response::from(Redirect::to("/").into_response());
-    let cookie = format!("pgpu_session={token}; Path=/; HttpOnly; SameSite=Lax");
-    r.headers_mut().insert(
-        axum::http::header::SET_COOKIE,
-        axum::http::HeaderValue::from_str(&cookie).unwrap(),
-    );
+    let cookie = format!("pgpu_session={token}; Path=/; HttpOnly; SameSite=Strict");
+    let Ok(cookie) = axum::http::HeaderValue::from_str(&cookie) else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "invalid token configuration").into_response();
+    };
+    r.headers_mut().insert(axum::http::header::SET_COOKIE, cookie);
     r
 }
 
@@ -198,6 +216,8 @@ pub struct OffersTpl {
     pub offers: Vec<OfferRow>,
     pub default_disk_gb: i64,
     pub machines: Vec<crate::db::MachineStatRow>,
+    pub activate_blacklist: bool,
+    pub activate_whitelist: bool,
     pub error: Option<String>,
 }
 
@@ -206,6 +226,11 @@ pub struct OfferRow {
     pub machine_id: i64,
     pub machine_fails: i64,
     pub blacklisted: bool,
+    pub whitelisted: bool,
+    pub eligible: bool,
+    pub rejection: String,
+    pub score: String,
+    pub gpu_ram_gb: f64,
     pub gpu_name: String,
     pub cpu_ram_gb: f64,
     pub disk_gb: f64,
@@ -520,6 +545,9 @@ pub async fn offers_page(app: AppCtx, Query(q): Query<HashMap<String, String>>, 
     let machines = app.db.machine_stats();
     let stats: std::collections::HashMap<i64, crate::db::MachineStatRow> =
         machines.iter().map(|m| (m.machine_id, m.clone())).collect();
+    let slot = app.cfg().slot(slot_id).cloned();
+    let offer_mode = if mode == "on_demand" {praxis_common::Mode::OnDemand} else {praxis_common::Mode::Interruptible};
+    let scores = slot.as_ref().and_then(|s| crate::performance::host_scores(&app.0, s).ok()).unwrap_or_default();
     let rows: Vec<OfferRow> = offers
         .iter()
         .take(30)
@@ -530,6 +558,11 @@ pub async fn offers_page(app: AppCtx, Query(q): Query<HashMap<String, String>>, 
                 machine_id: o.machine_id,
                 machine_fails: stat.map(|s| s.fails).unwrap_or(0),
                 blacklisted: stat.map(|s| s.blacklisted).unwrap_or(false),
+                whitelisted: stat.map(|s| s.whitelisted).unwrap_or(false),
+                eligible: slot.as_ref().is_some_and(|s| crate::catalog::assess(&app.0,s,o,offer_mode,praxis_policy::eligibility::rental_price(o,offer_mode,&s.bid),s.disk_gb).eligible),
+                rejection: slot.as_ref().map(|s| crate::catalog::assess(&app.0,s,o,offer_mode,praxis_policy::eligibility::rental_price(o,offer_mode,&s.bid),s.disk_gb).reasons.join("; ")).unwrap_or_default(),
+                score: scores.get(&(o.machine_id,crate::performance::allocation_key(o,slot.as_ref().map(|s|s.disk_gb).unwrap_or(0)))).map(|s|format!("{s:.1}/100")).unwrap_or_else(||"—".into()),
+                gpu_ram_gb: o.gpu_ram_gb,
                 gpu_name: o.gpu_name.clone(),
                 cpu_ram_gb: o.cpu_ram_gb,
                 disk_gb: o.disk_gb,
@@ -548,7 +581,9 @@ pub async fn offers_page(app: AppCtx, Query(q): Query<HashMap<String, String>>, 
         mode,
         offers: rows,
         default_disk_gb: app.cfg().slot(slot_id).map(|s| s.disk_gb).unwrap_or(60),
-        machines: machines.into_iter().take(12).collect(),
+        machines: machines.into_iter().take(200).collect(),
+        activate_blacklist: app.cfg().vast.activate_blacklist,
+        activate_whitelist: app.cfg().vast.activate_whitelist,
         error,
     };
     Html(tpl.render().unwrap_or_default()).into_response()
@@ -557,24 +592,44 @@ pub async fn offers_page(app: AppCtx, Query(q): Query<HashMap<String, String>>, 
 /// Blacklist-Knopf aus dem Dashboard: `/do/machines/:id/:action`.
 pub async fn do_machine_action(app: AppCtx, Path((machine_id, action)): Path<(i64, String)>, headers: axum::http::HeaderMap) -> Response {
     page_guard!(app, ReqOf(&headers));
-    let (set, note) = match action.as_str() {
-        "blacklist" => (true, "manuell blacklisted (Dashboard)"),
-        "unblacklist" => (false, ""),
-        _ => return (StatusCode::BAD_REQUEST, "unknown action").into_response(),
-    };
-    if app.db.machine_stat(machine_id).is_none() && !set {
-        return (StatusCode::NOT_FOUND, "Maschine unbekannt").into_response();
+    if let Err(e) = crate::catalog::machine_action(&app.0, machine_id, &action).await {
+        return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
-    let _ = app.db.set_machine_blacklist(machine_id, set, note);
-    app.events.emit(
-        &app.0.db,
-        if set { "machine_blacklisted" } else { "machine_unblacklisted" },
-        None,
-        None,
-        &format!("Host {machine_id} {} (Dashboard)", if set { "blacklisted" } else { "von Blacklist entfernt" }),
-        &serde_json::json!({"machine_id": machine_id}),
-    );
     Redirect::to("/offers").into_response()
+}
+
+#[derive(Template)]
+#[template(path = "performance.html")]
+struct PerformanceTpl { rows: Vec<PerformanceView> }
+struct PerformanceView {
+    machine: i64, gpu: String, profile: String, model: String, source: String,
+    workload: String, allocation: String, image: String,
+    samples: u64, successful: u64, decode: String, prefill: String, ttft: String,
+    elapsed: String, read_mb: String, disk_speed: String, vram: String, score: String,
+}
+pub async fn performance_page(app: AppCtx, req: Request) -> Response {
+    page_guard!(app, req);
+    let catalogue = match app.db.performance_catalogue() {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR,e.to_string()).into_response(),
+    };
+    let cfg = app.cfg();
+    let scores: std::collections::HashMap<_,_> = cfg.slots.iter().map(|s|(s.id,crate::performance::host_scores(&app.0,s).unwrap_or_default())).collect();
+    let rows=catalogue.into_iter().take(500).map(|r| {
+        let means=r.means();
+        let fmt=|name: &str,scale:f64| means.get(name).map(|v|format!("{:.1}",v/scale)).unwrap_or_else(||"—".into());
+        let score=cfg.slot(r.slot_id).filter(|s| r.source=="benchmark" && r.workload_key==crate::performance::workload_key(s,&s.image) && r.model==s.performance.benchmark.spec.model)
+            .and_then(|_|scores.get(&r.slot_id)).and_then(|m|m.get(&(r.machine_id,r.allocation.clone())))
+            .map(|s|format!("{s:.1}")).unwrap_or_else(||"—".into());
+        PerformanceView { machine:r.machine_id,gpu:r.gpu_name,profile:r.profile,model:r.model,source:r.source,
+            workload:r.workload_key.chars().take(12).collect(),allocation:r.allocation,image:r.image,samples:r.samples,successful:r.successful,
+            decode:fmt("decode_tps",1.0),prefill:fmt("prefill_tps",1.0),ttft:fmt("ttft_ms",1.0),elapsed:fmt("elapsed_ms",1.0),
+            read_mb:fmt("disk_read_bytes",1e6),disk_speed:fmt("disk_read_mbps",1.0),vram:fmt("vram_used_mb",1024.0),score }
+    }).collect();
+    match (PerformanceTpl {rows}).render() {
+        Ok(html)=>Html(html).into_response(),
+        Err(e)=>(StatusCode::INTERNAL_SERVER_ERROR,e.to_string()).into_response(),
+    }
 }
 
 fn inst_view(app: &SharedApp, row: &crate::db::InstanceRow) -> InstView {
@@ -747,8 +802,10 @@ pub async fn settings_page(app: AppCtx, Query(q): Query<HashMap<String, String>>
 /// /api/v1/destroy_all (alle nicht gepinnten, über alle Slots).
 pub async fn do_destroy_all(app: AppCtx, headers: axum::http::HeaderMap) -> Response {
     page_guard!(app, ReqOf(&headers));
-    let n = crate::reconciler::destroy_all_instances(&app.0, None, "dashboard: destroy_all").await;
-    Redirect::to(&format!("/?msg=destroyed%20{n}")).into_response()
+    match crate::reconciler::destroy_all_instances(&app.0, None, "dashboard: destroy_all").await {
+        Ok(n) => Redirect::to(&format!("/?msg=destroyed%20{n}")).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
+    }
 }
 
 /// Save aus dem Dashboard-Editor: validiert + schreibt + tauscht live
@@ -785,7 +842,7 @@ fn urlencode(s: &str) -> String {
 
 // ---------------------------------------------------------------- Form-Actions
 
-async fn api_slot(app: &SharedApp, slot_id: i64, action: &str) {
+async fn api_slot(app: &SharedApp, slot_id: i64, action: &str) -> Response {
     let req = Request::builder()
         .method(axum::http::Method::POST)
         // Bearer mitgeben: slot_action ist per guarded! geschützt — ohne
@@ -795,12 +852,13 @@ async fn api_slot(app: &SharedApp, slot_id: i64, action: &str) {
         .uri("/")
         .body(Body::empty())
         .unwrap();
-    let _ = crate::api::slot_action(AppCtx(app.clone()), axum::extract::Path((slot_id, action.to_string())), req).await;
+    crate::api::slot_action(AppCtx(app.clone()), axum::extract::Path((slot_id, action.to_string())), req).await
 }
 
 pub async fn do_slot_action(app: AppCtx, Path((slot_id, action)): Path<(i64, String)>, headers: axum::http::HeaderMap) -> Response {
     page_guard!(app, ReqOf(&headers));
-    api_slot(&app.0, slot_id, &action).await;
+    let response = api_slot(&app.0, slot_id, &action).await;
+    if !response.status().is_success() { return response; }
     Redirect::to("/").into_response()
 }
 
@@ -809,7 +867,9 @@ pub async fn do_slot_action(app: AppCtx, Path((slot_id, action)): Path<(i64, Str
 pub async fn do_auto_rent(app: AppCtx, headers: axum::http::HeaderMap) -> Response {
     page_guard!(app, ReqOf(&headers));
     let enabled = !app.db.auto_rent_enabled();
-    crate::reconciler::set_auto_rent(&app.0, enabled, "dashboard").await;
+    if let Err(e) = crate::reconciler::set_auto_rent(&app.0, enabled, "dashboard").await {
+        return (StatusCode::BAD_GATEWAY, e.to_string()).into_response();
+    }
     Redirect::to("/").into_response()
 }
 
@@ -947,7 +1007,8 @@ pub async fn do_instance_action(
         .header(axum::http::header::AUTHORIZATION, format!("Bearer {}", token_of(&app.0)))
         .body(Body::from(body_str))
         .unwrap();
-    let _ = crate::api::instance_action(AppCtx(app.0.clone()), axum::extract::Path((vast_id, action.clone())), api_req).await;
+    let response = crate::api::instance_action(AppCtx(app.0.clone()), axum::extract::Path((vast_id, action.clone())), api_req).await;
+    if !response.status().is_success() { return response; }
     Redirect::to(&back).into_response()
 }
 

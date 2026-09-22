@@ -17,14 +17,26 @@ impl Window {
     /// Aktiv an Tag `weekday` (1=Mo) zur Minute `minute_of_day`?
     /// Fenster über Mitternacht (z. B. 20:00-02:00) wird unterstützt.
     pub fn contains(&self, weekday: u8, minute_of_day: u32) -> bool {
-        if !self.days.contains(&weekday) {
-            return false;
-        }
+        if !(1..=7).contains(&weekday) || minute_of_day >= 1440 { return false; }
         if self.start_min <= self.end_min {
-            minute_of_day >= self.start_min && minute_of_day < self.end_min
+            self.days.contains(&weekday) && minute_of_day >= self.start_min && minute_of_day < self.end_min
         } else {
-            minute_of_day >= self.start_min || minute_of_day < self.end_min
+            let previous = if weekday == 1 { 7 } else { weekday - 1 };
+            (self.days.contains(&weekday) && minute_of_day >= self.start_min)
+                || (self.days.contains(&previous) && minute_of_day < self.end_min)
         }
+    }
+
+    /// Prewarm can cross midnight/week boundaries; never includes time after
+    /// the window. Zero explicitly disables prewarming.
+    pub fn in_prewarm(&self, weekday: u8, minute_of_day: u32, lead_s: u32) -> bool {
+        if !(1..=7).contains(&weekday) || minute_of_day >= 1440 || lead_s == 0 { return false; }
+        let now = ((weekday as i64 - 1) * 1440 + minute_of_day as i64) * 60;
+        self.days.iter().any(|day| {
+            let start = ((*day as i64 - 1) * 1440 + self.start_min as i64) * 60;
+            let until = (start - now).rem_euclid(7 * 86400);
+            until > 0 && until <= lead_s.min(7 * 86400) as i64
+        })
     }
 
     /// Minute, ab der Prewarm gestartet werden soll (start - prewarm_min),
@@ -76,8 +88,12 @@ fn parse_days(s: &str) -> Option<Vec<u8>> {
         }
         if let Some((a, b)) = part.split_once('-') {
             let (a, b) = (day_from(a)?, day_from(b)?);
-            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-            days.extend(lo..=hi);
+            let mut day = a;
+            loop {
+                days.push(day);
+                if day == b { break; }
+                day = day % 7 + 1;
+            }
         } else {
             days.push(day_from(part)?);
         }
@@ -99,7 +115,10 @@ pub fn parse_window(spec: &str) -> Option<Window> {
         None => (vec![1, 2, 3, 4, 5, 6, 7], spec),
     };
     let (start, end) = time.split_once('-')?;
-    Some(Window { days, start_min: parse_hhmm(start)?, end_min: parse_hhmm(end)? })
+    let start_min = parse_hhmm(start)?;
+    let end_min = parse_hhmm(end)?;
+    if start_min >= 1440 || start_min == end_min { return None; }
+    Some(Window { days, start_min, end_min })
 }
 
 #[cfg(test)]
@@ -146,6 +165,23 @@ mod tests {
         // Fensterfreier Tag: kein Prewarm — der Stop-Arm muss greifen können.
         assert_eq!(w.prewarm_start(20, 7), None);
         assert_eq!(w.prewarm_start(20, 6), None);
+    }
+
+    #[test]
+    fn overnight_belongs_to_its_start_day_and_prewarm_crosses_week() {
+        let w = parse_window("Fr 20:00-02:00").unwrap();
+        assert!(w.contains(5, 21 * 60));
+        assert!(w.contains(6, 60));
+        assert!(!w.contains(5, 60));
+        assert!(!w.contains(6, 120));
+        let w = parse_window("Mo 00:10-01:00").unwrap();
+        assert!(w.in_prewarm(7, 23 * 60 + 50, 1200));
+        assert!(!w.in_prewarm(7, 23 * 60 + 49, 1200));
+        assert!(!w.in_prewarm(1, 120, 1200));
+        assert!(!w.in_prewarm(1, 0, 0));
+        assert_eq!(parse_window("Fr-Mo 09:00-18:00").unwrap().days, vec![1, 5, 6, 7]);
+        assert!(parse_window("24:00-03:00").is_none());
+        assert!(parse_window("12:00-12:00").is_none());
     }
 
     #[test]

@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}pgpu — GPU-Messdaten{% endblock %}
+{% block content %}
+<h1>GPU-/Host-Messdaten</h1>
+<p>Nur echte Messungen; „—“ = nicht gemessen. Getrennt nach Host, GPU, Modell, Image/Workload-Key und Quelle. Lebenszeit-Mittelwerte bleiben nach Ablauf der Rohdaten-Aufbewahrung erhalten.</p>
+<p class="mut">Score 0–100: Median vergleichbarer aktueller Benchmarks, relativ zu deinen konfigurierten Zielen; 50 = Ziel erreicht. Kein universelles GPU-Rating. Preisgewichtung ist separat opt-in. Inferenz-I/O ist Prozess-I/O, kein Disk-Speed-Test. VRAM ist eine Momentaufnahme, kein garantierter Peak. Passive Nutzung ist wegen unterschiedlicher Prompts nicht scorewirksam.</p>
+<p>Benchmarks: Instanz öffnen → Performance-Benchmark. <a href="/settings">Konfiguration</a> · JSON-Export (Bearer-API): <code>/api/v1/performance/summary</code>, Rohdaten <code>/api/v1/performance?limit=1000</code>.</p>
+<div class="card" style="overflow:auto">
+<table>
+<tr><th>Host</th><th>GPU</th><th>Profil / Modell</th><th>Quelle</th><th>Erfolg / N</th><th>Decode tok/s Ø</th><th>Prefill tok/s Ø</th><th>TTFT ms Ø</th><th>Dauer ms Ø</th><th>Inferenz Read MB Ø</th><th>Direct Disk MB/s Ø</th><th>VRAM GiB Ø</th><th>Score aktuell</th></tr>
+{% for r in rows %}
+<tr><td>{{ r.machine }}</td><td>{{ r.gpu }}</td><td title="{{ r.image }} · Allocation: {{ r.allocation }}">{{ r.profile }}<br>{{ r.model }}<br><span class="mono mut">{{ r.workload }}</span></td><td>{{ r.source }}</td><td>{{ r.successful }} / {{ r.samples }}</td><td>{{ r.decode }}</td><td>{{ r.prefill }}</td><td>{{ r.ttft }}</td><td>{{ r.elapsed }}</td><td>{{ r.read_mb }}</td><td>{{ r.disk_speed }}</td><td>{{ r.vram }}</td><td>{{ r.score }}</td></tr>
+{% endfor %}
+</table>
+</div>
+{% if rows.is_empty() %}<p>Noch keine Messdaten. <code>[slots.performance] enabled=true</code> und <code>collect_usage=true</code> aktivieren oder Benchmarks ausdrücklich freigeben.</p>{% endif %}
+{% endblock %}

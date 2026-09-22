@@ -1,8 +1,11 @@
 //! SQLite (rusqlite, bundled). Sync-Wrapper mit Mutex — Operationen sind
 //! kurz genug für v1 (Reconciler-Takt 30 s, Dashboard-Einzelabrufe).
 
+mod performance_store;
+pub use performance_store::PerformanceRow;
+
 use crate::config::Config;
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
 use praxis_common::{Mode, Role};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
@@ -43,6 +46,8 @@ pub struct InstanceRow {
     pub intended_status: String,
     pub state: String,
     pub healthy: bool,
+    /// Historical readiness; must survive preemption/stop unlike current health.
+    pub ever_healthy: bool,
     pub busy: bool,
     pub busy_reason: String,
     pub min_bid: f64,
@@ -74,6 +79,7 @@ pub struct MachineStatRow {
     pub machine_id: i64,
     pub fails: i64,
     pub blacklisted: bool,
+    pub whitelisted: bool,
     pub last_fail_at: Option<String>,
     pub note: String,
 }
@@ -184,12 +190,36 @@ impl Db {
                 sha256 TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY, v TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS pending_operations(
+                instance_id INTEGER PRIMARY KEY,
+                operation TEXT NOT NULL CHECK(operation IN ('stop', 'destroy')),
+                reason TEXT NOT NULL
+            );
             "#,
         )?;
-        // Nachtragsspalten (ALTER schlägt fehl wenn vorhanden — ignorieren):
-        // healthy_since: Idle-Uhr ab Healthy, nicht ab Miete — sonst stoppt
-        // eine Box mit 50-min-Warmup 29 s nach dem ersten Healthy (20.09.).
-        let _ = conn.execute_batch("ALTER TABLE instances ADD COLUMN healthy_since TEXT;");
+        // Do not hide real migration failures (disk full, permissions, corruption).
+        let columns: Vec<String> = conn.prepare("PRAGMA table_info(instances)")?
+            .query_map([], |r| r.get(1))?.collect::<rusqlite::Result<_>>()?;
+        let tx = conn.unchecked_transaction()?;
+        if !columns.iter().any(|c| c == "boot_started_at") {
+            tx.execute_batch("ALTER TABLE instances ADD COLUMN boot_started_at TEXT;
+                UPDATE instances SET boot_started_at=created_at;")?;
+        }
+        if !columns.iter().any(|c| c == "healthy_since") {
+            tx.execute_batch("ALTER TABLE instances ADD COLUMN healthy_since TEXT;")?;
+        }
+        if !columns.iter().any(|c| c == "ever_healthy") {
+            tx.execute_batch("ALTER TABLE instances ADD COLUMN ever_healthy INTEGER NOT NULL DEFAULT 0;
+                UPDATE instances SET ever_healthy=1 WHERE healthy=1 OR healthy_since IS NOT NULL OR state='healthy';")?;
+        }
+        if !columns.iter().any(|c| c == "last_metered_at") {
+            tx.execute_batch("ALTER TABLE instances ADD COLUMN last_metered_at TEXT;")?;
+            // Historic totals from the old meter cannot be reconstructed safely.
+            // Start existing contracts at migration time, never replay their lifetime.
+            tx.execute("UPDATE instances SET last_metered_at=?1", params![now_iso()])?;
+        }
+        performance_store::migrate(&tx)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -309,8 +339,8 @@ impl Db {
         conn.execute(
             "INSERT INTO instances(vast_id, slot_id, role, node_token, offer_id, machine_id, gpu_name,
                                    image, mode, lifecycle, pinned, actual_status, intended_status,
-                                   state, min_bid, bid_usd_h, dph_total, storage_usd_h, created_at, label)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+                                   state, min_bid, bid_usd_h, dph_total, storage_usd_h, created_at, label, last_metered_at, ever_healthy)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?19,?21)",
             params![
                 row.vast_id,
                 row.slot_id,
@@ -332,6 +362,7 @@ impl Db {
                 row.storage_usd_h,
                 row.created_at,
                 row.label,
+                row.ever_healthy || row.healthy,
             ],
         )?;
         Ok(())
@@ -356,6 +387,7 @@ impl Db {
         // healthy_since: Idle-Uhr-Basis — nur beim echten Übergang setzen.
         conn.execute(
             "UPDATE instances SET nb_ip=COALESCE(?2, nb_ip), healthy=?3, state=?4,
+                ever_healthy=CASE WHEN ?3=1 THEN 1 ELSE ever_healthy END,
                 healthy_since=CASE
                     WHEN ?4='healthy' AND healthy_since IS NULL THEN ?5
                     WHEN ?4!='healthy' THEN NULL
@@ -381,15 +413,6 @@ impl Db {
         Ok(())
     }
 
-    pub fn update_instance_mode(&self, vast_id: i64, mode: Mode) -> anyhow::Result<()> {
-        let conn = self.0.lock().unwrap();
-        conn.execute(
-            "UPDATE instances SET mode=?2 WHERE vast_id=?1",
-            params![vast_id, serde_json::to_string(&mode)?.trim_matches('"')],
-        )?;
-        Ok(())
-    }
-
     pub fn update_instance_lifecycle(&self, vast_id: i64, lifecycle: &str) -> anyhow::Result<()> {
         let conn = self.0.lock().unwrap();
         conn.execute("UPDATE instances SET lifecycle=?2 WHERE vast_id=?1", params![vast_id, lifecycle])?;
@@ -402,15 +425,23 @@ impl Db {
         Ok(())
     }
 
+    pub fn boot_started_at(&self, vast_id: i64) -> anyhow::Result<Option<DateTime<Utc>>> {
+        let value: Option<String> = self.0.lock().unwrap().query_row(
+            "SELECT COALESCE(boot_started_at, created_at) FROM instances WHERE vast_id=?1",
+            params![vast_id], |row| row.get(0)).optional()?;
+        Ok(value.as_deref().and_then(parse_iso))
+    }
+
     pub fn set_instance_state(&self, vast_id: i64, state: &str) -> anyhow::Result<()> {
         let conn = self.0.lock().unwrap();
         conn.execute(
             "UPDATE instances SET state=?2,
-                stopped_since=CASE WHEN ?2='stopped' AND stopped_since IS NULL THEN ?3 ELSE stopped_since END,
-                stopped_since=CASE WHEN ?2!='stopped' THEN NULL ELSE stopped_since END,
-                healthy_since=CASE WHEN ?2='healthy' AND healthy_since IS NULL THEN ?3 ELSE healthy_since END,
-                healthy_since=CASE WHEN ?2!='healthy' THEN NULL ELSE healthy_since END,
+                boot_started_at=CASE WHEN ?2='booting' AND state NOT IN ('requested','provisioning','booting','agent_connected')
+                    THEN ?3 ELSE COALESCE(boot_started_at, created_at) END,
+                stopped_since=CASE WHEN ?2='stopped' THEN COALESCE(stopped_since, ?3) ELSE NULL END,
+                healthy_since=CASE WHEN ?2='healthy' THEN COALESCE(healthy_since, ?3) ELSE NULL END,
                 healthy=CASE WHEN ?2='healthy' THEN 1 ELSE 0 END,
+                ever_healthy=CASE WHEN ?2='healthy' THEN 1 ELSE ever_healthy END,
                 busy=CASE WHEN ?2 IN ('stopped','preempted','unreachable','destroyed') THEN 0 ELSE busy END
              WHERE vast_id=?1",
             params![vast_id, state, now_iso()],
@@ -428,7 +459,8 @@ impl Db {
     }
 
     pub fn mark_destroyed(&self, vast_id: i64) -> anyhow::Result<()> {
-        let conn = self.0.lock().unwrap();
+        let mut conn = self.0.lock().unwrap();
+        let conn = conn.transaction()?;
         // Active-Instanz sofort freimachen: sonst bleibt der Proxy bis zum
         // nächsten Flip auf der toten Box hängen und 502t statt 503+Wake zu
         // antworten (20.09.: instance_gone ließ active=51735121 stehen).
@@ -441,6 +473,44 @@ impl Db {
                 healthy=0, busy=0, busy_reason='' WHERE vast_id=?1",
             params![vast_id, now_iso()],
         )?;
+        conn.execute("UPDATE slots SET pinned_instance=NULL WHERE pinned_instance=?1", params![vast_id])?;
+        conn.execute("DELETE FROM pending_operations WHERE instance_id=?1", params![vast_id])?;
+        conn.commit()?;
+        Ok(())
+    }
+
+    /// Persist intent before provider I/O. A pending destroy cannot be weakened to stop.
+    pub fn queue_operation(&self, id: i64, operation: &str, reason: &str) -> anyhow::Result<()> {
+        let mut conn = self.0.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO pending_operations(instance_id,operation,reason) VALUES(?1,?2,?3)
+             ON CONFLICT(instance_id) DO UPDATE SET operation=?2, reason=?3
+             WHERE pending_operations.operation!='destroy'",
+            params![id, operation, reason],
+        )?;
+        tx.execute("UPDATE instances SET intended_status=CASE
+            WHEN (SELECT operation FROM pending_operations WHERE instance_id=?1)='destroy'
+            THEN 'deleted' ELSE 'stopped' END WHERE vast_id=?1", params![id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn pending_operations(&self) -> anyhow::Result<Vec<(i64, String, String)>> {
+        let conn = self.0.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT instance_id,operation,reason FROM pending_operations ORDER BY instance_id")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn complete_stop(&self, id: i64) -> anyhow::Result<()> {
+        let mut conn = self.0.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute("UPDATE instances SET state='stopped', intended_status='stopped',
+            healthy=0, busy=0, healthy_since=NULL, stopped_since=COALESCE(stopped_since,?2)
+            WHERE vast_id=?1", params![id, now_iso()])?;
+        tx.execute("DELETE FROM pending_operations WHERE instance_id=?1", params![id])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -494,6 +564,7 @@ impl Db {
             intended_status: r.get("intended_status")?,
             state: r.get("state")?,
             healthy: r.get::<_, i64>("healthy")? != 0,
+            ever_healthy: r.get::<_, i64>("ever_healthy")? != 0,
             busy: r.get::<_, i64>("busy")? != 0,
             busy_reason: r.get("busy_reason")?,
             min_bid: r.get("min_bid")?,
@@ -585,22 +656,51 @@ impl Db {
 
     // ------------------------------------------------------------ Metering
 
-    pub fn meter(&self, date: &str, instance_id: i64, metered_usd: f64, storage_usd: f64) -> anyhow::Result<()> {
-        let conn = self.0.lock().unwrap();
-        conn.execute(
-            "INSERT INTO instance_meter(date, instance_id, metered_usd, storage_usd, last_metered_at)
-             VALUES(?1,?2,?3,?4,?5)
-             ON CONFLICT(date, instance_id) DO UPDATE SET
-               metered_usd = metered_usd + excluded.metered_usd,
-               storage_usd = storage_usd + excluded.storage_usd,
-               last_metered_at = excluded.last_metered_at",
-            params![date, instance_id, metered_usd, storage_usd, now_iso()],
-        )?;
-        conn.execute(
-            "INSERT INTO budget_days(date, metered_usd) VALUES(?1, ?2)
-             ON CONFLICT(date) DO UPDATE SET metered_usd = metered_usd + excluded.metered_usd",
-            params![date, metered_usd + storage_usd],
-        )?;
+    /// Integrate last OBSERVED provider rates, not heartbeat age or desired state.
+    /// Cursor and both ledgers commit together, including across restarts and midnight.
+    /// Provider state during an outage is unknown: this is an estimate, not an invoice.
+    pub fn meter_until(&self, now: DateTime<Utc>, tz: chrono_tz::Tz) -> anyhow::Result<()> {
+        let mut conn = self.0.lock().unwrap();
+        let tx = conn.transaction()?;
+        let rows: Vec<(i64, String, f64, f64)> = {
+            let mut stmt = tx.prepare("SELECT vast_id, COALESCE(last_metered_at,created_at),
+                CASE WHEN actual_status='running' THEN
+                    CASE WHEN mode='interruptible' THEN bid_usd_h ELSE dph_total END
+                    ELSE 0 END, storage_usd_h FROM instances WHERE state!='destroyed'")?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        for (id, cursor, gpu_rate, storage_rate) in rows {
+            anyhow::ensure!(gpu_rate.is_finite() && gpu_rate >= 0.0 && storage_rate.is_finite() && storage_rate >= 0.0, "invalid metering rate for {id}");
+            let mut from = parse_iso(&cursor).ok_or_else(|| anyhow::anyhow!("invalid meter cursor for {id}"))?;
+            if now <= from { continue; } // backward clock: never move cursor backwards
+            while from < now {
+                let date = from.with_timezone(&tz).date_naive();
+                let mut midnight = date.succ_opt().ok_or_else(|| anyhow::anyhow!("date overflow"))?.and_hms_opt(0,0,0).unwrap();
+                // Some zones skip local midnight (or even a day). First valid minute
+                // of the next local date is the boundary; earliest handles DST folds.
+                let boundary = loop {
+                    if let Some(t) = tz.from_local_datetime(&midnight).earliest() { break t.with_timezone(&Utc); }
+                    midnight += chrono::Duration::minutes(1);
+                };
+                let until = now.min(boundary);
+                let hours = (until - from).num_milliseconds() as f64 / 3_600_000.0;
+                let gpu = gpu_rate * hours;
+                let storage = storage_rate * hours;
+                let date = date.to_string();
+                tx.execute("INSERT INTO instance_meter(date,instance_id,metered_usd,storage_usd,last_metered_at)
+                    VALUES(?1,?2,?3,?4,?5) ON CONFLICT(date,instance_id) DO UPDATE SET
+                    metered_usd=metered_usd+excluded.metered_usd,
+                    storage_usd=storage_usd+excluded.storage_usd, last_metered_at=excluded.last_metered_at",
+                    params![date,id,gpu,storage,until.to_rfc3339()])?;
+                tx.execute("INSERT INTO budget_days(date,metered_usd) VALUES(?1,?2)
+                    ON CONFLICT(date) DO UPDATE SET metered_usd=metered_usd+excluded.metered_usd",
+                    params![date,gpu+storage])?;
+                from = until;
+            }
+            tx.execute("UPDATE instances SET last_metered_at=?2 WHERE vast_id=?1", params![id,now.to_rfc3339()])?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -612,6 +712,14 @@ impl Db {
             params![date, traffic_usd],
         )?;
         Ok(())
+    }
+
+    /// Safety-critical callers must propagate read errors instead of assuming $0.
+    pub fn budget_totals(&self, date: &str) -> anyhow::Result<(f64, f64)> {
+        let conn = self.0.lock().unwrap();
+        let today = conn.query_row("SELECT COALESCE(SUM(metered_usd+traffic_usd),0) FROM budget_days WHERE date=?1", params![date], |r| r.get(0))?;
+        let month = conn.query_row("SELECT COALESCE(SUM(metered_usd+traffic_usd),0) FROM budget_days WHERE date LIKE ?1", params![format!("{}%", &date[..7])], |r| r.get(0))?;
+        Ok((today, month))
     }
 
     pub fn spent_today(&self, date: &str) -> f64 {
@@ -635,24 +743,19 @@ impl Db {
         .unwrap_or(0.0)
     }
 
-    pub fn set_reconciled(&self, date: &str, reconciled_usd: f64, credit_usd: f64) -> anyhow::Result<()> {
-        let conn = self.0.lock().unwrap();
-        conn.execute(
-            "INSERT INTO budget_days(date, reconciled_usd, last_credit_usd) VALUES(?1,?2,?3)
-             ON CONFLICT(date) DO UPDATE SET reconciled_usd=?2, last_credit_usd=?3",
-            params![date, reconciled_usd, credit_usd],
-        )?;
-        Ok(())
-    }
-
-    pub fn last_credit(&self, date: &str) -> Option<f64> {
-        let conn = self.0.lock().unwrap();
-        conn.query_row(
-            "SELECT last_credit_usd FROM budget_days WHERE date=?1",
-            params![date],
-            |r| r.get::<_, Option<f64>>(0),
-        )
-        .unwrap_or(None)
+    /// Accumulate balance deltas atomically. This is diagnostic only: top-ups,
+    /// refunds and non-pgpu contracts prevent balance changes being an invoice.
+    pub fn record_credit(&self, date: &str, credit: f64) -> anyhow::Result<f64> {
+        anyhow::ensure!(credit.is_finite(), "invalid provider balance");
+        let mut conn = self.0.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute("INSERT INTO budget_days(date,last_credit_usd) VALUES(?1,?2)
+            ON CONFLICT(date) DO UPDATE SET
+            reconciled_usd=reconciled_usd+MAX(COALESCE(last_credit_usd,?2)-?2,0), last_credit_usd=?2",
+            params![date,credit])?;
+        let total = tx.query_row("SELECT reconciled_usd FROM budget_days WHERE date=?1", params![date], |r| r.get(0))?;
+        tx.commit()?;
+        Ok(total)
     }
 
     // ------------------------------------------------------------ Offers cache
@@ -742,6 +845,7 @@ impl Db {
             machine_id: r.get("machine_id")?,
             fails: r.get("fails")?,
             blacklisted: r.get::<_, i64>("blacklisted")? != 0,
+            whitelisted: r.get::<_, i64>("whitelisted")? != 0,
             last_fail_at: r.get("last_fail_at")?,
             note: r.get("note")?,
         })

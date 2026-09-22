@@ -1,0 +1,12 @@
+*
+!Cargo.toml
+!Cargo.lock
+!crates/
+!crates/**
+!deploy/
+!deploy/Dockerfile
+**/target
+**/.env
+**/*.sqlite*
+**/*.db
+**/*.log

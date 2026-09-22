@@ -8,6 +8,26 @@ use praxis_policy::{
 };
 use std::collections::HashMap;
 
+#[test]
+fn pinned_warmup_and_draining_instances_are_not_removed() {
+    for state in [InstanceState::Booting, InstanceState::Draining] {
+        let mut a = inst(11, 1, Role::Llm, state);
+        a.pinned = true;
+        let s = snap(vec![slot(1, Role::Llm, vec![a], Some(11))]);
+        let actions = decide(&s, &cfg());
+        assert!(!actions.iter().any(|a| matches!(a, Action::Destroy {..} | Action::SwapOut {..} | Action::Stop {..})), "{actions:?}");
+    }
+}
+
+#[test]
+fn locked_slot_does_not_flip_or_destroy_on_replacement_readiness() {
+    let a = inst(11, 1, Role::Llm, InstanceState::Booting);
+    let b = inst(12, 1, Role::Llm, InstanceState::Healthy);
+    let mut s = slot(1, Role::Llm, vec![a,b], Some(11));
+    s.pinned = true;
+    assert!(decide(&snap(vec![s]), &cfg()).is_empty());
+}
+
 fn cfg() -> PolicyConfig {
     let mut slots = HashMap::new();
     slots.insert(
@@ -80,6 +100,8 @@ fn inst(vast_id: i64, slot_id: i64, role: Role, state: InstanceState) -> Instanc
         dph_total: 0.20,
         storage_usd_h: 0.005,
         created_at: now() - chrono::Duration::hours(1),
+        boot_started_at: now() - chrono::Duration::hours(1),
+        resume_at: None,
         idle_since: None,
         stopped_since: None,
         last_seen: Some(now()),
@@ -112,6 +134,7 @@ fn slot(id: i64, role: Role, instances: Vec<InstanceSnapshot>, active: Option<i6
             inet_down: 900.0,
             reliability2: 0.98,
             disk_bw: 2000.0,
+            ..Default::default()
         }),
         desired_running: false,
         local_weekday: 1,
@@ -237,7 +260,7 @@ fn on_demand_slot_never_cost_optimizes() {
     c.slots.get_mut(&1).unwrap().mode = SlotMode::OnDemand;
     c.slots.get_mut(&1).unwrap().swap.optimize_cost = true;
     let a = inst(11, 1, Role::Llm, InstanceState::Healthy);
-    let mut s = snap(vec![slot(1, Role::Llm, vec![a], Some(11))]);
+    let s = snap(vec![slot(1, Role::Llm, vec![a], Some(11))]);
     let actions = decide(&s, &c);
     assert!(!actions.iter().any(|x| matches!(x, Action::Create { .. })), "{actions:?}");
 }
@@ -322,7 +345,7 @@ fn replacement_healthy_flips_slot_and_swaps_out_old() {
 #[test]
 fn warmup_timeout_destroys_failed_backing() {
     let mut a = inst(11, 1, Role::Llm, InstanceState::Booting);
-    a.created_at = now() - chrono::Duration::hours(2); // > 45 min max_warmup
+    a.boot_started_at = now() - chrono::Duration::hours(2); // > 45 min max_warmup
     let s = snap(vec![slot(1, Role::Llm, vec![a], None)]);
     let actions = decide(&s, &cfg());
     assert!(actions.iter().any(|x| matches!(x, Action::Destroy { instance_id: 11, .. })), "{actions:?}");
@@ -409,6 +432,7 @@ fn cost_optimization_only_when_enabled_and_cheap_enough() {
         inet_down: 1200.0,
         reliability2: 0.99,
         disk_bw: 3000.0,
+        ..Default::default()
     });
     let actions = decide(&s, &cfg());
     assert!(actions.iter().any(|x| matches!(x, Action::Create { slot_id: 2, offer_id: 999, .. })), "{actions:?}");
@@ -418,6 +442,84 @@ fn cost_optimization_only_when_enabled_and_cheap_enough() {
     s2.slots[0].last_swap = Some(now() - chrono::Duration::minutes(30));
     let actions2 = decide(&s2, &cfg());
     assert!(!actions2.iter().any(|x| matches!(x, Action::Create { slot_id: 2, .. })), "{actions2:?}");
+}
+
+#[test]
+fn flip_waits_for_streams_and_busy_on_both_backers() {
+    for (in_flight, old_busy, new_busy) in [(1, false, false), (0, true, false), (0, false, true)] {
+        let mut a = inst(11, 1, Role::Llm, InstanceState::Healthy);
+        let mut b = inst(12, 1, Role::Llm, InstanceState::Healthy);
+        a.busy = old_busy; b.busy = new_busy;
+        let mut s = slot(1, Role::Llm, vec![a, b], Some(11)); s.in_flight = in_flight;
+        let actions = decide(&snap(vec![s]), &cfg());
+        assert!(!actions.iter().any(|a| matches!(a, Action::FlipSlot { .. } | Action::SwapOut { .. })), "{actions:?}");
+    }
+}
+
+#[test]
+fn resumed_contract_gets_a_fresh_warmup_deadline() {
+    let mut a = inst(11, 1, Role::Llm, InstanceState::Booting);
+    a.created_at = now() - chrono::Duration::days(3);
+    a.boot_started_at = now();
+    let s = snap(vec![slot(1, Role::Llm, vec![a], Some(11))]);
+    assert!(!decide(&s, &cfg()).iter().any(|a| matches!(a, Action::Destroy { .. })));
+}
+
+#[test]
+fn manual_contracts_ignore_lifecycle_automation_but_not_monthly_cap() {
+    for state in [InstanceState::Healthy, InstanceState::Booting, InstanceState::Stopped, InstanceState::Preempted] {
+        let mut a = inst(11, 1, Role::Llm, state);
+        a.mode = Mode::Manual;
+        a.idle_since = Some(now() - chrono::Duration::hours(5));
+        a.stopped_since = Some(now() - chrono::Duration::days(4));
+        a.lifecycle = praxis_common::Lifecycle::Ttl { ttl_s: 1, destroy: true };
+        let s = snap(vec![slot(1, Role::Llm, vec![a], Some(11))]);
+        assert!(!decide(&s, &cfg()).iter().any(|a| matches!(a, Action::Stop { .. } | Action::Destroy { .. } | Action::Start { .. } | Action::ChangeBid { .. })));
+    }
+    let mut a = inst(11, 1, Role::Llm, InstanceState::Healthy); a.mode = Mode::Manual;
+    let mut s = snap(vec![slot(1, Role::Llm, vec![a], Some(11))]);
+    s.spent_month_usd = 100.0;
+    let actions = decide(&s, &cfg());
+    assert!(actions.iter().any(|a| matches!(a, Action::Stop { reason, .. } if reason.contains("month"))));
+    assert!(!actions.iter().any(|a| matches!(a, Action::Start { .. } | Action::Create { .. })));
+}
+
+#[test]
+fn schedule_stops_after_close_but_not_from_ordinary_idle_during_window() {
+    let mut a = inst(11, 1, Role::Llm, InstanceState::Healthy);
+    a.idle_since = Some(now() - chrono::Duration::hours(2));
+    a.lifecycle = praxis_common::Lifecycle::Schedule { spec: "Mo-Fr 09:00-18:00".into(), prewarm_s: 1200, destroy: false };
+    let mut s = snap(vec![slot(1, Role::Llm, vec![a], Some(11))]);
+    s.slots[0].local_weekday = 1;
+    s.slots[0].local_minutes_of_day = 12 * 60;
+    assert!(!decide(&s, &cfg()).iter().any(|a| matches!(a, Action::Stop { .. })));
+    s.slots[0].local_minutes_of_day = 19 * 60;
+    assert!(decide(&s, &cfg()).iter().any(|a| matches!(a, Action::Stop { .. })));
+}
+
+#[test]
+fn sleep_duration_never_wraps_at_midnight_or_depends_on_local_hour() {
+    let mut a = inst(11, 1, Role::Llm, InstanceState::Stopped);
+    a.lifecycle = praxis_common::Lifecycle::Sleep { stop_after_idle_s: 60, resume_at: None, resume_after_s: Some(26 * 3600) };
+    a.stopped_since = Some(now() - chrono::Duration::hours(25));
+    let mut s = snap(vec![slot(1, Role::Llm, vec![a], Some(11))]);
+    assert!(!decide(&s, &cfg()).iter().any(|a| matches!(a, Action::Start { .. })));
+    s.slots[0].instances[0].stopped_since = Some(now() - chrono::Duration::hours(27));
+    assert!(decide(&s, &cfg()).iter().any(|a| matches!(a, Action::Start { .. })));
+    s.slots[0].instances[0].lifecycle = praxis_common::Lifecycle::Sleep { stop_after_idle_s: 60, resume_at: Some("07:30".into()), resume_after_s: None };
+    s.slots[0].instances[0].resume_at = Some(now() + chrono::Duration::hours(1));
+    assert!(!decide(&s, &cfg()).iter().any(|a| matches!(a, Action::Start { .. })));
+    s.slots[0].instances[0].resume_at = Some(now());
+    assert!(decide(&s, &cfg()).iter().any(|a| matches!(a, Action::Start { .. })));
+}
+
+#[test]
+fn scheduled_weekend_disk_is_not_garbage_collected_before_monday_resume() {
+    let mut a = inst(11, 1, Role::Llm, InstanceState::Stopped);
+    a.stopped_since = Some(now() - chrono::Duration::days(3));
+    a.lifecycle = praxis_common::Lifecycle::Schedule { spec: "Mo-Fr 09:00-18:00".into(), prewarm_s: 1200, destroy: false };
+    let mut s = snap(vec![slot(1, Role::Llm, vec![a], Some(11))]); s.slots[0].local_weekday = 7;
+    assert!(!decide(&s, &cfg()).iter().any(|a| matches!(a, Action::Destroy { .. })));
 }
 
 #[test]
@@ -468,7 +570,6 @@ fn schedule_start_and_stop() {
 fn limits_block_create() {
     let mut c = cfg();
     c.limits.max_instances = 1;
-    let a = inst(11, 2, Role::Media, InstanceState::Healthy);
     let mut s = snap(vec![slot(1, Role::Llm, vec![], None)]);
     s.slots[0].desired_running = true;
     s.instance_count = 1;
@@ -481,12 +582,12 @@ fn offer_score_prefers_cheap_rate_with_storage() {
     let o1 = OfferSnapshot {
         id: 1, machine_id: 0, gpu_name: "A".into(), min_bid: 0.10, dph_total: 0.0,
         storage_cost: 0.30, inet_down_cost: 0.005,
-        cpu_ram_gb: 0.0, gpu_ram_gb: 0.0, disk_gb: 0.0, inet_down: 0.0, reliability2: 0.0, disk_bw: 0.0,
+        ..Default::default()
     };
     let o2 = OfferSnapshot {
         id: 2, machine_id: 0, gpu_name: "B".into(), min_bid: 0.11, dph_total: 0.0,
         storage_cost: 0.05, inet_down_cost: 0.001,
-        cpu_ram_gb: 0.0, gpu_ram_gb: 0.0, disk_gb: 0.0, inet_down: 0.0, reliability2: 0.0, disk_bw: 0.0,
+        ..Default::default()
     };
     // 120 GB Disk, 20 GB Traffic, 4 h erwartet:
     assert!(o2.score(120, 20.0, 4.0) < o1.score(120, 20.0, 4.0));
@@ -499,12 +600,12 @@ fn offer_score_weights_reliability2() {
     let flaky = OfferSnapshot {
         id: 1, machine_id: 10, gpu_name: "3090 wackelig".into(), min_bid: 0.100, dph_total: 0.0,
         storage_cost: 0.0, inet_down_cost: 0.0,
-        cpu_ram_gb: 0.0, gpu_ram_gb: 0.0, disk_gb: 0.0, inet_down: 0.0, reliability2: 0.95, disk_bw: 0.0,
+        reliability2: 0.95, ..Default::default()
     };
     let solid = OfferSnapshot {
         id: 2, machine_id: 11, gpu_name: "3090 solide".into(), min_bid: 0.104, dph_total: 0.0,
         storage_cost: 0.0, inet_down_cost: 0.0,
-        cpu_ram_gb: 0.0, gpu_ram_gb: 0.0, disk_gb: 0.0, inet_down: 0.0, reliability2: 0.99, disk_bw: 0.0,
+        reliability2: 0.99, ..Default::default()
     };
     // flaky: 0.100/0.95 = 0.10526 — solid: 0.104/0.99 = 0.10505 → solid gewinnt.
     assert!(solid.score(60, 0.0, 4.0) < flaky.score(60, 0.0, 4.0));

@@ -19,7 +19,7 @@ use futures::{SinkExt, StreamExt};
 pub fn check_token(app: &SharedApp, req: &Request) -> bool {
     let token = app.cfg().router_token();
     if token.is_empty() {
-        return true; // offener Modus (nur lokal testen!)
+        return false; // Missing configuration must never grant administrator access.
     }
     match bearer(req.headers()) {
         Some(t) if t == token => true,
@@ -41,7 +41,9 @@ macro_rules! guarded {
 /// (Disk bleibt). Gegenstück zu destroy_all fürs sanfte Runterfahren.
 pub async fn sleep_all(app: AppCtx, req: Request) -> Response {
     guarded!(app, req);
-    crate::reconciler::set_auto_rent(&app.0, false, "api: sleep_all").await;
+    if let Err(e) = crate::reconciler::set_auto_rent(&app.0, false, "api: sleep_all").await {
+        return (StatusCode::BAD_GATEWAY, e.to_string()).into_response();
+    }
     (StatusCode::OK, "sleeping: auto_rent off, instances stopped").into_response()
 }
 
@@ -50,16 +52,32 @@ pub async fn sleep_all(app: AppCtx, req: Request) -> Response {
 /// Aufräumen + als Ziel für externe Cronjobs.
 pub async fn destroy_all(app: AppCtx, req: Request) -> Response {
     guarded!(app, req);
-    let body = axum::body::to_bytes(req.into_body(), 64 * 1024).await.unwrap_or_default();
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
-    let slots: Option<Vec<i64>> = payload
-        .get("slots")
-        .and_then(|s| serde_json::from_value(s.clone()).ok());
-    let n = crate::reconciler::destroy_all_instances(&app.0, slots.as_deref(), "api: destroy_all").await;
-    if payload.get("auto_rent").and_then(|a| a.as_bool()).unwrap_or(false) {
-        crate::reconciler::set_auto_rent(&app.0, false, "api: destroy_all").await;
+    #[derive(Deserialize, Default)]
+    #[serde(deny_unknown_fields)]
+    struct DestroyRequest { slots: Option<Vec<i64>>, auto_rent: Option<bool> }
+    let Ok(body) = axum::body::to_bytes(req.into_body(), 64 * 1024).await else {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "request body too large").into_response();
+    };
+    let payload = if body.is_empty() { DestroyRequest::default() } else {
+        let Ok(payload) = serde_json::from_slice::<DestroyRequest>(&body) else {
+            return (StatusCode::BAD_REQUEST, "invalid destroy request").into_response();
+        };
+        payload
+    };
+    if payload.slots.as_ref().is_some_and(|ids| ids.iter().any(|id| app.cfg().slot(*id).is_none())) {
+        return (StatusCode::BAD_REQUEST, "unknown slot").into_response();
     }
-    (StatusCode::OK, format!("destroyed {n} instances")).into_response()
+    if let Some(enabled) = payload.auto_rent {
+        // Persist the switch without a redundant stop-before-destroy round trip.
+        let _lock = app.management.lock().await;
+        if let Err(e) = app.db.set_auto_rent(enabled) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+    }
+    match crate::reconciler::destroy_all_instances(&app.0, payload.slots.as_deref(), "api: destroy_all").await {
+        Ok(n) => (StatusCode::OK, format!("destroyed {n} instances")).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
+    }
 }
 
 /// `GET /api/v1/config` — Rohtext der config.toml (Bearer-geschützt).
@@ -118,6 +136,7 @@ pub async fn apply_config(app: &SharedApp, raw: &str) -> anyhow::Result<String> 
         new_cfg.netbird.api_token = cur.netbird.api_token.clone();
     }
 
+    new_cfg.validate_auth()?;
     // Slot-DB synchronisieren (neue Slots, geänderte Rollen/Namen).
     app.db.init_slots(&new_cfg)?;
     // Atomar schreiben: tmp + rename — der Router startet nach einem Crash
@@ -142,6 +161,19 @@ pub async fn apply_config(app: &SharedApp, raw: &str) -> anyhow::Result<String> 
 }
 
 // ------------------------------------------------------------- State
+
+/// Readiness of the control plane, not a promise that a cold GPU is available.
+/// No secrets are exposed; liveness is separately served at /healthz.
+pub async fn ready(app: AppCtx) -> Response {
+    use std::sync::atomic::Ordering;
+    let last = app.last_reconcile.load(Ordering::Relaxed);
+    let max_age = app.cfg().vast.poll_interval_s.max(5).saturating_mul(3).saturating_add(60);
+    let age = chrono::Utc::now().timestamp().saturating_sub(last);
+    let ready = !app.shutting_down.load(Ordering::Relaxed) && last > 0 && age >= 0
+        && age as u64 <= max_age && app.db.budget_totals(&crate::node::local_date(&app.0)).is_ok();
+    (if ready { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE },
+        if ready { "ready" } else { "not ready" }).into_response()
+}
 
 pub async fn state(app: AppCtx, req: Request) -> Response {
     guarded!(app, req);
@@ -213,7 +245,25 @@ pub async fn offers(app: AppCtx, Query(params): Query<HashMap<String, String>>, 
     };
     let refresh = params.contains_key("refresh");
     match crate::reconciler::search_slot_offers(&app.0, slot_id, refresh).await {
-        Ok(offers) => axum::Json(offers).into_response(),
+        Ok(offers) => {
+            let cfg = app.cfg();
+            let slot = cfg.slot(slot_id).unwrap();
+            let mode = match params.get("mode").map(String::as_str) {
+                Some("on_demand") => Mode::OnDemand,
+                Some("interruptible") => Mode::Interruptible,
+                Some(_) => return (StatusCode::BAD_REQUEST, "mode must be interruptible|on_demand").into_response(),
+                None if slot.policy().mode == praxis_policy::SlotMode::OnDemand => Mode::OnDemand,
+                None => Mode::Interruptible,
+            };
+            let scores = crate::performance::host_scores(&app.0, slot).unwrap_or_default();
+            axum::Json(offers.into_iter().map(|o| {
+                let check = crate::catalog::assess(&app.0,slot,&o,mode,praxis_policy::eligibility::rental_price(&o,mode,&slot.bid),slot.disk_gb);
+                let mut value = serde_json::to_value(&o).unwrap();
+                value["assessment"] = serde_json::to_value(check).unwrap();
+                value["performance_score"] = serde_json::json!(scores.get(&(o.machine_id,crate::performance::allocation_key(&o,slot.disk_gb))));
+                value
+            }).collect::<Vec<_>>()).into_response()
+        }
         Err(e) => (StatusCode::BAD_GATEWAY, format!("{e}")).into_response(),
     }
 }
@@ -228,24 +278,33 @@ pub async fn machines(app: AppCtx, req: Request) -> Response {
 
 pub async fn machine_action(app: AppCtx, Path((machine_id, action)): Path<(i64, String)>, req: Request) -> Response {
     guarded!(app, req);
-    let (set, note) = match action.as_str() {
-        "blacklist" => (true, "manuell blacklisted (API)"),
-        "unblacklist" => (false, ""),
-        _ => return (StatusCode::BAD_REQUEST, "unknown action; use blacklist|unblacklist").into_response(),
-    };
-    if app.db.machine_stat(machine_id).is_none() && !set {
-        return (StatusCode::NOT_FOUND, "machine unknown").into_response();
+    match crate::catalog::machine_action(&app.0, machine_id, &action).await {
+        Ok(()) => (StatusCode::OK, action).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     }
-    let _ = app.db.set_machine_blacklist(machine_id, set, note);
-    app.events.emit(
-        &app.0.db,
-        if set { "machine_blacklisted" } else { "machine_unblacklisted" },
-        None,
-        None,
-        &format!("Host {machine_id} {} (API)", if set { "blacklisted" } else { "von Blacklist entfernt" }),
-        &serde_json::json!({"machine_id": machine_id}),
-    );
-    (StatusCode::OK, if set { "blacklisted" } else { "unblacklisted" }).into_response()
+}
+
+/// Raw history, newest first. Page using before=<last id>; bounded to 1000 rows.
+pub async fn performance_history(app: AppCtx, Query(q): Query<HashMap<String,String>>, req: Request) -> Response {
+    guarded!(app, req);
+    let number=|name: &str| -> Result<Option<i64>, std::num::ParseIntError> {q.get(name).map(|s|s.parse()).transpose()};
+    let (Ok(slot),Ok(machine),Ok(before),Ok(limit))=(number("slot"),number("machine_id"),number("before"),number("limit")) else {
+        return (StatusCode::BAD_REQUEST,"invalid integer filter").into_response();
+    };
+    let limit=limit.unwrap_or(100);
+    if !(1..=1000).contains(&limit) {return (StatusCode::BAD_REQUEST,"limit must be 1..1000").into_response();}
+    match app.db.performance_samples(slot,machine,before,limit as usize) {
+        Ok(rows)=>axum::Json(rows).into_response(),
+        Err(e)=>(StatusCode::INTERNAL_SERVER_ERROR,e.to_string()).into_response(),
+    }
+}
+
+pub async fn performance_summary(app: AppCtx, req: Request) -> Response {
+    guarded!(app, req);
+    match app.db.performance_catalogue() {
+        Ok(rows)=>axum::Json(rows.into_iter().map(|r|serde_json::json!({"means":r.means(),"history":r})).collect::<Vec<_>>()).into_response(),
+        Err(e)=>(StatusCode::INTERNAL_SERVER_ERROR,e.to_string()).into_response(),
+    }
 }
 
 // ------------------------------------------------------------- Slot actions
@@ -255,6 +314,9 @@ pub async fn slot_action(app: AppCtx, Path((slot_id, action)): Path<(i64, String
     let body = axum::body::to_bytes(req.into_body(), 64 * 1024).await.unwrap_or_default();
     let payload: serde_json::Value = serde_json::from_slice(&body).unwrap_or(serde_json::json!({}));
     let reason = format!("api: slot {slot_id} {action}");
+    if app.cfg().slot(slot_id).is_none() {
+        return (StatusCode::NOT_FOUND, "unknown slot").into_response();
+    }
 
     match action.as_str() {
         "wake" => {
@@ -280,7 +342,9 @@ pub async fn slot_action(app: AppCtx, Path((slot_id, action)): Path<(i64, String
                     )
                         .into_response();
                 }
-                crate::reconciler::set_auto_rent(&app.0, true, "api: force wake").await;
+                if let Err(e) = crate::reconciler::set_auto_rent(&app.0, true, "api: force wake").await {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+                }
             }
             let _ = app.db.set_slot_desired_audited(slot_id, true, "api: wake");
             app.events.emit(&app.db, "wake", Some(slot_id), None, &reason, &payload);
@@ -291,30 +355,27 @@ pub async fn slot_action(app: AppCtx, Path((slot_id, action)): Path<(i64, String
             let _ = app.db.set_slot_desired_audited(slot_id, false, "api: sleep")
                 .map_err(|e| tracing::warn!(%e, "audit write"));
             if let Some(active) = app.db.active_instance(slot_id) {
-                let _ = crate::reconciler::stop_instance(&app.0, active, &reason);
+                if let Err(e) = crate::reconciler::stop_instance(&app.0, active, &reason).await {
+                    return (StatusCode::BAD_GATEWAY, format!("stop pending: {e}")).into_response();
+                }
             }
             (StatusCode::OK, "stopping").into_response()
         }
         "destroy" => {
-            // Bugfix 21.09.: bisher nur die ACTIVE Instanz — während
-            // Warmup/Boot ist active None → Button war ein stilles No-Op
-            // ("der Destroy-Button zerstört die Instanz nicht"). Jetzt:
-            // ALLE Instanzen des Slots.
-            let mut n = 0;
-            for inst in app.db.instances(false) {
-                if inst.slot_id == slot_id && inst.destroyed_at.is_none() && !inst.pinned {
-                    if crate::reconciler::destroy_instance(&app.0, inst.vast_id, &reason).await.is_ok() {
-                        n += 1;
-                    }
-                }
+            match crate::reconciler::destroy_all_instances(&app.0, Some(&[slot_id]), &reason).await {
+                Ok(n) => (StatusCode::OK, format!("destroyed {n}")).into_response(),
+                Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
             }
-            (StatusCode::OK, format!("destroying {n}")).into_response()
         }
         "start" => {
             if let Some(active) = app.db.active_instance(slot_id) {
                 let _ = app.db.set_slot_desired_audited(slot_id, true, "api: slot start")
                     .map_err(|e| tracing::warn!(%e, "audit write"));
-                let _ = crate::reconciler::start_instance(&app.0, active, &reason);
+                if let Err(e) = crate::reconciler::start_instance(&app.0, active, &reason).await {
+                    return (StatusCode::BAD_GATEWAY, format!("start failed: {e}")).into_response();
+                }
+            } else {
+                return (StatusCode::NOT_FOUND, "no active instance").into_response();
             }
             (StatusCode::OK, "starting").into_response()
         }
@@ -325,6 +386,7 @@ pub async fn slot_action(app: AppCtx, Path((slot_id, action)): Path<(i64, String
             (StatusCode::OK, "swap requested").into_response()
         }
         "pin" => {
+            let _lock = app.management.lock().await;
             if let Some(active) = app.db.active_instance(slot_id) {
                 let _ = app.db.set_slot_pin(slot_id, Some(active));
                 let _ = app.db.update_instance_pinned(active, true);
@@ -333,6 +395,7 @@ pub async fn slot_action(app: AppCtx, Path((slot_id, action)): Path<(i64, String
             (StatusCode::OK, "pinned").into_response()
         }
         "unpin" => {
+            let _lock = app.management.lock().await;
             let _ = app.db.set_slot_pin(slot_id, None);
             for inst in app.db.instances(false) {
                 if inst.slot_id == slot_id && inst.pinned {
@@ -347,18 +410,9 @@ pub async fn slot_action(app: AppCtx, Path((slot_id, action)): Path<(i64, String
                 return (StatusCode::BAD_REQUEST, "missing price").into_response();
             };
             if let Some(active) = app.db.active_instance(slot_id) {
-                let vast_client = app.vast.lock().unwrap().clone();
-        if let Some(vast) = vast_client {
-                    match vast.set_bid(active, price).await {
-                        Ok(_) => {
-                            let _ = app.db.set_instance_bid(active, price);
-                            app.events.emit(&app.db, "bid_changed", Some(slot_id), Some(active), &format!("Gebot → {price:.4} $/h ({reason})"), &payload);
-                            (StatusCode::OK, "bid updated").into_response()
-                        }
-                        Err(e) => (StatusCode::BAD_GATEWAY, format!("{e}")).into_response(),
-                    }
-                } else {
-                    (StatusCode::SERVICE_UNAVAILABLE, "vast api not configured").into_response()
+                match crate::operations::change_bid(&app.0, active, price, &reason).await {
+                    Ok(()) => (StatusCode::OK, "bid updated").into_response(),
+                    Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
                 }
             } else {
                 (StatusCode::NOT_FOUND, "no active instance").into_response()
@@ -385,9 +439,7 @@ pub struct CreateInstanceBody {
     #[serde(default)]
     #[allow(dead_code)]
     pub search: Option<String>, // live-Suche statt offer_id
-    /// true = bewusst über Ceiling mieten (Notfall). Default: nein — die
-    /// Ceiling ist ein hartes Budget, manuelles Mieten umgeht sie NICHT mehr
-    /// (21.09.: „20 €/h-Instanz"-Überraschungen über do_rent).
+    /// Legacy field: force overrides are rejected, never bypass admission.
     #[serde(default)]
     pub force: bool,
 }
@@ -418,22 +470,13 @@ pub async fn instance_create(app: AppCtx, req: Request) -> Response {
     let Some(price) = price else {
         return (StatusCode::BAD_REQUEST, "no price").into_response();
     };
-    // Hartes Preisfenster durchsetzen (search filtert bereits — das hier
-    // fängt explizite price_usd_h-Übergaben und UI-Edge-Cases ab).
-    if !payload.force {
-        let rate = if payload.mode == Mode::Interruptible { offer.min_bid } else { offer.dph_total };
-        if rate < slot.bid.rent_min_usd_h || rate > slot.bid.ceiling_usd_h {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "price {:.4} $/h außerhalb Fenster [{:.4}, {:.4}] $/h (slot {}) — force=true zum bewussten Überschreiten",
-                    rate, slot.bid.rent_min_usd_h, slot.bid.ceiling_usd_h, slot.id
-                ),
-            )
-                .into_response();
-        }
-    }
+    if payload.force { return (StatusCode::BAD_REQUEST,"force overrides disabled; configure limits explicitly").into_response(); }
     let disk = payload.disk_gb.unwrap_or(slot.disk_gb);
+    let check = crate::catalog::assess(&app.0,&slot,offer,payload.mode,price,disk);
+    if !check.eligible {return (StatusCode::BAD_REQUEST,check.reasons.join("; ")).into_response();}
+    if !price.is_finite() || price <= 0.0 || disk <= 0 {
+        return (StatusCode::BAD_REQUEST, "price and disk must be positive").into_response();
+    }
     match crate::reconciler::create_instance(
         &app.0,
         payload.slot_id,
@@ -442,6 +485,7 @@ pub async fn instance_create(app: AppCtx, req: Request) -> Response {
         price,
         disk,
         payload.lifecycle.clone().unwrap_or_default(),
+        false,
         "api: manual rent",
     )
     .await
@@ -461,7 +505,11 @@ pub async fn instance_action(app: AppCtx, Path((vast_id, action)): Path<(i64, St
     }
 
     match action.as_str() {
-        "stop" => match crate::reconciler::stop_instance(&app.0, vast_id, &reason) {
+        "benchmark" => match crate::performance::start_benchmark(&app.0, vast_id).await {
+            Ok(()) => (StatusCode::ACCEPTED, "benchmark scheduled; results: /api/v1/performance").into_response(),
+            Err(e) => (StatusCode::CONFLICT, e.to_string()).into_response(),
+        },
+        "stop" => match crate::reconciler::stop_instance(&app.0, vast_id, &reason).await {
             Ok(_) => (StatusCode::OK, "stopping").into_response(),
             Err(e) => (StatusCode::BAD_GATEWAY, format!("{e}")).into_response(),
         },
@@ -478,6 +526,7 @@ pub async fn instance_action(app: AppCtx, Path((vast_id, action)): Path<(i64, St
             Err(e) => (StatusCode::BAD_GATEWAY, format!("{e}")).into_response(),
         },
         "pin" => {
+            let _lock = app.management.lock().await;
             let _ = app.db.update_instance_pinned(vast_id, true);
             app.events.emit(&app.db, "pinned", None, Some(vast_id), &reason, &payload);
             (StatusCode::OK, "pinned").into_response()
@@ -488,6 +537,7 @@ pub async fn instance_action(app: AppCtx, Path((vast_id, action)): Path<(i64, St
         // kein Pool-Refill, kein Auto-Rent). Manuelles Stop/Destroy bleibt
         // möglich (bewusste Aktion schlägt immer den Lock).
         "lock" => {
+            let _lock = app.management.lock().await;
             let slot_id = app.db.instance(vast_id).map(|i| i.slot_id);
             let _ = app.db.update_instance_pinned(vast_id, true);
             if let Some(sid) = slot_id {
@@ -497,6 +547,7 @@ pub async fn instance_action(app: AppCtx, Path((vast_id, action)): Path<(i64, St
             (StatusCode::OK, "locked").into_response()
         }
         "unlock" => {
+            let _lock = app.management.lock().await;
             let slot_id = app.db.instance(vast_id).map(|i| i.slot_id);
             let _ = app.db.update_instance_pinned(vast_id, false);
             if let Some(sid) = slot_id {
@@ -518,33 +569,21 @@ pub async fn instance_action(app: AppCtx, Path((vast_id, action)): Path<(i64, St
             let Some(price) = payload.get("price").and_then(|p| p.as_f64()) else {
                 return (StatusCode::BAD_REQUEST, "missing price").into_response();
             };
-            let vast_client = app.vast.lock().unwrap().clone();
-            let Some(vast) = vast_client else {
-                return (StatusCode::SERVICE_UNAVAILABLE, "vast api not configured").into_response();
-            };
-            match vast.set_bid(vast_id, price).await {
-                Ok(_) => {
-                    let _ = app.db.set_instance_bid(vast_id, price);
-                    app.events.emit(&app.db, "bid_changed", None, Some(vast_id), &format!("Gebot → {price:.4} $/h"), &payload);
-                    (StatusCode::OK, "bid updated").into_response()
-                }
-                Err(e) => (StatusCode::BAD_GATEWAY, format!("{e}")).into_response(),
+            match crate::operations::change_bid(&app.0, vast_id, price, &reason).await {
+                Ok(()) => (StatusCode::OK, "bid updated").into_response(),
+                Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
             }
         }
         "mode" => {
             let Some(mode) = payload.get("mode").and_then(|m| serde_json::from_value::<Mode>(m.clone()).ok()) else {
                 return (StatusCode::BAD_REQUEST, "bad mode").into_response();
             };
-            let _ = app.db.update_instance_mode(vast_id, mode);
-            app.events.emit(
-                &app.db,
-                "mode_changed",
-                None,
-                Some(vast_id),
-                &format!("Modus → {mode} (Hot-Swap bei nächster Gelegenheit)"),
-                &payload,
-            );
-            (StatusCode::OK, "mode updated").into_response()
+            if app.db.instance(vast_id).map(|i| i.mode) != Some(mode) {
+                // A DB edit cannot convert the actual Vast contract and would
+                // corrupt the meter. Require an explicit replacement rental.
+                return (StatusCode::CONFLICT, "contract mode is immutable; rent a replacement in the desired mode").into_response();
+            }
+            (StatusCode::OK, "mode unchanged").into_response()
         }
         "lifecycle" => {
             let Some(lc) = payload.get("lifecycle").and_then(|l| serde_json::from_value::<praxis_common::Lifecycle>(l.clone()).ok()) else {
@@ -627,8 +666,8 @@ pub async fn term_ws(app: AppCtx, Path(vast_id): Path<i64>, ws: WebSocketUpgrade
             return;
         }
 
-        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
-        app.hub.register_term(term_id, out_tx);
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(64);
+        app.hub.register_term(vast_id, term_id, out_tx);
 
         let hub = app.hub.clone();
         loop {
@@ -693,7 +732,8 @@ pub async fn term_ws(app: AppCtx, Path(vast_id): Path<i64>, ws: WebSocketUpgrade
                 }
             }
         }
-        app.hub.unregister_term(term_id);
+        let _ = hub.term_send(vast_id, praxis_common::node::RouterCommand::TermClose { id: term_id });
+        app.hub.unregister_term(vast_id, term_id);
     })
 }
 
@@ -761,7 +801,9 @@ pub async fn auto_rent_set(app: AppCtx, req: Request) -> Response {
         )
             .into_response();
     };
-    crate::reconciler::set_auto_rent(&app.0, enabled, "api").await;
+    if let Err(e) = crate::reconciler::set_auto_rent(&app.0, enabled, "api").await {
+        return (StatusCode::BAD_GATEWAY, e.to_string()).into_response();
+    }
     (
         StatusCode::OK,
         format!(

@@ -2,6 +2,8 @@
 //! Kein I/O, keine Zeitmessung — alles kommt über den Snapshot. 100 % testbar.
 
 pub mod schedule;
+pub mod eligibility;
+pub mod performance;
 
 use chrono::{DateTime, Utc};
 use praxis_common::{Action, InstanceState, Mode, Role};
@@ -51,7 +53,7 @@ fn d_max_rate() -> f64 {
     0.60
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BidConfig {
     #[serde(default = "d_margin")]
     pub margin: f64,
@@ -62,6 +64,12 @@ pub struct BidConfig {
     /// (trotz Suchfilter) sind verdächtige Faker/brechen beim Mieten. 0 = aus.
     #[serde(default)]
     pub rent_min_usd_h: f64,
+}
+
+impl Default for BidConfig {
+    fn default() -> Self {
+        Self { margin: d_margin(), ceiling_usd_h: 0.0, defend_when_busy: d_defend(), rent_min_usd_h: 0.0 }
+    }
 }
 
 fn d_margin() -> f64 {
@@ -77,7 +85,7 @@ pub struct IdleConfig {
     pub destroy_after_stopped_s: i64,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SwapConfig {
     #[serde(default = "d_true")]
     pub on_preempt: bool,
@@ -101,6 +109,15 @@ pub struct SwapConfig {
     /// Download fällt über agent-unreachable/instance_gone weiter auf.
     #[serde(default)]
     pub allow_long_downloads: bool,
+}
+
+impl Default for SwapConfig {
+    fn default() -> Self {
+        Self { on_preempt: true, on_bid_pressure: true, optimize_cost: false,
+            min_savings_pct: d_savings(), max_warmup_s: d_warmup(),
+            min_swap_interval_s: d_swap_h(), keep_warm_window_s: d_keep_warm(),
+            allow_long_downloads: false }
+    }
 }
 
 fn d_true() -> bool {
@@ -183,7 +200,7 @@ pub struct PolicyConfig {
 
 // ---------------------------------------------------------------- Snapshot
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct OfferSnapshot {
     pub id: i64,
     /// Vast-Maschine (Blacklist-Key); 0 = unbekannt (alte Caches).
@@ -207,6 +224,12 @@ pub struct OfferSnapshot {
     pub reliability2: f64,
     #[serde(default)]
     pub disk_bw: f64,
+    #[serde(default)]
+    pub num_gpus: i64,
+    #[serde(default)]
+    pub cuda_max_good: Option<f64>,
+    #[serde(default)]
+    pub cpu_cores: Option<f64>,
 }
 
 impl OfferSnapshot {
@@ -242,6 +265,7 @@ pub struct InstanceSnapshot {
     pub state: InstanceState,
     pub actual_status: String,
     pub intended_status: String,
+    /// Whether this instance has EVER reached readiness (current state is above).
     pub healthy: bool,
     pub busy: bool,
     pub busy_reason: String,
@@ -250,6 +274,10 @@ pub struct InstanceSnapshot {
     pub dph_total: f64,
     pub storage_usd_h: f64,
     pub created_at: DateTime<Utc>,
+    /// Current boot/resume attempt, not the lifetime of the paid contract.
+    pub boot_started_at: DateTime<Utc>,
+    /// Router resolves local resume_at (including DST) from stopped_since.
+    pub resume_at: Option<DateTime<Utc>>,
     pub idle_since: Option<DateTime<Utc>>,
     pub stopped_since: Option<DateTime<Utc>>,
     pub last_seen: Option<DateTime<Utc>>,
@@ -363,8 +391,13 @@ pub fn decide(snap: &Snapshot, cfg: &PolicyConfig) -> Vec<Action> {
     // --- Budget-Hard-Cap: real akkumulierte Kosten ueberstiegen -> alles drainen.
     // hard_action: "stop" (Disk bleibt) oder "destroy" (Boxen weg — Storage-
     // Abfluss null; gewaehlt via [budget] hard_action = "destroy").
-    if snap.spent_today_usd >= hard_usd {
+    if snap.spent_today_usd >= hard_usd || snap.spent_month_usd >= monthly_usd {
         let destroy_mode = cfg.budget.hard_action.trim().eq_ignore_ascii_case("destroy");
+        let cap = if snap.spent_month_usd >= monthly_usd {
+            format!("budget hard cap: month {:.2} USD >= {monthly_usd:.2} USD", snap.spent_month_usd)
+        } else {
+            format!("budget hard cap: today {:.2} USD >= {hard_usd:.2} USD", snap.spent_today_usd)
+        };
         for slot in &snap.slots {
             for inst in &slot.instances {
                 if inst.pinned {
@@ -373,27 +406,20 @@ pub fn decide(snap: &Snapshot, cfg: &PolicyConfig) -> Vec<Action> {
                 if destroy_mode {
                     actions.push(Action::Destroy {
                         instance_id: inst.vast_id,
-                        reason: format!(
-                            "budget hard cap (destroy): heute {spent:.2} USD >= {hard_usd:.2} USD", spent = snap.spent_today_usd
-                        ),
+                        reason: format!("{cap} (destroy)"),
                     });
-                } else if inst.is_running() {
+                } else if inst.actual_status == "running" || inst.state.is_active() || inst.state == InstanceState::Requested {
                     actions.push(Action::Stop {
                         instance_id: inst.vast_id,
-                        reason: format!(
-                            "budget hard cap: heute {spent:.2} USD >= {hard_usd:.2} USD", spent = snap.spent_today_usd
-                        ),
+                        reason: cap.clone(),
                     });
                 }
             }
         }
         actions.push(Action::Alert {
             kind: "budget_hard".into(),
-            message: format!(
-                "Hard-Cap erreicht: heute {:.2} $ verbraucht (Limit {hard_usd:.2} $) — alle Instanzen {}.",
-                snap.spent_today_usd,
-                if destroy_mode { "zerstört" } else { "gestoppt" }
-            ),
+            message: format!("{cap} — {} nicht gepinnter Instanzen angefordert; Provider-Bestätigung steht aus.",
+                if destroy_mode { "Destroy" } else { "Stop" }),
         });
         return actions;
     }
@@ -420,18 +446,19 @@ pub fn decide(snap: &Snapshot, cfg: &PolicyConfig) -> Vec<Action> {
 
         // --- Health-Clamp: keine Automatik auf gepinnten Slots/Instanzen.
         let slot_pinned = slot.pinned;
+        if slot_pinned { continue; }
         let active = slot.active();
 
         // --- Warmup-Watchdog: Backversuch abbrechen.
         for inst in &slot.instances {
-            if scfg.swap.allow_long_downloads {
-                // Bewusst: keine Warmup-Zeitbombe bei großen Downloads.
+            if inst.pinned || inst.mode == Mode::Manual || scfg.swap.allow_long_downloads {
+                // Bewusst: keine Warmup-Zeitbombe bei Locks/großen Downloads.
                 continue;
             }
             if inst.state.is_active()
                 && inst.state != InstanceState::Healthy
                 && inst.state != InstanceState::Draining
-                && (snap.now - inst.created_at).num_seconds() > scfg.swap.max_warmup_s
+                && (snap.now - inst.boot_started_at).num_seconds() > scfg.swap.max_warmup_s
             {
                 actions.push(Action::Destroy {
                     instance_id: inst.vast_id,
@@ -452,7 +479,9 @@ pub fn decide(snap: &Snapshot, cfg: &PolicyConfig) -> Vec<Action> {
         // healthy Boxen — Flip+SwapOut nur, wenn die AKTIVE krank ist
         // (Failover) oder klassischer Einzel-Swap (pool.warm <= 1, das
         // Replacement wurde gezielt als Ersatz gemietet).
-        if let Some(repl) = slot.healthy_replacement() {
+        if let Some(repl) = slot.healthy_replacement().filter(|repl| {
+            slot.in_flight == 0 && !repl.busy && !active.is_some_and(|old| old.pinned || old.busy || old.mode == Mode::Manual)
+        }) {
             if let Some(old) = active {
                 if old.vast_id != repl.vast_id {
                     let old_healthy = old.state == InstanceState::Healthy;
@@ -492,7 +521,7 @@ pub fn decide(snap: &Snapshot, cfg: &PolicyConfig) -> Vec<Action> {
         // zuerst Reserve starten (Disk warm, kein Image-Pull), sonst neu
         // mieten bis pool.total. Warming-Gate: bereits aktive (auch
         // ungeflippte) zählen — kein Doppel-Mieten.
-        if slot.desired_running && !slot_pinned {
+        if slot.desired_running && !slot_pinned && !active.is_some_and(|i| i.mode == Mode::Manual) {
             let actives = slot.instances.iter().filter(|i| i.state.is_active()).count();
             // Live-Zähler fürs total-Limit: Preempted (nie-healthy-Zombies UND
             // ausgebene Boxen) zählen nicht — sie werden geräumt bzw. als
@@ -512,7 +541,7 @@ pub fn decide(snap: &Snapshot, cfg: &PolicyConfig) -> Vec<Action> {
                 if let Some(cand) = slot
                     .instances
                     .iter()
-                    .find(|i| i.state == InstanceState::Stopped && !i.pinned)
+                    .find(|i| i.state == InstanceState::Stopped && !i.pinned && i.mode != Mode::Manual)
                 {
                     if let Some(r) = budget_ok_for_start(snap, cfg, cand, hours_to_end, soft_usd, monthly_usd) {
                         actions.push(Action::Start {
@@ -540,7 +569,7 @@ pub fn decide(snap: &Snapshot, cfg: &PolicyConfig) -> Vec<Action> {
         }
 
         if let Some(inst) = active {
-            let pinned = inst.pinned || slot_pinned;
+            let pinned = inst.pinned || slot_pinned || inst.mode == Mode::Manual;
             let mut replacement_queued = false;
 
             // --- Preempted (Trigger A): Replacement nur bei frischem Traffic.
@@ -654,7 +683,8 @@ pub fn decide(snap: &Snapshot, cfg: &PolicyConfig) -> Vec<Action> {
                         _ => scfg.idle.stop_after_s,
                     };
                     let over_soft_idle = snap.spent_today_usd >= soft_usd && idle_secs > 0;
-                    if idle_secs >= stop_after || over_soft_idle {
+                    let idle_managed = matches!(inst.lifecycle, praxis_common::Lifecycle::Auto | praxis_common::Lifecycle::Sleep { .. });
+                    if (idle_managed && idle_secs >= stop_after) || over_soft_idle {
                         actions.push(Action::Stop {
                             instance_id: inst.vast_id,
                             reason: if over_soft_idle {
@@ -672,7 +702,7 @@ pub fn decide(snap: &Snapshot, cfg: &PolicyConfig) -> Vec<Action> {
         // (Vast hat sie beendet; Storage läuft bis destroy weiter). Healthy
         // gewesene bleiben für Restart-Präferenz/manuelle Entscheidung.
         for inst in &slot.instances {
-            if inst.state == InstanceState::Preempted && !inst.healthy && !inst.pinned {
+            if inst.state == InstanceState::Preempted && !inst.healthy && !inst.pinned && inst.mode != Mode::Manual {
                 // Download-Boxen weiter stehen lassen, wenn gewünscht
                 // (Disk+Warmup bleiben erhalten — Restart statt Neumiete).
                 if scfg.swap.allow_long_downloads {
@@ -691,7 +721,7 @@ pub fn decide(snap: &Snapshot, cfg: &PolicyConfig) -> Vec<Action> {
         // Traffic läuft die Box sonst Storage-Kosten ohne Nutzen.
         if scfg.pool.total > 1 {
             for inst in &slot.instances {
-                if inst.state != InstanceState::Preempted || !inst.healthy || inst.pinned {
+                if inst.state != InstanceState::Preempted || !inst.healthy || inst.pinned || inst.mode == Mode::Manual {
                     continue;
                 }
                 let stale = slot
@@ -722,7 +752,8 @@ pub fn decide(snap: &Snapshot, cfg: &PolicyConfig) -> Vec<Action> {
             .count();
         let pool_reserve = slot.desired_running && scfg.pool.total > 1 && live <= scfg.pool.total;
         for inst in &slot.instances {
-            if inst.state == InstanceState::Stopped && !inst.pinned && !pool_reserve {
+            let has_resume = matches!(inst.lifecycle, praxis_common::Lifecycle::Schedule { .. } | praxis_common::Lifecycle::Sleep { .. });
+            if inst.state == InstanceState::Stopped && !inst.pinned && inst.mode != Mode::Manual && !pool_reserve && !has_resume {
                 if let Some(since) = inst.stopped_since {
                     let stopped_secs = (snap.now - since).num_seconds();
                     if stopped_secs >= scfg.idle.destroy_after_stopped_s {
@@ -740,7 +771,7 @@ pub fn decide(snap: &Snapshot, cfg: &PolicyConfig) -> Vec<Action> {
 
         // --- Draining abschließen (kein Traffic mehr → stop/destroy).
         for inst in &slot.instances {
-            if inst.state == InstanceState::Draining && slot.in_flight == 0 {
+            if !inst.pinned && inst.mode != Mode::Manual && !inst.busy && inst.state == InstanceState::Draining && slot.in_flight == 0 {
                 actions.push(Action::SwapOut {
                     instance_id: inst.vast_id,
                     destroy: slot.role == Role::Media,
@@ -751,7 +782,7 @@ pub fn decide(snap: &Snapshot, cfg: &PolicyConfig) -> Vec<Action> {
 
         // --- Lifecycle-Zeitpläne auf ALLE Instanzen des Slots.
         for inst in &slot.instances {
-            if inst.pinned || slot_pinned {
+            if inst.pinned || slot_pinned || inst.mode == Mode::Manual {
                 continue;
             }
             match &inst.lifecycle {
@@ -777,10 +808,8 @@ pub fn decide(snap: &Snapshot, cfg: &PolicyConfig) -> Vec<Action> {
                                     reason: format!("schedule {spec}: Fenster aktiv"),
                                 });
                             }
-                        } else if let Some(prewarm_min) = win.prewarm_start((*prewarm_s / 60).max(1) as u32, slot.local_weekday) {
-                            if inst.state == InstanceState::Stopped
-                                && slot.local_minutes_of_day >= prewarm_min
-                            {
+                        } else if win.in_prewarm(slot.local_weekday, slot.local_minutes_of_day, (*prewarm_s).clamp(0, 604800) as u32) {
+                            if inst.state == InstanceState::Stopped {
                                 actions.push(Action::Start {
                                     instance_id: inst.vast_id,
                                     reason: format!("schedule {spec}: Prewarm {prewarm_s}s"),
@@ -793,33 +822,13 @@ pub fn decide(snap: &Snapshot, cfg: &PolicyConfig) -> Vec<Action> {
                 }
                 praxis_common::Lifecycle::Sleep { resume_at, resume_after_s, .. } => {
                     if inst.state == InstanceState::Stopped {
-                        let resume = 'res: {
-                            if let Some(at) = resume_at {
-                                if let Ok(t) = chrono::NaiveTime::parse_from_str(at, "%H:%M") {
-                                    break 'res Some(t);
-                                }
-                            }
-                            if let Some(after) = resume_after_s {
-                                break 'res Some(
-                                    (inst.stopped_since.map(|s| s.time()).unwrap_or_default())
-                                        + chrono::Duration::seconds(*after),
-                                );
-                            }
-                            None
+                        let due = if resume_at.is_some() {
+                            inst.resume_at.is_some_and(|at| snap.now >= at)
+                        } else {
+                            resume_after_s.is_some_and(|after| after >= 0 && inst.stopped_since.is_some_and(|since| (snap.now - since).num_seconds() >= after))
                         };
-                        if let Some(t) = resume {
-                            let now_local = chrono::NaiveTime::from_hms_opt(
-                                (slot.local_minutes_of_day / 60) as u32,
-                                slot.local_minutes_of_day % 60,
-                                0,
-                            )
-                            .unwrap_or_default();
-                            if now_local >= t {
-                                actions.push(Action::Start {
-                                    instance_id: inst.vast_id,
-                                    reason: format!("sleep: resume_at {t}"),
-                                });
-                            }
+                        if due {
+                            actions.push(Action::Start { instance_id: inst.vast_id, reason: "sleep: resume deadline reached".into() });
                         }
                     }
                 }

@@ -3,7 +3,6 @@
 
 use praxis_common::node::RouterCommand;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 
@@ -51,8 +50,8 @@ struct HubInner {
     /// der Reconciler auch NACH einem WS-Abriß „Agent seit X s still"
     /// erkennen kann (Sitzung weg = last_seen(None) sonst nicht unterscheidbar).
     last_seen_all: HashMap<i64, i64>,
-    pending: HashMap<u64, oneshot::Sender<CommandResult>>,
-    terms: HashMap<u64, mpsc::UnboundedSender<serde_json::Value>>,
+    pending: HashMap<(i64, u64), oneshot::Sender<CommandResult>>,
+    terms: HashMap<(i64, u64), mpsc::Sender<serde_json::Value>>,
     next_id: u64,
 }
 
@@ -71,10 +70,7 @@ impl Default for HubInner {
 #[derive(Clone, Default)]
 pub struct Hub {
     inner: Arc<Mutex<HubInner>>,
-    next_term: Arc<AtomicU64>,
 }
-
-const TERM_ID_BASE: u64 = 1_000_000;
 
 impl Hub {
     /// Registriert einen Agent. Der WS-Task hält die Receiver-Seite.
@@ -108,6 +104,8 @@ impl Hub {
     pub fn unregister(&self, vast_id: i64) {
         let mut inner = self.inner.lock().unwrap();
         inner.agents.remove(&vast_id);
+        inner.pending.retain(|(agent, _), _| *agent != vast_id);
+        inner.terms.retain(|(agent, _), _| *agent != vast_id);
         // last_seen_all bleibt bewusst stehen (s. oben).
     }
 
@@ -170,6 +168,10 @@ impl Hub {
         vast_id: i64,
         make_cmd: impl FnOnce(u64) -> RouterCommand,
     ) -> CommandResult {
+        self.command_timeout(vast_id, make_cmd, std::time::Duration::from_secs(90)).await
+    }
+
+    pub async fn command_timeout(&self, vast_id: i64, make_cmd: impl FnOnce(u64) -> RouterCommand, timeout: std::time::Duration) -> CommandResult {
         let (id, cmd, tx_agent) = {
             let mut inner = self.inner.lock().unwrap();
             let handle = inner.agents.get(&vast_id).map(|h| h.lock().unwrap().tx.clone());
@@ -183,54 +185,54 @@ impl Hub {
         let (res_tx, res_rx) = oneshot::channel::<CommandResult>();
         {
             let mut inner = self.inner.lock().unwrap();
-            inner.pending.insert(id, res_tx);
+            inner.pending.insert((vast_id, id), res_tx);
         }
         if tx_agent.send(cmd).is_err() {
             let mut inner = self.inner.lock().unwrap();
-            inner.pending.remove(&id);
+            inner.pending.remove(&(vast_id, id));
             return Err("Agent-Verbindung geschlossen".into());
         }
-        match tokio::time::timeout(std::time::Duration::from_secs(90), res_rx).await {
+        match tokio::time::timeout(timeout, res_rx).await {
             Ok(Ok(r)) => r,
             _ => {
                 let mut inner = self.inner.lock().unwrap();
-                inner.pending.remove(&id);
+                inner.pending.remove(&(vast_id, id));
                 Err("Timeout beim Warten auf Agent-Antwort".into())
             }
         }
     }
 
     /// cmd_result vom WS-Task auflösen.
-    pub fn resolve(&self, id: u64, result: CommandResult) {
+    pub fn resolve(&self, vast_id: i64, id: u64, result: CommandResult) {
         let mut inner = self.inner.lock().unwrap();
-        if let Some(tx) = inner.pending.remove(&id) {
+        if let Some(tx) = inner.pending.remove(&(vast_id, id)) {
             let _ = tx.send(result);
         }
     }
 
     // -------------------------------------------------- Terminal-Relay
 
-    pub fn new_term_id(&self) -> u64 {
-        self.next_term.fetch_add(1, Ordering::Relaxed) + TERM_ID_BASE
-    }
-
     /// Dashboard registriert einen Kanal für term-Frames.
-    pub fn register_term(&self, term_id: u64, tx: mpsc::UnboundedSender<serde_json::Value>) {
+    pub fn register_term(&self, vast_id: i64, term_id: u64, tx: mpsc::Sender<serde_json::Value>) {
         let mut inner = self.inner.lock().unwrap();
-        inner.terms.insert(term_id, tx);
+        inner.terms.insert((vast_id, term_id), tx);
     }
 
-    pub fn unregister_term(&self, term_id: u64) {
+    pub fn unregister_term(&self, vast_id: i64, term_id: u64) {
         let mut inner = self.inner.lock().unwrap();
-        inner.terms.remove(&term_id);
+        inner.terms.remove(&(vast_id, term_id));
     }
 
     /// term-Frames vom Agent → Dashboard weiterleiten.
-    pub fn relay_term(&self, frame: serde_json::Value) {
+    pub fn relay_term(&self, vast_id: i64, frame: serde_json::Value) {
         let term_id = frame.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
-        let inner = self.inner.lock().unwrap();
-        if let Some(tx) = inner.terms.get(&term_id) {
-            let _ = tx.send(frame);
+        let key = (vast_id, term_id);
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(tx) = inner.terms.get(&key) {
+            if tx.try_send(frame).is_err() {
+                // Slow/disconnected browser: bound memory and end its terminal.
+                inner.terms.remove(&key);
+            }
         }
     }
 

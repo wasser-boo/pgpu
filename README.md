@@ -1,5 +1,13 @@
 # pgpu — Praxis GPU Router
 
+> **Aktueller Qualitätsstatus:** Kernpfade gehärtet, 119 automatisierte Tests
+> und ein isolierter Prozess-Smoke-Test. Noch **keine kommerzielle Freigabe**.
+> Änderungen, Upgrade-Hinweise und konkrete offene Release-Gates:
+> [Produktionsreife / Hardening](docs/production-readiness.md).
+> **Bauplan inklusive Nice-to-haves noch nicht vollständig:**
+> [aktueller Abgleich, Restarbeiten und Image-Abhängigkeiten](docs/plan-audit.md).
+> Die folgenden datierten Live-Berichte beschreiben frühere Entwicklungsstände.
+
 Vast.ai-Interruptible-Verwaltung für Praxis: **Slots statt Instanzen.**
 Slot 1 = Rolle `llm` (fork-llama), Slot 2 = Rolle `media` (fork-comfyui).
 Vast-Instanzen backen einen Slot; beim Hot-Swap flippt der Slot auf die
@@ -32,6 +40,15 @@ Router/wasser erreichen die Boxen nicht. Policies:
   (LLM-Fail „temporarily unavailable ×5"). Achtung NetBird-API: Regeln mit
   gleicher ID in einem PUT werden verworfen → separate Policy pro Regel.
 Boxen heißen `gpu-<role>-<tok8>` (netbird up --hostname im Fork-Entrypoint).
+
+## Neu im Quellcode: GPU-Messdaten und Host-Auswahl
+
+- Unabhängige `[vast]`-Schalter `activate_blacklist` (Default an) und `activate_whitelist` (Default aus); Ausschalten löscht keine Einträge.
+- Lokale Hardware-/Modell-/Kostenprüfung, auch vor manuellen Mieten und Wiederanlauf. Eine Whitelist oder ein guter Score umgeht keine Limits.
+- Optional passive Inferenzmetriken, dauerhafter Host-/GPU-Katalog, JSON-Export und `/performance` im Dashboard; keine Prompt-/Antworttexte in der Historie.
+- Konfigurierbare, begrenzte LLM-/Disk-Benchmarks mit Agent 0.2.0; automatische Ausführung und scorebasierte Angebotsbevorzugung separat opt-in.
+
+**Anleitung und alle Schalter:** [GPU-Performance und Whitelist](docs/gpu-performance.md), Beispiele in `config.example.toml`. Benchmark-Slots sind während des Tests exklusiv (neue Requests: 503). Die Funktionen sind noch nicht in dem zuvor gestarteten/veröffentlichten Image **0.24** enthalten; bestehende Deployments wurden nicht geändert.
 
 ## Bauplan-Status (v2)
 
@@ -173,7 +190,7 @@ Was dazukam:
 
 - `common` — Protokoll Router↔Agent, Rollen/Modi/Lifecycle/State-Maschine
 - `vast` — v0-API-Client (bundles-Suche, asks, bid_price, status, credit, logs)
-- `policy` — reine Entscheidungen (`decide(snapshot, cfg)`), 100 % getestet
+- `policy` — reine Entscheidungen (`decide(snapshot, cfg)`), deterministisch getestet (keine gemessene Coverage-Angabe)
 - `router` — axum: Proxy, API, Dashboard, Reconciler, SQLite, Hub, Assets
 
 ## Deploy
@@ -227,6 +244,11 @@ Private Dateien (`reference.wav`, `runtime-settings.json`, Workflows) liegen
 unter `/data/assets/{all,llm,media}` im Router-Volume; der **Router pusht sie
 über die Agent-WS-Session** (Manifest → Agent prüft SHA → fehlende Bytes als
 Base64; `.meta.toml`-Sidecars mit `target/mode/restart/required`). Große
-Dateien (>48 MB) bewusst außen vor (Range-HTTP-Endpunkte bleiben als
-Fallerückweg). Fehlende `required`-Assets → Agent meldet `Degraded`
-(assets_missing) → kein Flip ohne Referenzstimme. Upload im Dashboard.
+Dateien über **32 MiB** werden vor dem Einlesen abgewiesen; großer
+Chunk-/Resume-Push ist noch offen (HTTP-Pull ist auf Vast kein verlässlicher
+Fallerückweg). Jede neue Agent-Verbindung braucht ein aktuelles Manifest,
+auch wenn es leer ist. Fehlende `required`-Assets → Agent meldet `Degraded`
+(assets_missing) → kein Flip ohne Referenzstimme. Bounded/atomarer Upload im
+Dashboard, derzeit nur flache ASCII-Dateinamen. Live-Updates mit Service-
+Neustart sind noch nicht durch eine vollständige Idle-Rollout-Pipeline geschützt;
+siehe [Bauplan-Abgleich](docs/plan-audit.md).
