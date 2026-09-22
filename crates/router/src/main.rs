@@ -11,6 +11,7 @@ mod assets;
 mod billing;
 mod connector;
 mod config;
+mod costs;
 mod dashboard;
 mod db;
 mod events;
@@ -94,6 +95,9 @@ async fn async_main() -> Result<()> {
     let data_dir = cfg.router.data_dir.clone();
     let db = db::Db::open(&data_dir.join("pgpu.sqlite"))?;
     db.init_slots(&cfg)?;
+    // Never admit a rental from legacy/cross-version offer pricing. Fresh
+    // mode-specific quotes are required after every process start.
+    db.invalidate_offers()?;
 
     let vast = if !cfg.vast_api_key().is_empty() {
         match praxis_vast::Vast::new(cfg.vast_api_key()) {
@@ -131,6 +135,7 @@ async fn async_main() -> Result<()> {
         stt_sessions: Default::default(),
     });
 
+    app.db.initialize_notifications(chrono::Utc::now().timestamp())?;
     app.events.emit(
         &app.db,
         "router_started",
@@ -143,6 +148,7 @@ async fn async_main() -> Result<()> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     // Keep handles: a dead control loop must fail the process, not silently
     // leave only the dashboard alive while GPUs continue costing money.
+    let notifications_task = tokio::spawn(notifications::run(app.clone()));
     let mut connector_task = {
         let app = app.clone();
         tokio::spawn(async move { connector::run(app).await })
@@ -289,6 +295,7 @@ async fn async_main() -> Result<()> {
     app.reconcile_now.notify_one();
     let _ = shutdown_tx.send(true);
     connector_task.abort();
+    notifications_task.abort();
     // Allow in-progress requests/control actions to finish, but never hang
     // indefinitely on SSE/WS. A service manager can safely restart afterwards.
     let graceful = async {

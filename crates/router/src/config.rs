@@ -286,7 +286,7 @@ impl SchedRule {
 
 const DAY_NAMES: [&str; 7] = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"];
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct AlertsCfg {
     /// Optional alert endpoint; treat the entire URL as a secret.
     #[serde(default)]
@@ -297,6 +297,16 @@ pub struct AlertsCfg {
     /// auto detects Discord, Slack and ntfy.sh per target; otherwise generic JSON.
     #[serde(default)]
     pub webhook_format: crate::webhook::Format,
+    /// Actual instance/slot transitions, not repeated heartbeats.
+    #[serde(default = "d_true")]
+    pub state_changes: bool,
+    /// 0 disables the digest. Default: every four hours, persisted across restarts.
+    #[serde(default = "d_spend_summary")]
+    pub spend_summary_interval_s: u64,
+}
+fn d_spend_summary() -> u64 { 4*3600 }
+impl Default for AlertsCfg {
+    fn default()->Self { Self {webhook_url:String::new(),webhook_urls:Vec::new(),webhook_format:Default::default(),state_changes:true,spend_summary_interval_s:d_spend_summary()} }
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -6,7 +6,7 @@
 <div class="card">
   <h2>Budget (heute)</h2>
   <div class="mono">
-    {{ budget.spent_usd|fmt2 }} $ verbraucht · Projektion bis Mitternacht {{ budget.projected_usd|fmt2 }} $ ·
+    {{ budget.spent_usd|fmt2 }} $ verbraucht · Projektion bis Mitternacht {% if budget.rate_known %}{{ budget.projected_usd|fmt2 }} ${% else %}unbekannt{% endif %} ·
     Soft {{ budget.soft_usd|fmt2 }} $ / Hard {{ budget.hard_usd|fmt2 }} $ · Monat {{ budget.spent_month_usd|fmt2 }} / {{ budget.monthly_usd|fmt2 }} $
   </div>
   <div class="bar"><div class="{{ budget.bar_class }}" style="width:{{ budget.pct }}%"></div></div>

@@ -41,6 +41,15 @@ Router/wasser erreichen die Boxen nicht. Policies:
   gleicher ID in einem PUT werden verworfen → separate Policy pro Regel.
 Boxen heißen `gpu-<role>-<tok8>` (netbird up --hostname im Fork-Entrypoint).
 
+## Patch 0.26.1
+
+- Vast-Kostenabgleich über `/api/v0/charges/`: HTTP-301 behoben, Redirect-Schutz bleibt erhalten. Übersichtliche Charges-Statusanzeige statt Provider-HTML, tatsächliche Nutzung separat von lokalen Schätzungen.
+- Bid- und On-demand-Preise werden nicht mehr verwechselt; Compute und Speicher zählen genau einmal. Aktueller On-demand-Preis in HTML; Stundenlimit-Meldung nennt Kostenanteile und Cap, nicht ein vermeintliches API-Limit.
+- Informative Webhooks nach Miete und erster geprüfter Router-Freigabe, bei echten Instanz-/Slot-Zustandswechseln und Backend-Ersetzungen. Keine unveränderten Heartbeats; dauerhafte Deduplizierung.
+- **Alle vier Stunden** eine Ausgabenübersicht mit Tages-/Monatsverbrauch, Restbudget, Stundenkosten, Slot-Status und Aktualität der Vast-Daten (`spend_summary_interval_s = 14400`).
+
+Slot-Label-Scope, bisherige Budget-/Speicherhistorie, Limits und Währungskurs bleiben erhalten. Details: [Auswahl & Kosten](docs/selection-and-billing.md), [Webhooks](docs/webhooks.md). Veröffentlichung aktualisiert keine laufende Installation.
+
 ## Neu in 0.26: Länderkarte, Kostenabgleich und mehrere Webhooks
 
 - Länderlisten und Ausschlüsse: `geolocation in [DE,AT,CH]`, `geolocation!=DE`, `geolocation notin [DE,FR]`; ungültige Filter werden abgelehnt.

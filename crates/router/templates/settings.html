@@ -62,6 +62,8 @@
 </div>
 <div class="card">
   <h2 style="margin-top:0">Limits & Ceilings</h2>
+  <p><strong>Aktuell / reserviert:</strong> {{ budget.current_rate }} · Traffic zusätzlich</p>
+  <p class="mut">Das globale Stundenlimit ist ein Kostenlimit für Miete + Speicher, kein API-Request-Limit. Startende GPUs zählen bereits; gestoppte Mietdisks kosten weiter.</p>
   <table>
     <tr><td>Max. Instanzen</td><td>{{ limits.max_instances }}</td></tr>
     <tr><td>Max. pro Slot</td><td>{{ limits.max_per_slot }}</td></tr>
@@ -88,12 +90,12 @@
 </div>
 </div>
 
-<div class="card">
-  <h2 style="margin-top:0">Vast-Kostenabgleich nach Slot-Labels</h2>
-  <p>{{ billing.status }}</p>
-  <p class="mut">Scope: <code>{{ billing.scope }}</code> · letzter erfolgreicher Abgleich {{ billing.synced }}</p>
+<div class="card" id="vast-charges">
+  <h2 style="margin-top:0">Vast-Kostenabgleich nach Slot-Labels · Charges</h2>
+  <p role="status" {% if billing.failed %}class="b-bad"{% endif %}>{{ billing.status }}</p>
+  <p class="mut">Quelle: <code>/api/v0/charges/</code> · Zeitzone {{ billing.timezone }}<br>Letzter Versuch: {{ billing.attempted }} · letzter erfolgreicher Abgleich: {{ billing.synced }}<br>Scope: <code>{{ billing.scope }}</code></p>
   <table>
-    <thead><tr><th>Zeitraum</th><th>Vast-Nutzung</th><th>Lokale Slot-Schätzung</th></tr></thead>
+    <thead><tr><th>Zeitraum</th><th>Tatsächliche Vast-Nutzung (USD)</th><th>Lokale Slot-Schätzung beim Abgleich (USD)</th></tr></thead>
     <tbody>
       <tr><td>{{ billing.day }}</td><td>{{ billing.day_provider }}</td><td>{{ billing.day_estimate }}</td></tr>
       <tr><td>{{ billing.month }}</td><td>{{ billing.month_provider }}</td><td>{{ billing.month_estimate }}</td></tr>
@@ -129,7 +131,7 @@ webhook_format = "discord"</pre>
     <p>Discord → Servereinstellungen → Integrationen → Webhooks → Webhook-URL kopieren. Einen vorhandenen <code>[alerts]</code>-Abschnitt bearbeiten, nicht doppelt anlegen. URL geheim halten.</p>
     <p>Nach „Speichern &amp; live anwenden“ den Testknopf drücken. In jedem Kanal erscheint eine <strong>✅ PGPU-Testnachricht</strong>. Fehler werden pro Ziel angezeigt und blockieren die anderen Ziele nicht. URLs bleiben geheim. Die bisherige einzelne <code>webhook_url</code> funktioniert weiterhin; für gemischte Dienste <code>webhook_format = "auto"</code> wählen.</p>
   </details>
-  <p class="mut">Automatische Warnungen: Budget, Preemption, Bid-Limit und fehlgeschlagene Swaps (gleiche Art höchstens alle 30 Minuten). Zustellversuche erscheinen in Events; vorübergehende Fehler werden bis zu zweimal wiederholt. Ein bloßes Speichern sendet noch keine Nachricht.</p>
+  <p class="mut">Instanz-Meldungen: <code>instance_rented</code> nach erfolgreicher Miete (noch nicht bereit), <code>instance_ready</code> nach frischen Service-Healthchecks und Router-Freigabe (einmal je Mietinstanz, auch über Router-Neustarts hinweg). <code>state_changes = true</code> meldet echte Instanz-/Slot-Wechsel und Backend-Ersetzungen, keine unveränderten Heartbeats. <code>spend_summary_interval_s = 14400</code> sendet standardmäßig alle vier Stunden eine Ausgabenübersicht (0 = aus); Intervall und Zustandsverlauf bleiben bei Neustarts erhalten. Automatische Warnungen: Budget, Preemption, Bid-Limit und fehlgeschlagene Swaps (gleiche Art höchstens alle 30 Minuten). Zustellversuche erscheinen in Events; vorübergehende Fehler werden bis zu zweimal wiederholt. Ein bloßes Speichern sendet noch keine Nachricht.</p>
 </div>
 
 <div class="card">

@@ -138,14 +138,145 @@ pub fn alert(app: &SharedApp, kind: &str, message: &str) {
     }
 }
 
+/// Creation caller invokes this only after provider success and durable ownership.
+/// Only explicitly selected public facts are formatted, never node tokens/env/config.
+pub fn rented(
+    app: &SharedApp,
+    slot: &crate::config::SlotCfg,
+    row: &crate::db::InstanceRow,
+    offer: &praxis_policy::OfferSnapshot,
+    disk_gb: i64,
+    download_usd: f64,
+) {
+    let details = instance_details(slot, row, Some(offer));
+    let message=format!("🆕 Instanz gemietet — startet noch, NICHT einsatzbereit.\n{details}\nDisk: {disk_gb} GB · geschätzter initialer Download: {download_usd:.3} USD\nKosten sind Angebotswerte; Traffic zusätzlich. Eine separate Nachricht folgt nach Health-Checks und Router-Freigabe.\nZeitpunkt: {}",row.created_at);
+    alert(app, "instance_rented", &message);
+}
+
+fn instance_details(
+    slot: &crate::config::SlotCfg,
+    row: &crate::db::InstanceRow,
+    offer: Option<&praxis_policy::OfferSnapshot>,
+) -> String {
+    let short = |s: &str| s.chars().take(160).collect::<String>();
+    let hardware = offer
+        .map(|o| {
+            format!(
+                " · {:.1} GiB VRAM/GPU · {:.1} GiB RAM · {} GPU(s)",
+                o.gpu_ram_gb, o.cpu_ram_gb, o.num_gpus
+            )
+        })
+        .unwrap_or_default();
+    let location = offer
+        .and_then(|o| o.geolocation.as_deref())
+        .map(short)
+        .unwrap_or_else(|| "unbekannt".into());
+    let rate = row.compute_usd_h();
+    let storage = row.storage_usd_h;
+    format!("Slot {} ({}) · Instanz {} · Host {}\nGPU: {}{hardware}\nStandort: {location} · Modus: {}\nMiete: {rate:.4} USD/h · Speicher: {storage:.4} USD/h · zusammen: {:.4} USD/h (ohne Traffic)",slot.id,short(&slot.name),row.vast_id,row.machine_id,short(&row.gpu_name),row.mode,rate+storage)
+}
+
+mod lifecycle;
+pub use lifecycle::run;
+
+#[cfg(test)]
+mod tests_lifecycle;
+
+fn backend_ready(app: &SharedApp, row: &crate::db::InstanceRow) -> bool {
+    backend_ready_at(app, row, chrono::Utc::now().timestamp())
+}
+fn backend_ready_at(app: &SharedApp, row: &crate::db::InstanceRow, now: i64) -> bool {
+    let cfg = app.cfg();
+    let Some(slot) = cfg.slot(row.slot_id) else {
+        return false;
+    };
+    // No probes means legacy agents can optimistically report healthy.
+    if !slot
+        .services
+        .values()
+        .any(|s| s.health.as_ref().is_some_and(|h| !h.is_empty()))
+    {
+        return false;
+    }
+    if row.role != slot.role
+        || row.destroyed_at.is_some()
+        || !row.healthy
+        || row.state != "healthy"
+        || row.actual_status != "running"
+        || row.intended_status != "running"
+    {
+        return false;
+    }
+    if !app
+        .pool_routes
+        .healthy(row.slot_id)
+        .iter()
+        .any(|(id, _)| *id == row.vast_id)
+    {
+        return false;
+    }
+    let Some(hb) = app.hub.heartbeat(row.vast_id) else {
+        return false;
+    };
+    let age = now - app.hub.last_seen(row.vast_id).unwrap_or(0);
+    hb.health_json == serde_json::json!("healthy") && (0..=60).contains(&age)
+}
+
+/// Called after pool publication; a DB flag or agent connection alone is not readiness.
+pub fn ready(app: &SharedApp, row: &crate::db::InstanceRow) {
+    if app.shutting_down.load(std::sync::atomic::Ordering::Relaxed)
+        || !webhook::targets(&app.cfg().alerts).is_ok_and(|targets| !targets.is_empty())
+        || !backend_ready(app, row)
+    {
+        return;
+    }
+    let cfg = app.cfg();
+    let Some(slot) = cfg.slot(row.slot_id) else {
+        return;
+    };
+    let claimed = app
+        .db
+        .claim_once(&format!("instance_ready_notified:{}", row.vast_id));
+    match claimed {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(_) => {
+            tracing::warn!(
+                instance_id = row.vast_id,
+                "ready notification deferred: claim storage unavailable"
+            );
+            return;
+        }
+    }
+    let offer = app.db.rental_facts(row.vast_id).ok().flatten();
+    let details = instance_details(slot, row, offer.as_ref());
+    let message=format!("✅ Instanz einsatzbereit: Service-Healthchecks grün und im Router als Backend freigegeben.\n{details}\nBereitschaft geprüft, kein Inferenz-Benchmark ausgeführt.\nZeitpunkt: {}",crate::db::now_iso());
+    app.events.emit(
+        &app.db,
+        "instance_ready",
+        Some(row.slot_id),
+        Some(row.vast_id),
+        "Service-Healthchecks grün und Backend freigegeben",
+        &serde_json::json!({"compute_usd_h":row.compute_usd_h(),"storage_usd_h":row.storage_usd_h}),
+    );
+    alert(app, "instance_ready", &message);
+}
+
 fn spawn_target(app: SharedApp, target: webhook::Target, kind: String, message: String) {
     tokio::spawn(async move {
         for attempt in 1..=3 {
-            let still_enabled = webhook::targets(&app.cfg().alerts).is_ok_and(|targets| {
-                targets
-                    .iter()
-                    .any(|t| t.url == target.url && t.format == target.format)
-            });
+            let cfg = app.cfg();
+            let category_enabled = (!matches!(
+                kind.as_str(),
+                "instance_state_changed" | "slot_state_changed" | "slot_backend_changed"
+            ) || cfg.alerts.state_changes)
+                && (kind != "spend_summary" || cfg.alerts.spend_summary_interval_s > 0);
+            let still_enabled = category_enabled
+                && webhook::targets(&cfg.alerts).is_ok_and(|targets| {
+                    targets
+                        .iter()
+                        .any(|t| t.url == target.url && t.format == target.format)
+                });
             if !still_enabled || app.shutting_down.load(std::sync::atomic::Ordering::Relaxed) {
                 return;
             }

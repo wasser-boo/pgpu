@@ -140,6 +140,9 @@ pub fn targets(cfg: &AlertsCfg) -> Result<Vec<Target>, Failure> {
 }
 
 pub fn validate(cfg: &AlertsCfg) -> Result<(), Failure> {
+    if cfg.spend_summary_interval_s!=0 && !(3600..=604800).contains(&cfg.spend_summary_interval_s) {
+        return Err(Failure::config("alerts.spend_summary_interval_s: 0 (aus) oder 3600..604800 Sekunden"));
+    }
     targets(cfg).map(|_| ())
 }
 
@@ -277,6 +280,7 @@ mod tests {
                 "https://ntfy.sh/private-topic".into(),
             ],
             webhook_format: Format::Auto,
+            ..Default::default()
         };
         let selected = targets(&cfg).unwrap();
         assert_eq!(selected.len(), 2);

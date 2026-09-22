@@ -13,7 +13,10 @@
     <tr><td>NetBird-IP</td><td class="mono">{{ inst.nb_ip }}</td></tr>
     <tr><td>Modus</td><td>{{ inst.mode }}</td></tr>
     <tr><td>Vast-Status</td><td class="mono">{{ inst.actual_status }} / {{ inst.intended_status }}</td></tr>
-    <tr><td>Preis</td><td class="mono">{{ inst.bid_usd_h|fmt4 }} $/h · min_bid {{ inst.min_bid|fmt4 }}</td></tr>
+    <tr><td>Aktuelle Miete (GPU/Compute)</td><td class="mono">{{ inst.bid_usd_h|fmt4 }} USD/h</td></tr>
+    <tr><td>Speicher</td><td class="mono">{{ inst.storage_usd_h|fmt4 }} USD/h (auch im Stop)</td></tr>
+    <tr><td>Zusammen bei laufender GPU</td><td class="mono">{{ inst.total_usd_h|fmt4 }} USD/h, ohne Traffic</td></tr>
+    <tr><td>Spot-Mindestgebot</td><td class="mono">{{ inst.min_bid|fmt4 }} USD/h — kein On-demand-Preis</td></tr>
     <tr><td>Busy</td><td>{% if inst.busy %}{{ inst.busy_reason }}{% else %}idle{% endif %}</td></tr>
     <tr><td>Agent-Health</td><td class="mono">{{ inst.agent_health }}</td></tr>
     <tr><td>Lifecycle</td><td class="mono">{{ inst.lifecycle }}</td></tr>
@@ -79,10 +82,12 @@
     <button>Wechseln</button>
     <p class="mut">Moduswechsel = Hot-Swap (neue Instanz im Zielmodus, alte drainen).</p>
   </form>
+  {% if inst.mode == "interruptible" %}
   <h2>Gebot</h2>
   <form method="post" action="/do/instances/{{ inst.vast_id }}/bid">
     <input name="price" value="{{ inst.bid_usd_h|fmt4 }}" size="8"> $/h <button>Setzen</button>
   </form>
+  {% else %}<p class="mut">On-demand: angezeigte aktuelle Mietrate aus dem Provider-Abgleich, kein veränderbares Spot-Gebot.</p>{% endif %}
 </div>
 </div>
 

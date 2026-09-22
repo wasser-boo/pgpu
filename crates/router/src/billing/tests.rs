@@ -195,7 +195,7 @@ fn period_boundaries_use_router_timezone_and_dst() {
 async fn complete_charge_pagination_uses_usage_endpoint_and_server_filters() {
     let server=LocalServer::new(axum::Router::new().fallback(|req:Request|async move {
         assert_eq!(req.method(),axum::http::Method::GET);
-        assert_eq!(req.uri().path(),"/api/v0/charges");
+        assert_eq!(req.uri().path(),"/api/v0/charges/");
         let url=url::Url::parse(&format!("http://test{}",req.uri())).unwrap();
         let params:HashMap<_,_>=url.query_pairs().into_owned().collect();
         let filters:Value=serde_json::from_str(&params["select_filters"]).unwrap();
@@ -206,6 +206,81 @@ async fn complete_charge_pagination_uses_usage_endpoint_and_server_filters() {
     })).await;
     let vast = praxis_vast::Vast::with_api_root("fake", &server.url()).unwrap();
     assert_eq!(vast.charges(100, 200).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn charges_uses_canonical_slash_without_relying_on_redirects() {
+    use axum::response::IntoResponse;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let redirects = Arc::new(AtomicUsize::new(0));
+    let observed = redirects.clone();
+    let server = LocalServer::new(axum::Router::new().fallback(move |req: Request| {
+        let redirects = observed.clone();
+        async move {
+            if req.uri().path() == "/api/v0/charges" {
+                redirects.fetch_add(1, Ordering::SeqCst);
+                return (
+                    axum::http::StatusCode::MOVED_PERMANENTLY,
+                    [("location", "/api/v0/charges/")],
+                )
+                    .into_response();
+            }
+            assert_eq!(req.uri().path(), "/api/v0/charges/");
+            assert_eq!(req.headers()["authorization"], "Bearer fake");
+            Json(
+                json!({"success":true,"count":1,"total":1,"next_token":null,"results":[{
+                    "type":"instance","source":"instance-123","amount":0.469,
+                    "start":1790035200,"end":1790035200,"description":"usage",
+                    "metadata":{"label":"praxis-llm-s1-deadbeef"},"items":[]
+                }]}),
+            )
+            .into_response()
+        }
+    }))
+    .await;
+    let vast = praxis_vast::Vast::with_api_root("fake", &server.url()).unwrap();
+    let charges = vast.charges(100, 200).await.unwrap();
+    assert_eq!(charges.len(), 1);
+    assert_eq!(charges[0].instance_id(), Some(123));
+    assert_eq!(
+        charges[0].metadata.as_ref().unwrap().label.as_deref(),
+        Some("praxis-llm-s1-deadbeef")
+    );
+    assert_eq!(redirects.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn charges_redirects_never_contact_another_endpoint() {
+    let destination = MockProvider::new().await;
+    let location = destination.server.url();
+    let server = LocalServer::new(axum::Router::new().fallback(move |req: Request| {
+        let location = location.clone();
+        async move {
+            assert_eq!(req.uri().path(), "/api/v0/charges/");
+            (
+                axum::http::StatusCode::MOVED_PERMANENTLY,
+                [("location", location)],
+            )
+        }
+    }))
+    .await;
+    let vast = praxis_vast::Vast::with_api_root("fake", &server.url()).unwrap();
+    assert!(vast.charges(100, 200).await.is_err());
+    assert!(destination.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn charges_errors_hide_remote_html_and_financial_payloads() {
+    let server=MockProvider::new().await;
+    let vast=praxis_vast::Vast::with_api_root("fake",&server.server.url()).unwrap();
+    for status in [301,500,200] {
+        server.respond(status,"<!doctype html>PRIVATE-RESPONSE-PAYLOAD");
+        let error=vast.charges(100,200).await.unwrap_err().to_string();
+        assert!(!error.contains("PRIVATE-RESPONSE-PAYLOAD"));assert!(!error.contains("<!doctype"));
+    }
 }
 
 #[tokio::test]
@@ -231,7 +306,7 @@ async fn reconciliation_reads_only_and_keeps_previous_snapshot_on_provider_failu
         if req.uri().path()=="/api/v1/instances/" {
             Json(json!({"instances":[{"id":12,"actual_status":"stopped","label":"praxis-llm-s1-deadbeef"}]}))
         } else {
-            assert_eq!(req.uri().path(),"/api/v0/charges");
+            assert_eq!(req.uri().path(),"/api/v0/charges/");
             Json(json!({"success":true,"count":2,"total":2,"next_token":null,"results":[
                 {"type":"instance","source":"instance-12","amount":0.4,"metadata":{"label":"praxis-llm-s1-deadbeef"}},
                 {"type":"instance","source":"instance-999","amount":999.0,"metadata":{"label":"personal-unrelated"}}

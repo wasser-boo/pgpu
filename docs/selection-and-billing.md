@@ -63,9 +63,21 @@ Alternativ in Settings ein Modell pro Zeile; leer erlaubt alle ansonsten passend
 
 Preisfenster stehen unter `[slots.bid]`: `rent_min_usd_h` und `ceiling_usd_h`. Beispielsweise `0.0` bis `0.20` bedeutet 0–20 **US-Cent pro GPU-Stunde**, nicht Euro-Cent und nicht automatisch inklusive Storage/Traffic. Zusätzliche effektive Kostenlimits stehen in `[slots.requirements]`. Eine bestehende Obergrenze wird durch dieses Update nicht angehoben.
 
+## Preise und Stundenlimit (0.26.1)
+
+Vast liefert im **Bid-Suchmodus** unter `dph_total` einen anderen Preis als bei **On-demand**. Ein ausschließlich in der Bid-Suche gefundenes Angebot erhält deshalb keinen synthetischen On-demand-Preis. Fehlende/unbrauchbare Preise sperren diesen Mietmodus; der Angebotscache wird beim Routerstart verworfen. `search_query_on_demand` ist eine eigene Suche, keine Zusicherung, dass jede Bid-Instanz auch dort enthalten ist.
+
+Provider-`dph_total` enthält bereits den zugewiesenen Speicher. Router-intern wird der Compute-Anteil aus `dph_base`, ersatzweise Gesamtpreis minus Speicher, normalisiert. **Compute + Speicher genau einmal** gilt gemeinsam für Admission, Settings und Ausgabenübersichten. Beim Vertragsabgleich werden beobachteter Compute- und Speicherpreis zusammen aktualisiert. Der historische interne Feldname `dph_total` bezeichnet ab 0.26.1 daher den normalisierten Compute-Anteil; Rohantworten der Vast-API behalten ihre eigene Semantik. Alte Budget-/Meter-Historie wird nicht rückwirkend gelöscht oder als Erstattung behandelt.
+
+Die Instanzansicht zeigt bei On-demand die zuletzt gespeicherte aktuelle Mietrate statt des ursprünglichen Spot-/Gebotsfelds, daneben Speicher und Summe ohne Traffic. Angebot und späterer Providerstand sind Momentaufnahmen, keine Preisgarantie. Ein veränderbares Spot-Gebotsformular wird bei On-demand nicht angeboten.
+
+**`hourly rate limit reached` ist kein API-Request-Limit.** Die Meldung nennt vorhandenen Compute, angefragten Compute, sämtliche Mietdisks und `limits.max_total_rate_usd_h`. Startende Instanzen zählen bereits, gestoppte Verträge behalten ihre Speicherkosten. Beim Resume und beim Ändern eines Gebots wird die vorhandene Disk genau einmal berücksichtigt, weder doppelt noch gar nicht. Bestehende Caps werden nicht angehoben.
+
 ## Echte Vast-Nutzung nach Slot-Labels
 
-Der Abgleich liest **`GET /api/v0/charges`** mit dem Datumsfenster und Vertragstyp `instance`, komplett paginiert. Quelle: <https://docs.vast.ai/api-reference/billing/show-charges>. Payment-Invoices, Einzahlungen, Überweisungen, Refund-Transaktionen und bloße Kontostand-Deltas sind keine GPU-Nutzung und werden nicht als solche verbucht.
+**Patch 0.26.1:** Vast verlangt den abschließenden Slash. 0.26 erhielt auf `/charges` eine HTTP-301-Antwort; bestehende Kosten/Budgethistorie blieben dabei erhalten. 0.26.1 ruft direkt `/charges/` auf, ohne Weiterleitungen für API-Zugangsdaten zu erlauben.
+
+Der Abgleich liest **`GET /api/v0/charges/`** mit dem Datumsfenster und Vertragstyp `instance`, komplett paginiert. Quelle: <https://docs.vast.ai/api-reference/billing/show-charges>. Payment-Invoices, Einzahlungen, Überweisungen, Refund-Transaktionen und bloße Kontostand-Deltas sind keine GPU-Nutzung und werden nicht als solche verbucht.
 
 Scope sind die von den konfigurierten Slots erzeugten Labels:
 
@@ -78,7 +90,7 @@ praxis-media-s2-<token8>
 
 Nach Start und anschließend stündlich läuft der Abgleich im Hintergrund. Er blockiert weder Lifecycle-Steuerung noch lokales Metering. Fehlende Rechte, HTTP-Fehler, kaputte/inkonsistente oder unvollständige Seiten ergeben **keinen Null-Verbrauch**; letzter erfolgreicher Stand und Budgethistorie bleiben erhalten.
 
-Settings zeigt echte Providerkosten und lokale Schätzungen getrennt, Zeitraum, Aktualität und Einzelergebnisse. `/api/v1/budget` enthält `vast_usage`, lokale `metered_*` und effektive `spent_*`-Werte. Tages-/Monatsgrenzen werden aus `router.tz` in UTC-Unix-Grenzen für die Vast-Abfrage umgerechnet; die Vergleichsfenster sind in den Daten enthalten. Provider-Tagesaggregation, Verzögerung und Rundung können Unterschiede zum lokalen Live-Meter oder einer anders eingestellten Vast-Ansicht verursachen. Ohne lokalen Datensatz steht die Schätzung ausdrücklich auf unbekannt.
+Settings zeigt echte Providerkosten und lokale Schätzungen getrennt, Zeitraum, Quelle `/api/v0/charges/`, letzten Versuch, letzten Erfolg und Einzelergebnisse. Provider-HTML wird nicht als Fehlertext durchgereicht; auch alte gespeicherte 301-HTML-Seiten werden in der Oberfläche gekürzt. `/api/v1/budget` enthält `vast_usage`, lokale `metered_*` und effektive `spent_*`-Werte. Tages-/Monatsgrenzen werden aus `router.tz` in UTC-Unix-Grenzen für die Vast-Abfrage umgerechnet; die Vergleichsfenster sind in den Daten enthalten. Provider-Tagesaggregation, Verzögerung und Rundung können Unterschiede zum lokalen Live-Meter oder einer anders eingestellten Vast-Ansicht verursachen. Ohne lokalen Datensatz steht die Schätzung ausdrücklich auf unbekannt.
 
 ### Konservative Budgetkorrektur
 

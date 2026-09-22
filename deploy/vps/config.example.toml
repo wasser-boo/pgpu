@@ -55,6 +55,8 @@ max_per_slot = 2
 max_total_rate_usd_h = 0.60
 
 [alerts]
+state_changes = true
+spend_summary_interval_s = 14400 # alle vier Stunden; 0 = aus
 # webhook_urls = [
 #   "https://discord.com/api/webhooks/ID_KANAL_1/TOKEN_1",
 #   "https://discord.com/api/webhooks/ID_KANAL_2/TOKEN_2",

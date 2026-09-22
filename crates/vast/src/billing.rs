@@ -67,7 +67,9 @@ impl Vast {
             if let Some(token) = &cursor {
                 params.push(("after_token", token));
             }
-            let page: Page = self.get("/charges", &params).await?;
+            // Vast redirects the slashless URL with 301. Use its canonical
+            // endpoint directly; never relax redirect protection for API keys.
+            let page: Page = self.get("/charges/", &params).await?;
             ensure!(
                 page.success && page.count == page.results.len(),
                 "Vast charges: unsuccessful/incomplete page"

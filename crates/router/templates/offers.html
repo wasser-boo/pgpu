@@ -32,7 +32,7 @@
   <td class="mono">{{ o.inet_down|fmt0 }} Mbps</td>
   <td class="mono">{{ o.reliability2|fmt2 }}</td>
   <td class="mono">{{ o.min_bid|fmt4 }} $/h</td>
-  <td class="mono">{{ o.dph_total|fmt4 }} $/h</td>
+  <td class="mono">{% if o.dph_total > 0.0 %}{{ o.dph_total|fmt4 }} $/h{% else %}kein Preis{% endif %}</td>
   <td class="mono">{{ o.storage_cost|fmt3 }} $/GB·Mo</td>
   <td>{{ o.score }}</td>
   <td>{% if o.eligible %}<span class="badge b-ok">geeignet</span>{% else %}{{ o.rejection }}{% endif %}</td>

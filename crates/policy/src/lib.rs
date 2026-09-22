@@ -208,6 +208,8 @@ pub struct OfferSnapshot {
     pub machine_id: i64,
     pub gpu_name: String,
     pub min_bid: f64,
+    /// On-demand COMPUTE-only quote from that mode's search (0 = unavailable).
+    /// Historical field name retained; allocated storage must not be included here.
     pub dph_total: f64,
     pub storage_cost: f64, // $/GB/Monat
     pub inet_down_cost: f64,

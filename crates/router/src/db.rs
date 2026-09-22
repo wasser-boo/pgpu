@@ -3,6 +3,7 @@
 
 mod performance_store;
 mod billing_store;
+mod notification_store;
 pub use performance_store::PerformanceRow;
 
 use crate::config::Config;
@@ -53,6 +54,7 @@ pub struct InstanceRow {
     pub busy_reason: String,
     pub min_bid: f64,
     pub bid_usd_h: f64,
+    /// Normalized on-demand compute rate; storage is accounted separately.
     pub dph_total: f64,
     pub storage_usd_h: f64,
     pub created_at: String,
@@ -61,6 +63,12 @@ pub struct InstanceRow {
     pub stopped_since: Option<String>,
     pub destroyed_at: Option<String>,
     pub label: String,
+}
+
+impl InstanceRow {
+    pub fn compute_usd_h(&self) -> f64 {
+        if self.mode==Mode::Interruptible {self.bid_usd_h} else {self.dph_total}
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -229,6 +237,7 @@ impl Db {
             tx.execute("UPDATE instances SET last_metered_at=?1", params![now_iso()])?;
         }
         performance_store::migrate(&tx)?;
+        notification_store::migrate(&tx)?;
         tx.commit()?;
         Ok(())
     }
@@ -378,11 +387,11 @@ impl Db {
         Ok(())
     }
 
-    pub fn update_instance_vast(&self, vast_id: i64, actual_status: &str, min_bid: f64, dph_total: f64, machine_id: i64, gpu_name: &str) -> anyhow::Result<()> {
+    pub fn update_instance_vast(&self, vast_id: i64, actual_status: &str, min_bid: f64, dph_total: f64, machine_id: i64, gpu_name: &str, storage_usd_h:f64) -> anyhow::Result<()> {
         let conn = self.0.lock().unwrap();
         conn.execute(
-            "UPDATE instances SET actual_status=?2, min_bid=?3, dph_total=?4, machine_id=?5, gpu_name=?6 WHERE vast_id=?1",
-            params![vast_id, actual_status, min_bid, dph_total, machine_id, gpu_name],
+            "UPDATE instances SET actual_status=?2, min_bid=?3, dph_total=?4, machine_id=?5, gpu_name=?6, storage_usd_h=?7 WHERE vast_id=?1",
+            params![vast_id, actual_status, min_bid, dph_total, machine_id, gpu_name, storage_usd_h],
         )?;
         Ok(())
     }
@@ -866,6 +875,11 @@ impl Db {
             params![k, v],
         )?;
         Ok(())
+    }
+
+    /// Persistent one-shot claim; used for first-routable notifications across restarts.
+    pub fn claim_once(&self, key: &str) -> anyhow::Result<bool> {
+        Ok(self.0.lock().unwrap().execute("INSERT OR IGNORE INTO settings(k,v) VALUES(?1,?2)",params![key,now_iso()])?==1)
     }
 
     /// Atomically reserve a persisted interval (manual notification tests/cleanup).

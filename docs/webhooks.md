@@ -13,6 +13,8 @@ webhook_urls = [
   "https://discord.com/api/webhooks/ID_KANAL_2/TOKEN_2",
 ]
 webhook_format = "discord"
+state_changes = true
+spend_summary_interval_s = 14400 # alle 4 Stunden; 0 = aus
 ```
 
 Die Platzhalter durch die tatsächlich kopierten URLs ersetzen; für nur einen Kanal den zweiten Eintrag entfernen. Eine normale Discord-Kanal-/Einladungs-URL ist kein Webhook.
@@ -65,6 +67,36 @@ Ohne Webhook-Konfiguration: HTTP 400. Ohne Router-Authentifizierung: HTTP 401. Z
 | `json` | `{"kind":"…","message":"…"}` (bisheriges generisches Format) |
 
 Discord-Nachrichten bleiben innerhalb des 2.000-Zeichen-Limits; Benutzer-/Rollen-/Everyone-Pings sind deaktiviert. Weiterleitungen werden nicht verfolgt. URLs dürfen HTTP(S) verwenden, aber keine eingebetteten Benutzername/Passwort- oder Fragment-Bestandteile.
+
+### Pushover
+
+Pushover Native Webhooks können mit `auto`/generischem JSON verwendet werden. Im Pushover-Webhook als **Body Selector `{{message}}`** setzen. Dafür ist kein eigener Pushover-Adapter nötig; die direkte Messaging-API `/1/messages.json` ist eine andere Schnittstelle. Eine HTTP-200-Antwort bedeutet Annahme durch den Dienst, nicht automatisch eine sichtbare Benachrichtigung auf dem Telefon.
+
+## Miet-, Bereitschafts- und Zustandsmeldungen (0.26.1)
+
+Alle Ziele erhalten informative Nachrichten mit Slot/Instanz, GPU, Mietmodus, Kosten und den jeweils bekannten Zustandsdaten. Zugangsdaten, Node-Tokens, Environment und ungeprüfte Provider-Antworttexte werden nicht übernommen.
+
+- **`instance_rented`:** nur nach erfolgreicher Provider-Anlage und lokaler Speicherung, sowohl manuell als auch automatisch. Hardware/VRAM/RAM, Standort, Compute-/Speicherpreis und geschätzte initiale Downloadkosten. Ausdrücklich **noch nicht einsatzbereit**; Preise zunächst aus dem Angebot.
+- **`instance_ready`:** erste Freigabe dieser Mietinstanz im Router-Pool, laufender Vertrag, grüne Service-Healthchecks und gesunder Agent-Heartbeat höchstens 60 Sekunden alt. Eine Verbindung, ein alter DB-Healthy-Wert, ein nicht ausgewählter Ersatz oder Services ohne konfigurierte Healthchecks reichen nicht. Einmal je Mietinstanz, dauerhaft über Router-Neustarts dedupliziert. Kein Inferenz-Benchmark oder Garantie einer zukünftigen Verfügbarkeit.
+- **`instance_state_changed`:** tatsächliche gespeicherte Übergänge, z. B. provisioning → booting → healthy, unreachable, preempted, stopped oder destroyed. Enthält vorherigen/neuen Zustand, Provider-/Sollstatus, Kosten und Ereigniszeitpunkt. „Healthy“ vom Agent und die Router-Freigabe werden unterschieden. Auch kurze Zwischenzustände werden im DB-Audit erfasst; unveränderte Heartbeats erzeugen keine Meldung. Ein nachlaufendes Provider-„loading“ setzt Agent-Booting nicht immer wieder auf Provisioning zurück.
+- **`slot_backend_changed`:** vorherige/neue Backend-Instanz mit GPU, insbesondere Ersetzungen. Die Zuordnung allein behauptet keine Einsatzbereitschaft.
+- **`slot_state_changed`:** aggregierte Änderungen wie warming, ready, unreachable oder cold, mit vorhandenen Verträgen, Laufwunsch, Auto-Miete und Kostenlimits. Dieser abgeleitete Slot-Zustand wird nach Reconciliation geprüft.
+
+`state_changes = false` deaktiviert die Zustands-/Slot-Meldungen, nicht die Miet-/Erstbereitschaftsmeldungen oder Budgetwarnungen. Auf der ersten Installation wird alte Eventhistorie nicht nachträglich versendet. Ein persistenter Cursor verhindert Wiederholungen nach Neustart; Ereignisse älter als eine Stunde werden bei langem Ausfall nicht als vermeintlich aktuelle Meldungen nachgesendet. Normalerweise erfolgt die Zustandszustellung innerhalb weniger Sekunden. Es gelten dieselben unabhängigen Ziel-/Retry-Regeln wie für andere Meldungen. Persistente Dispatch-Reservierungen verhindern Doppelstarts, sind aber **keine Exactly-once-Zustellgarantie**: ein Prozessabbruch zwischen Reservierung und Versand oder ein dauerhafter Empfängerfehler kann eine Meldung verlieren. Der vollständige Zustands-Audit bleibt in Events.
+
+## Ausgabenübersicht alle vier Stunden
+
+Default: `spend_summary_interval_s = 14400`. Erste periodische Nachricht vier Stunden nach Initialisierung, danach wird der Zeitabstand dauerhaft über Neustarts gehalten. `0` deaktiviert sie; erlaubt sind sonst 3600–604800 Sekunden. Änderungen benötigen keinen Neustart.
+
+**`spend_summary`** enthält:
+
+- budgetwirksamen Tages-/Monatsverbrauch in USD und EUR;
+- wirksame Soft-/Hard-/Monatslimits, Restbudget und verwendete Router-Zeitzone;
+- aktuelle/reservierte Compute-Kosten und laufende Speicherkosten getrennt, globales USD/h-Limit; Traffic separat;
+- bestätigte Vast-Charges mit ihrem eigenen Zeitraum und letztem erfolgreichen Abgleich, einschließlich Warnung bei einem neueren fehlgeschlagenen Versuch;
+- aktuellen Instanzstatus je Slot. Ohne erfolgreichen Charges-Abgleich steht ausdrücklich „nicht verfügbar“, nicht Nullverbrauch.
+
+Die Übersicht liest nur bestehende Kosten-/Zustandsdaten. Sie mietet, startet, stoppt oder benchmarked nichts, erhöht keine Limits und verändert keine Budgets. Lokale Schätzungen/bestätigte Mindestwerte bleiben von verzögerten tatsächlichen Providerkosten unterscheidbar.
 
 ## Automatische Warnungen und Fehler
 

@@ -6,6 +6,10 @@
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
+#[path = "types_tests.rs"]
+mod tests;
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OfferType {
@@ -29,7 +33,9 @@ pub struct Offer {
     pub inet_down_cost: Option<f64>,
     pub inet_up_cost: Option<f64>,
     pub storage_cost: Option<f64>, // $/GB/Monat
-    pub dph_total: Option<f64>,
+    pub dph_total: Option<f64>,    // includes allocated storage; depends on search mode!
+    pub dph_base: Option<f64>,
+    pub storage_total_cost: Option<f64>,
     pub min_bid: Option<f64>,
     pub reliability2: Option<f64>,
     pub machine_id: i64,
@@ -56,6 +62,28 @@ impl Offer {
     pub fn storage_or(&self, alt: f64) -> f64 {
         self.storage_cost.unwrap_or(alt)
     }
+    /// Call ONLY for results returned by an on-demand search. Bid results use
+    /// the same field names for a DIFFERENT price and are not on-demand quotes.
+    pub fn on_demand_compute_usd_h(&self, disk_gb: i64) -> Option<f64> {
+        compute_usd_h(
+            self.dph_base,
+            self.dph_total,
+            self.storage_total_cost
+                .unwrap_or_else(|| self.storage_usd_h(disk_gb)),
+        )
+    }
+    /// Normalize a quote for the requested allocation to the router's monthly
+    /// unit price. An explicit zero is valid; a missing price is not free disk.
+    pub fn quoted_storage_cost(&self, disk_gb: i64) -> Option<f64> {
+        if disk_gb <= 0 {
+            return None;
+        }
+        let cost = match self.storage_total_cost {
+            Some(hourly) => hourly * 720.0 / disk_gb as f64,
+            None => self.storage_cost?,
+        };
+        (cost.is_finite() && cost >= 0.0).then_some(cost)
+    }
     /// Storage-Preis $/h für `disk_gb`.
     pub fn storage_usd_h(&self, disk_gb: i64) -> f64 {
         self.storage_or(0.0) * disk_gb as f64 / 30.0 / 24.0
@@ -78,6 +106,8 @@ pub struct Instance {
     pub status: Option<String>,
     pub bid_value: Option<f64>,
     pub dph_total: Option<f64>,
+    pub dph_base: Option<f64>,
+    pub storage_total_cost: Option<f64>,
     pub min_bid: Option<f64>,
     pub storage_total: Option<f64>,
     pub storage_cost: Option<f64>,
@@ -85,12 +115,37 @@ pub struct Instance {
     pub extra_env: serde_json::Value,
 }
 
+/// Normalize provider totals once at the boundary; router metering adds storage separately.
+fn compute_usd_h(base: Option<f64>, total: Option<f64>, storage: f64) -> Option<f64> {
+    let rate = match base {
+        Some(base) => base,
+        None => {
+            if !storage.is_finite() || storage < 0.0 {
+                return None;
+            }
+            total? - storage
+        }
+    };
+    (rate.is_finite() && rate > 0.0).then_some(rate)
+}
+
 impl Instance {
+    pub fn on_demand_compute_usd_h(&self, fallback_storage_usd_h: f64) -> Option<f64> {
+        compute_usd_h(
+            self.dph_base,
+            self.dph_total,
+            self.storage_total_cost.unwrap_or(fallback_storage_usd_h),
+        )
+    }
     pub fn actual_or(&self, alt: &str) -> String {
-        self.actual_status.clone().unwrap_or_else(|| alt.to_string())
+        self.actual_status
+            .clone()
+            .unwrap_or_else(|| alt.to_string())
     }
     pub fn intended_or(&self, alt: &str) -> String {
-        self.intended_status.clone().unwrap_or_else(|| alt.to_string())
+        self.intended_status
+            .clone()
+            .unwrap_or_else(|| alt.to_string())
     }
     pub fn label_or<'a>(&'a self, alt: &'a str) -> &'a str {
         self.label.as_deref().unwrap_or(alt)

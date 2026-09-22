@@ -177,6 +177,8 @@ pub struct StateView {
 pub struct BudgetView {
     pub spent_usd: f64,
     pub projected_usd: f64,
+    pub rate_known: bool,
+    pub current_rate: String,
     pub spent_month_usd: f64,
     pub soft_usd: f64,
     pub hard_usd: f64,
@@ -263,6 +265,8 @@ pub struct InstView {
     pub actual_status: String,
     pub intended_status: String,
     pub bid_usd_h: f64,
+    pub storage_usd_h: f64,
+    pub total_usd_h: f64,
     pub min_bid: f64,
     pub busy: bool,
     pub busy_reason: String,
@@ -339,7 +343,10 @@ pub struct BillingRowView {
 pub struct BillingView {
     pub scope: String,
     pub status: String,
+    pub failed: bool,
+    pub timezone: String,
     pub synced: String,
+    pub attempted: String,
     pub day: String,
     pub month: String,
     pub day_provider: String,
@@ -351,11 +358,17 @@ pub struct BillingView {
 fn billing_view(app: &SharedApp) -> BillingView {
     let status=crate::billing::status(app);
     let snapshot=crate::billing::snapshot(app).ok().flatten();
-    let money=|v:Option<f64>|v.map(|v|format!("{v:.4} $")).unwrap_or_else(||"noch unbekannt".into());
+    let money=|v:Option<f64>|v.map(|v|format!("{v:.4} USD")).unwrap_or_else(||"noch unbekannt".into());
+    let error=status.get("error").or_else(||status["last_attempt"].get("message")).and_then(|v|v.as_str());
+    // Also sanitize old persisted 0.26 errors until the first successful sync.
+    let brief=error.map(|s|s.lines().next().unwrap_or(s).split('<').next().unwrap_or("").chars().take(240).collect::<String>());
     BillingView {
         scope:crate::slot_labels::scope(&app.cfg()).join(", "),
-        status:status.get("error").or_else(||status["last_attempt"].get("message")).and_then(|v|v.as_str()).unwrap_or(
-            if snapshot.is_some() { "Abgleich verfügbar; Vast kann verzögert abrechnen." } else { "Noch kein Abgleich; wird nach Start und anschließend stündlich im Hintergrund versucht." }).into(),
+        status:brief.map(|e|format!("Abgleich fehlgeschlagen: {}. Letzte gültige Werte und Budgethistorie bleiben erhalten.",e.trim())).unwrap_or_else(||
+            if snapshot.is_some() { "Charges erfolgreich eingelesen. Vast kann verzögert abrechnen.".into() } else { "Noch kein Abgleich; nach Start und anschließend stündlich im Hintergrund.".into() }),
+        failed:error.is_some(),
+        timezone:app.cfg().router.tz.clone(),
+        attempted:status["last_attempt"]["at"].as_str().unwrap_or("—").into(),
         synced:snapshot.as_ref().map(|s|s.synced_at.clone()).unwrap_or_else(||"—".into()),
         day:snapshot.as_ref().map(|s|s.day.period.clone()).unwrap_or_else(||crate::node::local_date(app)),
         month:snapshot.as_ref().map(|s|s.month.period.clone()).unwrap_or_else(||crate::node::local_date(app)[..7].into()),
@@ -469,6 +482,9 @@ pub fn state_json(app: &SharedApp) -> serde_json::Value {
     })
 }
 
+#[cfg(test)]
+mod price_tests;
+
 fn budget_view(app: &SharedApp) -> BudgetView {
     let policy=crate::reconciler::effective_policy(app);
     let soft = policy.budget.daily_soft_eur * policy.budget.usd_per_eur;
@@ -476,17 +492,11 @@ fn budget_view(app: &SharedApp) -> BudgetView {
     let monthly = policy.budget.monthly_eur * policy.budget.usd_per_eur;
     let date = crate::node::local_date(app);
     let spent = app.db.spent_today(&date);
-    // Projektion: verbraucht + aktuelle Rates bis Tagesende.
-    let mut rate = 0.0;
-    for i in app.db.instances(false) {
-        if i.actual_status == "running" {
-            rate += match i.mode {
-                praxis_common::Mode::Interruptible => i.bid_usd_h,
-                _ => i.dph_total,
-            };
-        }
-        rate += i.storage_usd_h;
-    }
+    // Same active/reserved compute + retained storage as admission and digests.
+    let costs=app.db.try_instances(false).and_then(|rows|crate::costs::hourly(&rows));
+    let rate_known=costs.is_ok();
+    let current_rate=costs.as_ref().map(|c|format!("{:.4} USD/h (Miete {:.4} + Speicher {:.4})",c.total(),c.compute,c.storage)).unwrap_or_else(|_|"nicht verfügbar".into());
+    let rate=costs.map(|c|c.total()).unwrap_or(0.0);
     let now_local = chrono::Utc::now().with_timezone(&tz_of(app));
     let hours = 24.0 - now_local.time().hour() as f64 - now_local.time().minute() as f64 / 60.0;
     let projected = spent + rate * hours;
@@ -494,12 +504,14 @@ fn budget_view(app: &SharedApp) -> BudgetView {
     BudgetView {
         spent_usd: spent,
         projected_usd: projected,
+        rate_known,
+        current_rate,
         spent_month_usd: app.db.spent_month(&date[..7]),
         soft_usd: soft,
         hard_usd: hard,
         monthly_usd: monthly,
         pct,
-        bar_class: if projected >= hard { "hard" } else if projected >= soft { "warn" } else { "" },
+        bar_class: if !rate_known { "warn" } else if projected >= hard { "hard" } else if projected >= soft { "warn" } else { "" },
         daily_soft_eur: crate::reconciler::effective_policy(app).budget.daily_soft_eur,
         daily_hard_eur: crate::reconciler::effective_policy(app).budget.daily_hard_eur,
         monthly_eur: app.cfg().budget.monthly_eur,
@@ -555,7 +567,7 @@ pub async fn index(app: AppCtx, req: Request) -> Response {
             state: state_view,
             healthy: inst.as_ref().map(|i| i.healthy).unwrap_or(false),
             pct,
-            bid: inst.as_ref().map(|i| i.bid_usd_h).unwrap_or(0.0),
+            bid: inst.as_ref().map(|i| i.compute_usd_h()).unwrap_or(0.0),
             min_bid: inst.as_ref().map(|i| i.min_bid).unwrap_or(0.0),
             in_flight: traffic.in_flight,
             busy: inst.as_ref().map(|i| i.busy).unwrap_or(false),
@@ -707,7 +719,9 @@ fn inst_view(app: &SharedApp, row: &crate::db::InstanceRow) -> InstView {
         mode: row.mode.to_string(),
         actual_status: row.actual_status.clone(),
         intended_status: row.intended_status.clone(),
-        bid_usd_h: row.bid_usd_h,
+        bid_usd_h: row.compute_usd_h(),
+        storage_usd_h: row.storage_usd_h,
+        total_usd_h: row.compute_usd_h()+row.storage_usd_h,
         min_bid: row.min_bid,
         busy: row.busy,
         busy_reason: row.busy_reason.clone(),

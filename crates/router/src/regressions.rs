@@ -58,7 +58,7 @@ async fn flip_cannot_bypass_stream_lease_and_failed_flip_cannot_retire_active() 
     assert!(crate::operations::flip_slot(&t.app, 1, 11, 12, "grace").await.is_err());
     // Once preempted and no request is alive, the ready replacement can serve.
     t.app.db.set_instance_state(11, "preempted").unwrap();
-    t.app.db.update_instance_vast(11, "stopped", 1.0, 1.0, 1, "test").unwrap();
+    t.app.db.update_instance_vast(11, "stopped", 1.0, 1.0, 1, "test", 0.1).unwrap();
     crate::operations::flip_slot(&t.app, 1, 11, 12, "test").await.unwrap();
     assert_eq!(t.app.db.active_instance(1), Some(12));
     assert_eq!(t.app.targets.get(1).unwrap().0, 12);
@@ -154,7 +154,7 @@ fn storage_continues_when_stopped_and_failed_stop_still_bills_gpu() {
     // Local desired state is not proof that the provider stopped billing.
     t.app.db.meter_until(at("2026-01-01T01:00:00Z"), chrono_tz::UTC).unwrap();
     close(t.app.db.spent_today("2026-01-01"), 1.1);
-    t.app.db.update_instance_vast(11, "stopped", 1.0, 1.0, 1, "test").unwrap();
+    t.app.db.update_instance_vast(11, "stopped", 1.0, 1.0, 1, "test", 0.1).unwrap();
     t.app.db.meter_until(at("2026-01-01T02:00:00Z"), chrono_tz::UTC).unwrap();
     close(t.app.db.spent_today("2026-01-01"), 1.2);
     t.app.db.mark_destroyed(11).unwrap();

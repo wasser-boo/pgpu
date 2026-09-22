@@ -131,18 +131,18 @@ pub fn check_admission_with_startup(app: &SharedApp, slot: i64, rate: f64, stora
     anyhow::ensure!(!app.shutting_down.load(std::sync::atomic::Ordering::Relaxed), "router is shutting down");
     anyhow::ensure!(rate.is_finite() && rate > 0.0 && storage.is_finite() && storage >= 0.0, "invalid hourly rate");
     let cfg = crate::reconciler::effective_policy(app);
-    let rows = app.db.instances(false);
+    let rows = app.db.try_instances(false)?;
     let pending = app.db.pending_operations()?;
     anyhow::ensure!(!pending.iter().any(|p| rows.iter().any(|r| r.vast_id == p.0 && r.slot_id == slot)), "slot has pending provider operations");
     if existing.is_none() {
         anyhow::ensure!((rows.len() as i64) < cfg.limits.max_instances, "instance limit reached");
         anyhow::ensure!((rows.iter().filter(|r| r.slot_id == slot).count() as i64) < cfg.limits.max_per_slot, "slot instance limit reached");
     }
-    let running_rate: f64 = rows.iter().filter(|r| Some(r.vast_id) != existing &&
-        (r.actual_status == "running" || matches!(r.state.as_str(), "requested" | "provisioning" | "booting" | "agent_connected")))
-        .map(|r| if r.mode == praxis_common::Mode::Interruptible { r.bid_usd_h } else { r.dph_total }).sum();
-    let storage_rate: f64 = rows.iter().map(|r| r.storage_usd_h).sum::<f64>() + storage;
-    anyhow::ensure!(running_rate + rate + storage_rate <= cfg.limits.max_total_rate_usd_h, "hourly rate limit reached");
+    let current=crate::costs::hourly(rows.iter().filter(|r|Some(r.vast_id)!=existing))?;
+    let running_rate=current.compute;
+    let storage_rate=current.storage+storage;
+    anyhow::ensure!(running_rate + rate + storage_rate <= cfg.limits.max_total_rate_usd_h,
+        "hourly rate limit reached: existing compute {running_rate:.4} + requested compute {rate:.4} + storage {storage_rate:.4} > total limit {:.4} USD/h (not an API request limit)", cfg.limits.max_total_rate_usd_h);
     let date = crate::node::local_date(app);
     let (today, month) = app.db.budget_totals(&date)?;
     let exchange = cfg.budget.usd_per_eur;
@@ -172,7 +172,7 @@ async fn change_bid_impl(app: &SharedApp, id: i64, price: f64, reason: &str, aut
     crate::catalog::check_resume(app, &inst, price)?;
     crate::reconciler::meter(app)?;
     if price > inst.bid_usd_h {
-        check_admission(app, inst.slot_id, price, 0.0, Some(id))?;
+        check_admission(app, inst.slot_id, price, inst.storage_usd_h, Some(id))?;
     }
     let vast = app.vast.lock().unwrap().clone().ok_or_else(|| anyhow::anyhow!("vast api not configured"))?;
     vast.set_bid(id, price).await?;
@@ -201,7 +201,7 @@ async fn start(app: &SharedApp, id: i64, reason: &str, automatic: bool) -> anyho
     crate::reconciler::meter(app)?;
     let rate = if inst.mode == praxis_common::Mode::Interruptible { inst.bid_usd_h } else { inst.dph_total };
     crate::catalog::check_resume(app, &inst, rate)?;
-    check_admission(app, inst.slot_id, rate, 0.0, Some(id))?;
+    check_admission(app, inst.slot_id, rate, inst.storage_usd_h, Some(id))?;
     let vast = app.vast.lock().unwrap().clone().ok_or_else(|| anyhow::anyhow!("vast api not configured"))?;
     // Ambiguous/network failures must not destroy a disk as a 'recovery' action.
     vast.set_status(id, true).await?;

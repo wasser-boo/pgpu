@@ -164,10 +164,11 @@ pub fn refresh_slot_routes(app: &SharedApp, slot_id: i64) -> anyhow::Result<()> 
     } else {
         app.targets.set(slot_id, None, None, false);
     }
-    let targets = app.db.instances(false).into_iter().filter(usable)
+    let routable: Vec<_> = app.db.try_instances(false)?.into_iter().filter(usable)
         .filter(|r| slot.pool.warm > 1 || Some(r.vast_id) == active)
-        .filter_map(|r| r.nb_ip.clone().or_else(|| app.hub.nb_ip(r.vast_id)).map(|ip| (r.vast_id, ip))).collect();
-    app.pool_routes.set_healthy(slot_id, targets);
+        .filter_map(|r| r.nb_ip.clone().or_else(|| app.hub.nb_ip(r.vast_id)).map(|ip| (r, ip))).collect();
+    app.pool_routes.set_healthy(slot_id, routable.iter().map(|(r,ip)|(r.vast_id,ip.clone())).collect());
+    for (row,_) in &routable {crate::notifications::ready(app,row);}
     Ok(())
 }
 
@@ -191,7 +192,8 @@ async fn sync_vast(app: &SharedApp, list: &[praxis_vast::Instance]) -> anyhow::R
         };
         // machine_id nicht wischen, wenn Vast ihn diesmal nicht liefert.
         let machine_id = v.machine_id.unwrap_or(row.machine_id);
-        app.db.update_instance_vast(row.vast_id, &v.actual_or("loading"), v.min_bid.unwrap_or(row.min_bid), v.dph_total.unwrap_or(row.dph_total), machine_id, v.gpu_or(&row.gpu_name))?;
+        let storage=v.storage_total_cost.filter(|s|s.is_finite() && *s>=0.0).unwrap_or(row.storage_usd_h);
+        app.db.update_instance_vast(row.vast_id, &v.actual_or("loading"), v.min_bid.unwrap_or(row.min_bid), v.on_demand_compute_usd_h(storage).unwrap_or(row.dph_total), machine_id, v.gpu_or(&row.gpu_name), storage)?;
         // Provider acknowledgement is not always immediate convergence. Retry
         // stopped intent if the next inventory still reports a running GPU.
         if row.state != "destroyed" && row.intended_status == "stopped" {
@@ -233,7 +235,9 @@ async fn sync_vast(app: &SharedApp, list: &[praxis_vast::Instance]) -> anyhow::R
                 ),
                 &serde_json::json!({"min_bid": v.min_bid.unwrap_or(0.0), "bid": row.bid_usd_h}),
             );
-        } else if v.actual_or("loading") == "loading" && matches!(row.state.as_str(), "requested" | "booting") {
+        } else if v.actual_or("loading") == "loading" && row.state == "requested" {
+            // Once the agent advances to booting, a lagging provider "loading"
+            // must not bounce it back to provisioning on every poll/heartbeat.
             let _ = app.db.set_instance_state(row.vast_id, "provisioning");
         }
     }
@@ -436,13 +440,13 @@ pub async fn search_slot_offers(
         tracing::error!(%e, "vast on-demand-Suche fehlgeschlagen (API-Key? Filter?)");
     })?;
     let mut by_id: std::collections::HashMap<i64, OfferSnapshot> = std::collections::HashMap::new();
-    let snap_from = |o: &praxis_vast::Offer, min_bid: f64, dph: f64| OfferSnapshot {
+    let snap_from = |o: &praxis_vast::Offer, min_bid: f64, dph: f64| -> Option<OfferSnapshot> {Some(OfferSnapshot {
         id: o.id,
         machine_id: o.machine_id,
         gpu_name: o.gpu_name.clone(),
         min_bid,
         dph_total: dph,
-        storage_cost: o.storage_or(0.0),
+        storage_cost: o.quoted_storage_cost(slot.disk_gb)?,
         inet_down_cost: o.inet_down_cost.unwrap_or(0.0),
         cpu_ram_gb: o.cpu_ram_gb(),
         gpu_ram_gb: o.gpu_ram_gb(),
@@ -454,15 +458,20 @@ pub async fn search_slot_offers(
         cuda_max_good: o.cuda_max_good,
         cpu_cores: o.cpu_cores,
         geolocation: o.geolocation.clone(),
-    };
+    })};
     for o in &interruptible {
-        let snap = snap_from(o, o.min_bid_or(0.0).max(0.0), o.dph_or(0.0));
+        // A bid result's dph_total is the spot price INCLUDING storage, NOT
+        // an on-demand quote. Missing disk prices are not assumed to be zero.
+        let Some(snap) = snap_from(o, o.min_bid_or(0.0).max(0.0), 0.0) else {continue;};
         by_id.insert(snap.id, snap);
     }
     for o in &ondemand {
-        let snap = snap_from(o, 0.0, o.dph_or(0.0));
+        let Some(snap) = snap_from(o, 0.0, o.on_demand_compute_usd_h(slot.disk_gb).unwrap_or(0.0)) else {continue;};
         match by_id.get_mut(&snap.id) {
-            Some(existing) => existing.dph_total = snap.dph_total,
+            Some(existing) => {
+                existing.dph_total = snap.dph_total;
+                existing.storage_cost=existing.storage_cost.max(snap.storage_cost);
+            },
             None => {
                 by_id.insert(snap.id, snap);
             }
@@ -1210,6 +1219,9 @@ async fn mint_netbird_key(app: &SharedApp, name: &str) -> anyhow::Result<String>
     }
 }
 
+#[cfg(test)]
+mod price_tests;
+
 pub async fn create_instance(
     app: &SharedApp,
     slot_id: i64,
@@ -1340,10 +1352,11 @@ pub async fn create_instance(
         Some(vast_id),
         &format!(
             "{} gemietet: offer {} ({}) {} $/h, disk {disk_gb} GB — {reason}",
-            slot.name, offer.id, offer.gpu_name, price_usd_h
+            slot.name, offer.id, offer.gpu_name, rate
         ),
-        &serde_json::json!({"price": price_usd_h, "mode": mode, "offer": offer.id}),
+        &serde_json::json!({"price": rate, "storage_usd_h":storage_usd_h, "mode": mode, "offer": offer.id}),
     );
+    crate::notifications::rented(app,&slot,&row,offer,disk_gb,eligibility.startup_traffic_usd);
     app.reconcile_now.notify_one();
     Ok(vast_id)
 }

@@ -199,9 +199,18 @@ impl Vast {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
+            if what == "/charges/" {
+                anyhow::bail!("Vast charges: HTTP {status}; usage request failed (response body hidden)");
+            }
             anyhow::bail!("vast {what}: {status} {text}");
         }
-        serde_json::from_str(&text).with_context(|| format!("vast {what}: decode {text:.400}"))
+        if what == "/charges/" {
+            // Provider HTML/error pages and financial payloads do not belong
+            // in the dashboard, logs, or persisted error messages.
+            serde_json::from_str(&text).context("Vast charges: invalid usage response")
+        } else {
+            serde_json::from_str(&text).with_context(|| format!("vast {what}: decode {text:.400}"))
+        }
     }
 
     /// Angebote suchen (`POST /bundles/` mit JSON-Body, wie das vastai-SDK).
