@@ -55,8 +55,8 @@
     <tr><td>Tages Hard-Cap</td><td>{{ budget.daily_hard_eur }} €</td></tr>
     <tr><td>Monats-Cap</td><td>{{ budget.monthly_eur }} €</td></tr>
     <tr><td>Umrechnung</td><td>{{ budget.usd_per_eur }} $/€</td></tr>
-    <tr><td>Heute verbraucht</td><td class="mono">{{ budget.spent_usd|fmt2 }} $</td></tr>
-    <tr><td>Monat verbraucht</td><td class="mono">{{ budget.spent_month_usd|fmt2 }} $</td></tr>
+    <tr><td>Heute fürs Budget berücksichtigt (konservativ)</td><td class="mono">{% if budget.costs_known %}{{ budget.spent_usd|fmt4 }} ${% else %}nicht verfügbar{% endif %}</td></tr>
+    <tr><td>Monat fürs Budget berücksichtigt</td><td class="mono">{% if budget.costs_known %}{{ budget.spent_month_usd|fmt2 }} ${% else %}nicht verfügbar{% endif %}</td></tr>
     <tr><td>Zeitzone</td><td>{{ budget.tz }}</td></tr>
   </table>
 </div>

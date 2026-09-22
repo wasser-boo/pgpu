@@ -268,7 +268,7 @@ fn spawn_target(app: SharedApp, target: webhook::Target, kind: String, message: 
             let cfg = app.cfg();
             let category_enabled = (!matches!(
                 kind.as_str(),
-                "instance_state_changed" | "slot_state_changed" | "slot_backend_changed"
+                "instance_state_changed" | "slot_state_changed" | "slot_backend_changed" | "slot_lock_changed"
             ) || cfg.alerts.state_changes)
                 && (kind != "spend_summary" || cfg.alerts.spend_summary_interval_s > 0);
             let still_enabled = category_enabled

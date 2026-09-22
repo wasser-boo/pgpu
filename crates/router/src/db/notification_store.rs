@@ -16,6 +16,14 @@ pub(super) fn migrate(conn: &Connection) -> anyhow::Result<()> {
                     'compute_usd_h',CASE WHEN NEW.mode='interruptible' THEN NEW.bid_usd_h ELSE NEW.dph_total END,
                     'storage_usd_h',NEW.storage_usd_h));
         END;
+        CREATE TRIGGER IF NOT EXISTS notification_slot_lock
+        AFTER UPDATE OF locked,pinned_instance ON slots
+        WHEN (OLD.locked<>0 OR OLD.pinned_instance IS NOT NULL) != (NEW.locked<>0 OR NEW.pinned_instance IS NOT NULL)
+        BEGIN
+            INSERT INTO events(ts,kind,slot_id,reason,payload_json)
+            VALUES(strftime('%Y-%m-%dT%H:%M:%SZ','now'),'slot_lock_changed',NEW.id,
+                'Slot-Lock geaendert',json_object('locked',(NEW.locked<>0 OR NEW.pinned_instance IS NOT NULL)));
+        END;
         CREATE TRIGGER IF NOT EXISTS notification_slot_backend
         AFTER UPDATE OF active_instance ON slots WHEN OLD.active_instance IS NOT NEW.active_instance
         BEGIN
@@ -53,7 +61,7 @@ impl Db {
         )?;
         let cursor: i64 = cursor.parse()?;
         let events = {
-            let mut stmt=tx.prepare("SELECT * FROM events WHERE id>?1 AND kind IN ('instance_state_changed','slot_backend_changed') ORDER BY id LIMIT 32")?;
+            let mut stmt=tx.prepare("SELECT * FROM events WHERE id>?1 AND kind IN ('instance_state_changed','slot_backend_changed','slot_lock_changed') ORDER BY id LIMIT 32")?;
             let rows = stmt.query_map(params![cursor], |r| {
                 Ok(EventRow {
                     id: r.get("id")?,

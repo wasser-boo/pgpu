@@ -2,12 +2,20 @@
 {% block title %}pgpu — Slots{% endblock %}
 {% block content %}
 <h1>Overview</h1>
+<p id="overview-freshness" class="mut">Übersicht wird alle 30 Sekunden aktualisiert; Charges haben einen eigenen Abgleichszeitpunkt.</p>
 
-<div class="card">
-  <h2>Budget (heute)</h2>
+<div class="card" id="budget-card" data-refresh>
+  <h2>Kosten heute · {{ today.date }} · {{ today.tz }}</h2>
+  <div class="mono">Vast bisher gemeldet: {% match today.provider %}{% when Some with (amount) %}{{ amount|fmt4 }} USD · Stand {{ today.synced_at }}{% when None %}nicht verfügbar{% endmatch %}
+    <br>Lokal erfasst (Schätzung): {% match today.local %}{% when Some with (amount) %}{{ amount|fmt4 }} USD{% when None %}nicht verfügbar{% endmatch %}
+  </div>
+  {% if today.stale %}<p class="badge b-warn">Charges-Abgleich veraltet oder fehlgeschlagen; gemeldete Werte sind nicht der Echtzeitverbrauch.</p>{% endif %}
+  <p class="mut">Compute, Speicher und Traffic der Slot-Verträge, einschließlich gestoppter und historischer Instanzen. Vast kann verzögert melden. Die lokale Schätzung wird nicht auf die Charges aufaddiert. <a href="/settings">Abrechnungsdetails</a></p>
+  {% match today.unassigned %}{% when Some with (amount) %}<p class="mut">Lokaler Altbestand außerhalb der angezeigten Slot-Zuordnung: {{ amount|fmt4 }} USD (im Budget erhalten).</p>{% when None %}{% endmatch %}
+  <h2>Budget (heute, konservativ)</h2>
   <div class="mono">
-    {{ budget.spent_usd|fmt2 }} $ verbraucht · Projektion bis Mitternacht {% if budget.rate_known %}{{ budget.projected_usd|fmt2 }} ${% else %}unbekannt{% endif %} ·
-    Soft {{ budget.soft_usd|fmt2 }} $ / Hard {{ budget.hard_usd|fmt2 }} $ · Monat {{ budget.spent_month_usd|fmt2 }} / {{ budget.monthly_usd|fmt2 }} $
+    {% if budget.costs_known %}{{ budget.spent_usd|fmt4 }} USD für das Budget berücksichtigt{% else %}Budget-Verbrauch nicht verfügbar{% endif %} · Projektion bis Mitternacht {% if budget.rate_known %}{{ budget.projected_usd|fmt2 }} ${% else %}unbekannt{% endif %} ·
+    Soft {{ budget.soft_usd|fmt2 }} $ / Hard {{ budget.hard_usd|fmt2 }} $ · Monat {% if budget.costs_known %}{{ budget.spent_month_usd|fmt2 }}{% else %}unbekannt{% endif %} / {{ budget.monthly_usd|fmt2 }} $
   </div>
   <div class="bar"><div class="{{ budget.bar_class }}" style="width:{{ budget.pct }}%"></div></div>
   {% if stt_sessions > 0 %}<span class="badge b-info">STT: {{ stt_sessions }} WS-Session(s) aktiv</span>{% else %}<span class="badge b-mut">STT idle</span>{% endif %}
@@ -23,12 +31,12 @@
   </div>
 </div>
 
-<div class="grid">
+<div class="grid" id="slots-grid" data-refresh>
 {% for s in slots %}
-<div class="card">
+<div class="card" id="slot-card-{{ s.id }}">
   <h2 style="margin-top:0">Slot {{ s.id }} · {{ s.name }}</h2>
   {% match s.state %}
-  {% when Some with (st) %}<div>State: <span class="badge {{ st.class }}">{{ st.label }}</span> {% if s.healthy %}<span class="badge b-ok">healthy</span>{% else %}<span class="badge b-warn">warming</span>{% endif %}</div>
+  {% when Some with (st) %}<div>State: <span class="badge {{ st.class }}">{{ st.label }}</span> {% if s.healthy %}<span class="badge b-ok">healthy</span>{% else %}<span class="badge b-warn">nicht bereit</span>{% endif %}</div>
   {% when None %}<div>State: <span class="badge b-bad">cold</span></div>
   {% endmatch %}
   <div class="mono">
@@ -36,10 +44,11 @@
     {% if s.pct >= 0.0 %}<br>Download: {{ s.pct|fmt1 }} %{% endif %}
     {% if s.warming_id > 0 %}<br>→ Ersatz #{{ s.warming_id }} wärmt ({{ s.warming_state }}) — Flip bei healthy{% endif %}
     {% if !s.pool_line.is_empty() %}<br>{{ s.pool_line }}{% endif %}
-    {% if s.vast_id > 0 %}<br>Gebot {{ s.bid|fmt4 }} $/h vs. min_bid {{ s.min_bid|fmt4 }} $/h{% endif %}
+    {% if s.vast_id > 0 %}<br>Aktuelle Compute-Rate {{ s.bid|fmt4 }} USD/h · Spot-Mindestgebot {{ s.min_bid|fmt4 }} USD/h{% endif %}
     <br>In-flight: {{ s.in_flight }} · Busy: {% if s.busy %}<span class="badge b-info">{{ s.busy_reason }}</span>{% else %}idle{% endif %}
-    <br>Kosten heute: {{ s.cost_today|fmt2 }} $
-    {% if s.pinned %}<br><span class="badge b-warn">LOCKED</span>{% endif %}
+    <br>Kosten heute (Vast gemeldet): {% match s.provider_cost_today %}{% when Some with (amount) %}{{ amount|fmt4 }} USD{% when None %}nicht verfügbar{% endmatch %}
+    <br>Lokal erfasst (Schätzung): {% match s.cost_today %}{% when Some with (amount) %}{{ amount|fmt4 }} USD{% when None %}nicht verfügbar{% endmatch %}
+    {% if s.pinned %}<br><span class="badge b-warn">LOCKED · Automatik gesperrt, Kosten laufen weiter</span>{% endif %}
   </div>
   <div class="actions">
     <form method="post" action="/do/slots/{{ s.id }}/wake"><button>Wake</button></form>
@@ -49,7 +58,7 @@
     {% if s.pinned %}
     <form method="post" action="/do/slots/{{ s.id }}/unlock" onsubmit="return confirm('Lock aufheben? Der Slot mietet wieder automatisch Ersatz.')"><button>Unlock</button></form>
     {% else %}
-    <form method="post" action="/do/slots/{{ s.id }}/lock" onsubmit="return confirm('Slot locken? Kein Auto-Rent/Replace/Destroy bis Unlock.')"><button>Lock</button></form>
+    <form method="post" action="/do/slots/{{ s.id }}/lock" onsubmit="return confirm('Slot locken? Keine automatischen Starts/Mieten/Swaps/Stop-/Destroy-Aktionen, auch kein Budget-Drain. Laufende Kosten bleiben. Bereits übermittelte Aufträge sind ggf. nicht mehr abbrechbar; bewusste Einzelaktionen bleiben möglich.')"><button>Lock</button></form>
     {% endif %}
     {% if s.vast_id > 0 %}<a class="btn" href="/instances/{{ s.vast_id }}">Details</a>{% endif %}
   </div>
@@ -73,11 +82,39 @@ es.onmessage = (m) => {
     const e = JSON.parse(m.data);
     const div = document.createElement('div');
     div.className = 'row';
-    div.innerHTML = '<span class="k">' + e.kind + '</span><span class="mut">' + e.ts + '</span> ' + e.reason;
+    const kind = document.createElement('span'); kind.className = 'k'; kind.textContent = e.kind;
+    const time = document.createElement('span'); time.className = 'mut'; time.textContent = e.ts;
+    div.append(kind, time, document.createTextNode(' ' + e.reason));
     const el = document.getElementById('events');
     el.prepend(div);
     while (el.children.length > 200) el.lastChild.remove();
   } catch (err) {}
 };
+// Read-only refresh: costs/status must not remain the page-load snapshot all day.
+// Replace only server-rendered overview cards, never evaluate returned scripts.
+let refreshing = false;
+async function refreshCards() {
+  if (refreshing || document.hidden) return;
+  refreshing = true;
+  try {
+    const response = await fetch(location.pathname, {credentials: 'same-origin', cache: 'no-store', signal: AbortSignal.timeout(10000)});
+    if (!response.ok || response.redirected) throw new Error('overview unavailable');
+    const page = new DOMParser().parseFromString(await response.text(), 'text/html');
+    if (!page.getElementById('budget-card') || !page.getElementById('slots-grid')) throw new Error('overview incomplete');
+    for (const card of document.querySelectorAll('[data-refresh]')) {
+      const next = page.getElementById(card.id);
+      if (next) card.replaceChildren(...next.childNodes);
+    }
+    const status = document.getElementById('overview-freshness');
+    status.className = 'mut'; status.textContent = 'Übersicht aktualisiert: ' + new Date().toLocaleTimeString() + ' (Browserzeit). Charges-Stand siehe oben.';
+  } catch (_) {
+    // Preserve last display on failure; never invent zero costs.
+    const status = document.getElementById('overview-freshness');
+    status.className = 'badge b-warn'; status.textContent = 'Übersicht nicht aktualisiert — angezeigte Werte können veraltet sein. Verbindung/Sitzung prüfen.';
+  }
+  finally { refreshing = false; }
+}
+setInterval(refreshCards, 30000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshCards(); });
 </script>
 {% endblock %}

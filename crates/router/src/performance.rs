@@ -110,14 +110,18 @@ pub fn host_scores(app: &SharedApp, slot: &SlotCfg) -> anyhow::Result<HashMap<(i
 }
 
 pub async fn start_benchmark(app: &SharedApp, id: i64) -> anyhow::Result<()> {
+    start_benchmark_impl(app,id,false).await
+}
+async fn start_benchmark_impl(app:&SharedApp,id:i64,automatic:bool)->anyhow::Result<()> {
     let _management = app.management.lock().await;
     anyhow::ensure!(!app.shutting_down.load(std::sync::atomic::Ordering::Relaxed),"router shutting down");
     let inst = app.db.instance(id).ok_or_else(|| anyhow::anyhow!("unknown instance"))?;
+    if automatic {crate::operations::check_lock(app,inst.slot_id,Some(&inst))?;}
     let slot = app.cfg().slot(inst.slot_id).cloned().ok_or_else(|| anyhow::anyhow!("unknown slot"))?;
     let p = &slot.performance;
     anyhow::ensure!(p.enabled && p.benchmark.enabled,"benchmarks disabled in config");
     let rate=if inst.mode==praxis_common::Mode::Interruptible {inst.bid_usd_h} else {inst.dph_total};
-    crate::operations::check_admission(app,inst.slot_id,rate,0.0,Some(id))?;
+    crate::operations::check_admission(app,inst.slot_id,rate,inst.storage_usd_h,Some(id))?;
     anyhow::ensure!(inst.destroyed_at.is_none() && inst.state == "healthy" && inst.actual_status == "running" && !inst.busy,"instance must be healthy and idle");
     anyhow::ensure!(!app.db.pending_operations()?.iter().any(|r|r.0 == id),"pending provider operation");
     let now = chrono::Utc::now().timestamp();
@@ -167,11 +171,11 @@ pub async fn start_benchmark(app: &SharedApp, id: i64) -> anyhow::Result<()> {
 }
 
 pub async fn auto_benchmarks(app: &SharedApp) {
-    let pins=app.db.slot_pins();
+    let Ok(locks)=app.db.slot_locks() else {return;};
     for inst in app.db.instances(false) {
-        if inst.pinned || pins.iter().any(|(slot,pin)|*slot==inst.slot_id && pin.is_some()) {continue;}
+        if inst.pinned || locks.contains(&inst.slot_id) {continue;}
         let enabled = app.cfg().slot(inst.slot_id).is_some_and(|s| s.performance.enabled && s.performance.benchmark.enabled && s.performance.benchmark.auto_when_idle);
-        if enabled { let _ = start_benchmark(app,inst.vast_id).await; }
+        if enabled { let _ = start_benchmark_impl(app,inst.vast_id,true).await; }
     }
 }
 

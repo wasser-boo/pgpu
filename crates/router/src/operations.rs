@@ -4,25 +4,69 @@
 
 use crate::state::SharedApp;
 
+#[derive(Clone,Copy,PartialEq)]
+enum Origin { Explicit, Policy, GuardedBulk }
+
+/// Called under management lock immediately before committing an automatic action.
+pub fn check_lock(app:&SharedApp,slot:i64,instance:Option<&crate::db::InstanceRow>)->anyhow::Result<()> {
+    anyhow::ensure!(!instance.is_some_and(|i|i.pinned) && !app.db.slot_locks()?.contains(&slot),"automatic operation blocked by pin/lock");Ok(())
+}
+
+/// Revalidate a timeout against the CURRENT allocation, never an older policy snapshot.
+/// Caller holds management lock, also used by heartbeat readiness promotion.
+pub fn check_warmup_cleanup(app:&SharedApp,inst:&crate::db::InstanceRow)->anyhow::Result<()> {
+    let cfg=crate::reconciler::effective_policy(app);
+    let slot=cfg.slots.get(&inst.slot_id).ok_or_else(||anyhow::anyhow!("unknown slot"))?;
+    let boot=app.db.boot_started_at(inst.vast_id)?.ok_or_else(||anyhow::anyhow!("boot allocation time unknown"))?;
+    anyhow::ensure!(matches!(inst.state.as_str(),"booting"|"agent_connected") && !slot.swap.allow_long_downloads
+        && (chrono::Utc::now()-boot).num_seconds()>slot.swap.max_warmup_s,"stale/unconfirmed warmup timeout");Ok(())
+}
+
+pub async fn set_slot_lock(app:&SharedApp,slot:i64,locked:bool,reason:&str)->anyhow::Result<()> {
+    let _lock=app.management.lock().await;
+    if app.db.set_slot_locked(slot,locked)? {
+        app.events.emit(&app.db,if locked {"locked"} else {"unlocked"},Some(slot),None,reason,&serde_json::json!({"locked":locked}));
+        app.reconcile_now.notify_one();
+    }
+    Ok(())
+}
+
+/// Explicit bulk commands respect locks/pins, but can stop manual-mode contracts.
+pub async fn guarded_bulk_request(app:&SharedApp,id:i64,operation:&str,reason:&str)->anyhow::Result<()> {
+    anyhow::ensure!(matches!(operation,"stop"|"destroy"),"invalid operation");
+    request(app,id,operation,reason,Origin::GuardedBulk).await
+}
+
 pub async fn stop_instance(app: &SharedApp, id: i64, reason: &str) -> anyhow::Result<()> {
-    request(app, id, "stop", reason, false).await
+    request(app, id, "stop", reason, Origin::Explicit).await
 }
 
 pub async fn destroy_instance(app: &SharedApp, id: i64, reason: &str) -> anyhow::Result<()> {
-    request(app, id, "destroy", reason, false).await
+    request(app, id, "destroy", reason, Origin::Explicit).await
 }
 
 pub async fn automatic_request(app: &SharedApp, id: i64, operation: &str, reason: &str) -> anyhow::Result<()> {
     anyhow::ensure!(matches!(operation, "stop" | "destroy"), "invalid automatic operation");
-    request(app, id, operation, reason, true).await
+    request(app, id, operation, reason, Origin::Policy).await
 }
 
-async fn request(app: &SharedApp, id: i64, operation: &str, reason: &str, automatic: bool) -> anyhow::Result<()> {
+async fn request(app: &SharedApp, id: i64, operation: &str, reason: &str, origin: Origin) -> anyhow::Result<()> {
     let _lock = app.management.lock().await;
     let inst = app.db.instance(id).ok_or_else(|| anyhow::anyhow!("unknown instance {id}"))?;
     if inst.destroyed_at.is_some() { return Ok(()); }
-    if automatic {
-        anyhow::ensure!(!inst.pinned && !app.db.slot_pins().iter().any(|(s, pin)| *s == inst.slot_id && pin.is_some()), "automatic operation blocked by pin/lock");
+    if origin!=Origin::Explicit {check_lock(app,inst.slot_id,Some(&inst))?;}
+    if origin==Origin::Policy {
+        if reason.starts_with("unreachable:") {
+            anyhow::ensure!(inst.state=="unreachable" && inst.actual_status=="running","stale unreachable stop");
+        }
+        anyhow::ensure!(operation!="destroy" || !inst.phase().awaiting_allocation()
+            || reason.starts_with("budget hard cap:") || reason.starts_with("lifecycle ("),
+            "capacity wait/unconfirmed start cannot destroy a retained disk");
+        if operation=="destroy" {
+            if reason.contains("warmup timeout") || reason.contains("swap_failed") {check_warmup_cleanup(app,&inst)?;}
+            if reason.starts_with("preempted") {anyhow::ensure!(inst.state=="preempted","stale preemption cleanup");}
+            if reason.starts_with("destroy_after_stopped") {anyhow::ensure!(inst.state=="stopped","stale stopped-disk cleanup");}
+        }
         if inst.mode == praxis_common::Mode::Manual {
             crate::reconciler::meter(app)?;
             let cfg = crate::reconciler::effective_policy(app);
@@ -32,7 +76,7 @@ async fn request(app: &SharedApp, id: i64, operation: &str, reason: &str, automa
         }
     }
     // Persist before I/O. Never mark completed or stop metering on a failed request.
-    app.db.queue_operation(id, operation, reason)?;
+    app.db.queue_operation_guarded(id, operation, reason,origin!=Origin::Explicit)?;
     app.reconcile_now.notify_one();
     for (pending_id, op, why) in app.db.pending_operations()? {
         if pending_id == id { return execute(app, id, &op, &why).await; }
@@ -52,6 +96,7 @@ pub async fn retry_pending(app: &SharedApp) -> anyhow::Result<()> {
 
 async fn execute(app: &SharedApp, id: i64, op: &str, reason: &str) -> anyhow::Result<()> {
     let inst = app.db.instance(id).ok_or_else(|| anyhow::anyhow!("unknown instance {id}"))?;
+    if app.db.pending_respects_lock(id)? {check_lock(app,inst.slot_id,Some(&inst))?;}
     let vast = app.vast.lock().unwrap().clone().ok_or_else(|| anyhow::anyhow!("vast api not configured"))?;
     match op {
         "destroy" => vast.destroy(id).await?,
@@ -87,7 +132,7 @@ pub async fn flip_slot(app: &SharedApp, slot_id: i64, from: i64, to: i64, reason
     let _lock = app.management.lock().await;
     app.traffic.when_idle(slot_id, |traffic| -> anyhow::Result<()> {
         anyhow::ensure!(app.db.active_instance(slot_id).unwrap_or(0) == from, "stale flip: active instance changed");
-        anyhow::ensure!(!app.db.slot_pins().iter().any(|(s, pin)| *s == slot_id && pin.is_some()), "slot is locked");
+        check_lock(app,slot_id,None)?;
         let cfg = app.cfg();
         let slot = cfg.slot(slot_id).ok_or_else(|| anyhow::anyhow!("unknown slot"))?;
         let target = app.db.instance(to).ok_or_else(|| anyhow::anyhow!("unknown replacement"))?;
@@ -167,7 +212,7 @@ async fn change_bid_impl(app: &SharedApp, id: i64, price: f64, reason: &str, aut
     let cfg = app.cfg();
     let slot = cfg.slot(inst.slot_id).ok_or_else(|| anyhow::anyhow!("unknown slot"))?;
     anyhow::ensure!(inst.destroyed_at.is_none() && inst.mode == praxis_common::Mode::Interruptible, "bid requires a live interruptible contract");
-    anyhow::ensure!(!automatic || (!inst.pinned && !app.db.slot_pins().iter().any(|(s, pin)| *s == inst.slot_id && pin.is_some())), "automatic bid blocked by pin/lock");
+    if automatic {check_lock(app,inst.slot_id,Some(&inst))?;}
     anyhow::ensure!(price.is_finite() && price > 0.0 && price <= slot.bid.ceiling_usd_h, "bid outside slot price ceiling");
     crate::catalog::check_resume(app, &inst, price)?;
     crate::reconciler::meter(app)?;
@@ -195,20 +240,32 @@ async fn start(app: &SharedApp, id: i64, reason: &str, automatic: bool) -> anyho
     anyhow::ensure!(!automatic || app.db.auto_rent_enabled(), "auto-rent disabled");
     let inst = app.db.instance(id).ok_or_else(|| anyhow::anyhow!("unknown instance {id}"))?;
     anyhow::ensure!(inst.destroyed_at.is_none(), "instance {id} is destroyed");
-    anyhow::ensure!(!automatic || (!inst.pinned && inst.mode != praxis_common::Mode::Manual
-        && !app.db.slot_pins().iter().any(|(s, pin)| *s == inst.slot_id && pin.is_some())), "automatic start blocked by pin/manual mode");
+    if automatic {
+        check_lock(app,inst.slot_id,Some(&inst))?;
+        anyhow::ensure!(inst.mode!=praxis_common::Mode::Manual,"automatic start blocked by manual mode");
+    }
     anyhow::ensure!(!app.db.pending_operations()?.iter().any(|p| p.0 == id), "instance {id} has a pending stop/destroy");
+    // An accepted queue request is idempotent. Explicit retry remains available
+    // for an unconfirmed start, never through replacement/disk destruction.
+    if inst.phase().awaiting_allocation() && (automatic || !matches!(inst.state.as_str(),"start_requested"|"start_failed")) {return Ok(());}
     crate::reconciler::meter(app)?;
     let rate = if inst.mode == praxis_common::Mode::Interruptible { inst.bid_usd_h } else { inst.dph_total };
     crate::catalog::check_resume(app, &inst, rate)?;
+    if inst.state=="healthy" && inst.actual_status=="running" && inst.intended_status=="running" {return Ok(());}
     check_admission(app, inst.slot_id, rate, inst.storage_usd_h, Some(id))?;
     let vast = app.vast.lock().unwrap().clone().ok_or_else(|| anyhow::anyhow!("vast api not configured"))?;
-    // Ambiguous/network failures must not destroy a disk as a 'recovery' action.
-    vast.set_status(id, true).await?;
-    app.db.set_instance_intended(id, "running")?;
-    app.db.set_instance_state(id, "booting")?;
-    app.db.set_slot_desired_audited(inst.slot_id, true, "start confirmed")?;
-    app.events.emit(&app.db, "instance_started", Some(inst.slot_id), Some(id), reason, &serde_json::json!({}));
+    // Persist BEFORE I/O: failure/timeout can leave an accepted provider request.
+    app.db.request_instance_start(id)?;
+    app.hub.clear_boot_health(id);
+    crate::reconciler::refresh_slot_routes(app,inst.slot_id)?;
+    let result=vast.set_status(id, true).await;
+    // Only an inventory requested AFTER this response can confirm a new run.
+    app.db.set_instance_state(id,"start_requested")?;
     app.reconcile_now.notify_one();
+    result?;
+    app.db.set_slot_desired_audited(inst.slot_id, true, "start request accepted; allocation unconfirmed")?;
+    app.events.emit(&app.db, "instance_started", Some(inst.slot_id), Some(id),
+        &format!("Startanforderung angenommen, GPU-Zuweisung noch nicht bestätigt — {reason}"),
+        &serde_json::json!({"provider_accepted":true,"ready":false}));
     Ok(())
 }

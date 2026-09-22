@@ -1160,7 +1160,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-common"
-version = "0.26.1"
+version = "0.26.2"
 dependencies = [
  "chrono",
  "serde",
@@ -1169,7 +1169,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-policy"
-version = "0.26.1"
+version = "0.26.2"
 dependencies = [
  "chrono",
  "praxis-common",
@@ -1179,7 +1179,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-router"
-version = "0.26.1"
+version = "0.26.2"
 dependencies = [
  "anyhow",
  "askama",
@@ -1216,7 +1216,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-vast"
-version = "0.26.1"
+version = "0.26.2"
 dependencies = [
  "anyhow",
  "reqwest",

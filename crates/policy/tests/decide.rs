@@ -8,6 +8,9 @@ use praxis_policy::{
 };
 use std::collections::HashMap;
 
+#[path="decide/capacity_cases.rs"]
+mod capacity_cases;
+
 #[test]
 fn pinned_warmup_and_draining_instances_are_not_removed() {
     for state in [InstanceState::Booting, InstanceState::Draining] {

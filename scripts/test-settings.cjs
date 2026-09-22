@@ -5,7 +5,8 @@ const fs = require('node:fs/promises');
 const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
-const {spawn} = require('node:child_process');
+const {spawn, execFile} = require('node:child_process');
+const exec = require('node:util').promisify(execFile);
 const {chromium} = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
 const {circle, codes} = require('../crates/router/static/selection.js');
 
@@ -31,7 +32,7 @@ const delay = ms => new Promise(resolve => setTimeout(resolve,ms));
   const reserve = http.createServer(); const port = await listen(reserve); await new Promise(r => reserve.close(r));
   const base = `http://127.0.0.1:${port}`;
   const config = path.join(work,'config.toml');
-  await fs.writeFile(config, `# KEEP ME: unrelated comments/settings must survive UI saves\n[router]\nbind_ip = "127.0.0.1"\ndashboard_port = ${port}\ndata_dir = "${work}/data"\ntz = "Europe/Berlin"\n[stt]\nmode = "media_slot"\n[budget]\ndaily_soft_eur = 3.0\ndaily_hard_eur = 4.0\nmonthly_eur = 10.0\nusd_per_eur = 1.08\n[alerts]\nwebhook_urls = ["http://127.0.0.1:${sinkPort}/good/SECRET-1", "http://127.0.0.1:${sinkPort}/bad/SECRET-2"]\nwebhook_format = "discord"\n[[slots]]\nid = 1\nrole = "llm"\nname = "Offline browser test"\nsearch_query = 'gpu_ram>=16 geolocation!=FR'\n[slots.env]\nLLAMA_CONTEXT_SIZE = "32768"\n`, {mode:0o600});
+  await fs.writeFile(config, `# KEEP ME: unrelated comments/settings must survive UI saves\n[router]\nbind_ip = "127.0.0.1"\ndashboard_port = ${port}\ndata_dir = "${work}/data"\ntz = "Europe/Berlin"\n[stt]\nmode = "media_slot"\n[budget]\ndaily_soft_eur = 3.0\ndaily_hard_eur = 4.0\nmonthly_eur = 10.0\nusd_per_eur = 1.08\n[alerts]\nstate_changes = false\nwebhook_urls = ["http://127.0.0.1:${sinkPort}/good/SECRET-1", "http://127.0.0.1:${sinkPort}/bad/SECRET-2"]\nwebhook_format = "discord"\n[[slots]]\nid = 1\nrole = "llm"\nname = "Offline browser test"\nsearch_query = 'gpu_ram>=16 geolocation!=FR'\n[slots.env]\nLLAMA_CONTEXT_SIZE = "32768"\n`, {mode:0o600});
   const child = spawn(binary,['--config',config], {cwd:path.join(root,'crates/router'),
     env:{...process.env, ROUTER_TOKEN:token, VAST_API_KEY:'', NB_API_TOKEN:'', RUST_LOG:'warn', HTTP_PROXY:'', HTTPS_PROXY:'', ALL_PROXY:'', NO_PROXY:'127.0.0.1,localhost,::1'}, stdio:['ignore','pipe','pipe']});
   let log = ''; child.stdout.on('data',v => log += v); child.stderr.on('data',v => log += v);
@@ -56,6 +57,17 @@ const delay = ms => new Promise(resolve => setTimeout(resolve,ms));
     assert(page.url().endsWith('/login'));
     await page.locator('input[name=token]').fill(token);
     await Promise.all([page.waitForURL(`${base}/`),page.getByRole('button',{name:'Login',exact:true}).click()]);
+    page.on('dialog', dialog => dialog.accept());
+    assert((await page.locator('#budget-card').innerText()).includes('Vast bisher gemeldet: nicht verfügbar'));
+    await page.locator('form[action="/do/slots/1/lock"] button').click();
+    await page.locator('form[action="/do/slots/1/unlock"] button').waitFor();
+    assert((await page.locator('#slot-card-1').innerText()).includes('LOCKED'));
+    let locked = await (await fetch(`${base}/api/v1/state`,{headers:{Authorization:`Bearer ${token}`}})).json();
+    assert.equal(locked.slots[0].locked,true);
+    await page.locator('form[action="/do/slots/1/unlock"] button').click();
+    await page.locator('form[action="/do/slots/1/lock"] button').waitFor();
+    locked = await (await fetch(`${base}/api/v1/state`,{headers:{Authorization:`Bearer ${token}`}})).json();
+    assert.equal(locked.slots[0].locked,false);
     await page.goto(`${base}/settings`);
     const form = page.locator('form.selection');
     await page.waitForFunction(() => document.querySelector('.selection-status')?.textContent.includes('Vorschau —'));
@@ -99,7 +111,42 @@ const delay = ms => new Promise(resolve => setTimeout(resolve,ms));
       await fs.mkdir(process.env.SCREENSHOT_DIR,{recursive:true});
       await page.screenshot({path:path.join(process.env.SCREENSHOT_DIR,'settings.png'),fullPage:true});
     }
-    console.log('PASS: browser login, country map/preview/exclusion, GPU alternatives, safe config save, Discord fanout/partial failure, billing scope, auth and cooldown; zero GPUs/rentals');
+    // Synthetic DESTROYED contract in this isolated test DB: no cloud calls or live
+    // backends are possible. Verify that an already-open overview refreshes its
+    // per-slot historical costs, and does not add reported charges to estimates.
+    await page.goto(`${base}/`);
+    const current = await (await fetch(`${base}/api/v1/budget`,{headers:auth})).json();
+    await exec('python3',['-c',`
+import datetime,json,sqlite3,sys,zoneinfo
+con=sqlite3.connect(sys.argv[1]); date=sys.argv[2]; scope=json.loads(sys.argv[3])
+now=datetime.datetime.now(datetime.timezone.utc); stamp=now.isoformat(); through=int(now.timestamp())
+zone=zoneinfo.ZoneInfo('Europe/Berlin'); start=datetime.datetime.fromisoformat(date).replace(tzinfo=zone)
+label='praxis-llm-s1-deadbeef'
+with con:
+ con.execute("INSERT INTO instances(vast_id,slot_id,role,node_token,state,created_at,destroyed_at,actual_status,intended_status,label) VALUES(990011,1,'llm','offline-deleted-test-token','destroyed',?,?,'deleted','deleted',?)",(stamp,stamp,label))
+ con.execute("INSERT INTO budget_days(date,metered_usd,traffic_usd) VALUES(?,1.0,0.25) ON CONFLICT(date) DO UPDATE SET metered_usd=1.0,traffic_usd=0.25",(date,))
+ con.execute("INSERT INTO instance_meter(date,instance_id,metered_usd,storage_usd,traffic_usd,last_metered_at) VALUES(?,990011,0.75,0.25,0.25,?)",(date,stamp))
+ for period in (date,date[:7]):
+  con.execute("INSERT INTO provider_spend(period,instance_id,provider_usd,floor_usd,meter_at_sync,updated_at) VALUES(?,990011,2.0,2.0,1.25,?)",(period,stamp))
+ row=dict(instance_id=990011,slot_id=1,label=label,state='destroyed',provider_usd=2.0,estimated_usd=1.25)
+ day=dict(period=date,from_unix=int(start.timestamp()),through_unix=through,provider_usd=2.0,estimated_usd=1.25,ignored_contracts=0,rows=[row])
+ month=dict(day,period=date[:7],from_unix=int(start.replace(day=1).timestamp()))
+ snap=dict(scope=scope,timezone='Europe/Berlin',synced_at=stamp,day=day,month=month)
+ for key,value in [('vast_billing_snapshot',json.dumps(snap)),('vast_billing_status',json.dumps(dict(state='ok',at=stamp)))]:
+  con.execute("INSERT INTO settings(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",(key,value))
+con.close()
+`,path.join(work,'data','pgpu.sqlite'),current.date,JSON.stringify(current.vast_usage.scope)]);
+    await page.evaluate(() => refreshCards());
+    const card = await page.locator('#slot-card-1').innerText();
+    assert(card.includes('Kosten heute (Vast gemeldet): 2.0000 USD'));
+    assert(card.includes('Lokal erfasst (Schätzung): 1.2500 USD'));
+    const after = await (await fetch(`${base}/api/v1/budget`,{headers:auth})).json();
+    assert.equal(after.spent_today_usd,2); assert.equal(after.metered_today_usd,1.25);
+    assert.equal(after.soft_eur,3); assert.equal(after.hard_eur,4);
+    assert.equal((await (await fetch(`${base}/api/v1/state`,{headers:auth})).json()).slots[0].instances.length,0);
+    assert.deepEqual(errors,[]);
+    if (process.env.SCREENSHOT_DIR) await page.screenshot({path:path.join(process.env.SCREENSHOT_DIR,'overview.png'),fullPage:true});
+    console.log('PASS: browser login, slot lock/unlock, live overview refresh with synthetic historical day costs, country map/preview/exclusion, GPU alternatives, safe config save, Discord fanout/partial failure, billing scope, auth and cooldown; zero GPUs/rentals');
   } finally {
     if (browser) await browser.close();
     if (child.exitCode === null && child.signalCode === null) {

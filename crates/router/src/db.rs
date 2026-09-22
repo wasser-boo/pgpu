@@ -4,6 +4,7 @@
 mod performance_store;
 mod billing_store;
 mod notification_store;
+mod lock_store;
 pub use performance_store::PerformanceRow;
 
 use crate::config::Config;
@@ -23,7 +24,7 @@ pub struct Db(
 );
 
 pub fn now_iso() -> String {
-    Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+    Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)
 }
 
 pub fn parse_iso(s: &str) -> Option<DateTime<Utc>> {
@@ -66,6 +67,7 @@ pub struct InstanceRow {
 }
 
 impl InstanceRow {
+    pub fn phase(&self)->praxis_common::InstanceState {praxis_common::InstanceState::parse(&self.state)}
     pub fn compute_usd_h(&self) -> f64 {
         if self.mode==Mode::Interruptible {self.bid_usd_h} else {self.dph_total}
     }
@@ -236,6 +238,7 @@ impl Db {
             // Start existing contracts at migration time, never replay their lifetime.
             tx.execute("UPDATE instances SET last_metered_at=?1", params![now_iso()])?;
         }
+        lock_store::migrate(&tx)?;
         performance_store::migrate(&tx)?;
         notification_store::migrate(&tx)?;
         tx.commit()?;
@@ -283,21 +286,11 @@ impl Db {
         .unwrap_or(false)
     }
 
+    #[cfg(test)] // Legacy persisted locks remain readable; new callers use set_slot_locked.
     pub fn set_slot_pin(&self, slot_id: i64, instance: Option<i64>) -> anyhow::Result<()> {
         let conn = self.0.lock().unwrap();
         conn.execute("UPDATE slots SET pinned_instance=?2 WHERE id=?1", params![slot_id, instance])?;
         Ok(())
-    }
-
-    pub fn slot_pins(&self) -> Vec<(i64, Option<i64>)> {
-        let conn = self.0.lock().unwrap();
-        let mut stmt = match conn.prepare("SELECT id, pinned_instance FROM slots") {
-            Ok(s) => s,
-            Err(_) => return vec![],
-        };
-        stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?)))
-            .map(|rows| rows.filter_map(Result::ok).collect())
-            .unwrap_or_default()
     }
 
     pub fn set_active_instance(&self, slot_id: i64, instance: Option<i64>) -> anyhow::Result<()> {
@@ -407,11 +400,13 @@ impl Db {
         conn.execute(
             "UPDATE instances SET nb_ip=COALESCE(?2, nb_ip), healthy=?3, state=?4,
                 ever_healthy=CASE WHEN ?3=1 THEN 1 ELSE ever_healthy END,
+                boot_started_at=CASE WHEN state='healthy' AND ?4!='healthy' THEN ?5 ELSE boot_started_at END,
                 healthy_since=CASE
                     WHEN ?4='healthy' AND healthy_since IS NULL THEN ?5
                     WHEN ?4!='healthy' THEN NULL
                     ELSE healthy_since END
-             WHERE vast_id=?1 AND state IN ('requested','provisioning','booting','agent_connected','healthy','unreachable')",
+             WHERE vast_id=?1 AND actual_status='running' AND intended_status='running'
+                AND state IN ('booting','agent_connected','healthy','unreachable')",
             params![vast_id, nb_ip, healthy as i64, state, now_iso()],
         )?;
         Ok(())
@@ -455,19 +450,34 @@ impl Db {
         let conn = self.0.lock().unwrap();
         conn.execute(
             "UPDATE instances SET state=?2,
-                boot_started_at=CASE WHEN ?2='booting' AND state NOT IN ('requested','provisioning','booting','agent_connected')
-                    THEN ?3 ELSE COALESCE(boot_started_at, created_at) END,
+                boot_started_at=CASE
+                    WHEN ?2='start_requested' THEN ?3
+                    WHEN ?2='scheduling' AND state NOT IN ('requested','start_requested','start_failed','scheduling','provisioning') THEN ?3
+                    WHEN ?2='booting' AND state NOT IN ('booting','agent_connected') THEN ?3
+                    ELSE COALESCE(boot_started_at, created_at) END,
                 stopped_since=CASE WHEN ?2='stopped' THEN COALESCE(stopped_since, ?3) ELSE NULL END,
                 healthy_since=CASE WHEN ?2='healthy' THEN COALESCE(healthy_since, ?3) ELSE NULL END,
                 healthy=CASE WHEN ?2='healthy' THEN 1 ELSE 0 END,
                 ever_healthy=CASE WHEN ?2='healthy' THEN 1 ELSE ever_healthy END,
-                busy=CASE WHEN ?2 IN ('stopped','preempted','unreachable','destroyed') THEN 0 ELSE busy END
+                busy=CASE WHEN ?2 IN ('requested','start_requested','start_failed','scheduling','provisioning','stopped','preempted','unreachable','destroyed') THEN 0 ELSE busy END
              WHERE vast_id=?1",
             params![vast_id, state, now_iso()],
         )?;
         Ok(())
     }
 
+    /// Durable resume intent before network I/O. An old provider/agent observation
+    /// is not proof of allocation for this request. No ENV is rewritten here.
+    pub fn request_instance_start(&self,id:i64)->anyhow::Result<()> {
+        let conn=self.0.lock().unwrap();
+        let changed=conn.execute("UPDATE instances SET state='start_requested',intended_status='running',
+            healthy=0,busy=0,busy_reason='',healthy_since=NULL,stopped_since=NULL,boot_started_at=?2
+            WHERE vast_id=?1 AND destroyed_at IS NULL AND NOT EXISTS(SELECT 1 FROM pending_operations WHERE instance_id=?1)",params![id,now_iso()])?;
+        anyhow::ensure!(changed==1,"start request cannot be stored");
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub fn set_instance_intended(&self, vast_id: i64, intended: &str) -> anyhow::Result<()> {
         let conn = self.0.lock().unwrap();
         conn.execute(
@@ -500,13 +510,17 @@ impl Db {
 
     /// Persist intent before provider I/O. A pending destroy cannot be weakened to stop.
     pub fn queue_operation(&self, id: i64, operation: &str, reason: &str) -> anyhow::Result<()> {
+        // Explicit commands or convergence of an already acknowledged stop.
+        self.queue_operation_guarded(id,operation,reason,false)
+    }
+    pub fn queue_operation_guarded(&self,id:i64,operation:&str,reason:&str,respect_lock:bool)->anyhow::Result<()> {
         let mut conn = self.0.lock().unwrap();
         let tx = conn.transaction()?;
         tx.execute(
-            "INSERT INTO pending_operations(instance_id,operation,reason) VALUES(?1,?2,?3)
-             ON CONFLICT(instance_id) DO UPDATE SET operation=?2, reason=?3
-             WHERE pending_operations.operation!='destroy'",
-            params![id, operation, reason],
+            "INSERT INTO pending_operations(instance_id,operation,reason,respect_lock) VALUES(?1,?2,?3,?4)
+             ON CONFLICT(instance_id) DO UPDATE SET operation=?2, reason=?3,respect_lock=?4
+             WHERE pending_operations.operation!='destroy' OR (?2='destroy' AND ?4=0)",
+            params![id, operation, reason,respect_lock],
         )?;
         tx.execute("UPDATE instances SET intended_status=CASE
             WHEN (SELECT operation FROM pending_operations WHERE instance_id=?1)='destroy'

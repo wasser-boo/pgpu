@@ -120,6 +120,16 @@ impl Hub {
         inner.agents.get(&vast_id).map(|h| h.lock().unwrap().heartbeat.clone())
     }
 
+    /// A new allocation must obtain a new heartbeat, not reuse the pre-stop one.
+    /// Caller serializes with node heartbeat processing via management lock.
+    pub fn clear_boot_health(&self,vast_id:i64) {
+        let mut inner=self.inner.lock().unwrap();
+        inner.last_seen_all.remove(&vast_id);
+        if let Some(h)=inner.agents.get(&vast_id) {
+            let mut h=h.lock().unwrap();h.heartbeat=HeartbeatData::default();h.last_seen=0;
+        }
+    }
+
     pub fn last_seen(&self, vast_id: i64) -> Option<i64> {
         let inner = self.inner.lock().unwrap();
         match inner.agents.get(&vast_id) {

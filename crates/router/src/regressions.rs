@@ -113,7 +113,9 @@ fn current_boot_clock_is_persistent_and_does_not_reset_on_repeated_state_update(
     t.app.db.set_instance_state(11, "booting").unwrap();
     let started = t.app.db.boot_started_at(11).unwrap().unwrap();
     assert!(started > at("2000-01-01T00:00:00Z"));
-    t.app.db.set_instance_state(11, "provisioning").unwrap();
+    // Repeated allocated-boot updates cannot extend this attempt. Provider
+    // loading regression is separately covered at the reconciliation boundary.
+    t.app.db.set_instance_state(11, "booting").unwrap();
     t.app.db.set_instance_state(11, "booting").unwrap();
     let reopened = Db::open(&t.dir.join("test.sqlite")).unwrap();
     assert_eq!(reopened.boot_started_at(11).unwrap(), Some(started));
@@ -232,11 +234,12 @@ async fn slot_start_actually_awaits_provider_and_reports_failure() {
     p.respond(503, "outage");
     let r = crate::api::slot_action(AppCtx(t.app.clone()), Path((1, "start".into())), t.request("{}")).await;
     assert_eq!(r.status(), StatusCode::BAD_GATEWAY);
-    assert_eq!(t.app.db.instance(11).unwrap().state, "stopped");
+    // Even a 503 can follow an accepted request: never infer disk/boot failure.
+    assert_eq!(t.app.db.instance(11).unwrap().state, "start_requested");
     p.respond(200, r#"{"success":true}"#);
     let r = crate::api::slot_action(AppCtx(t.app.clone()), Path((1, "start".into())), t.request("{}")).await;
     assert_eq!(r.status(), StatusCode::OK);
-    assert_eq!(t.app.db.instance(11).unwrap().state, "booting");
+    assert_eq!(t.app.db.instance(11).unwrap().state, "start_requested");
     t.app.db.set_auto_rent(false).unwrap();
     assert!(crate::operations::start_automatic_instance(&t.app, 11, "stale policy action").await.is_err());
     let calls = p.calls.lock().unwrap();

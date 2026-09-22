@@ -383,6 +383,9 @@ fn describe_slot_state(app: &SharedApp, slot_id: i64) -> String {
     let mut best: Option<(String, i64)> = None;
     for row in app.db.instances(false).into_iter().filter(|r| r.slot_id == slot_id) {
         let label = match row.state.as_str() {
+            "start_requested" => "start_requested".to_string(),
+            "start_failed" => "start_failed".to_string(),
+            "scheduling" => "scheduling".to_string(),
             "requested" | "provisioning" | "booting" | "agent_connected" => {
                 let hb = app.hub.heartbeat(row.vast_id);
                 if let Some(hb) = hb {
@@ -393,6 +396,8 @@ fn describe_slot_state(app: &SharedApp, slot_id: i64) -> String {
                             .and_then(|p| p.as_f64())
                             .map(|p| format!("downloading {p:.0}%"))
                             .unwrap_or_else(|| "downloading".into())
+                    } else if health=="healthy" || health.is_empty() {
+                        "warming".to_string() // not a published, allocated ready backend
                     } else {
                         health.to_string()
                     }

@@ -58,12 +58,13 @@ pub async fn tick(app: &SharedApp) -> anyhow::Result<()> {
 
     // 1. Vast-Sync.
     let vast_client = app.vast.lock().unwrap().clone();
+    let inventory_requested_at=chrono::Utc::now();
     let vast_instances = match vast_client {
         Some(vast) => Some(vast.instances().await?),
         None => None,
     };
     if let Some(list) = &vast_instances {
-        sync_vast(app, list).await?;
+        sync_vast(app, list, inventory_requested_at).await?;
         if let Err(e) = crate::netbird::reconcile(app, list).await {
             tracing::warn!(%e, "NetBird cleanup deferred; will retry without changing live peers");
         }
@@ -73,10 +74,16 @@ pub async fn tick(app: &SharedApp) -> anyhow::Result<()> {
     //    Ein Fail = eine Transition — Reconnects zählen neu, Blips nicht
     //    (Connector flickt die in ~10 s, bevor 3 min Stille ansteht).
     let now_ts = chrono::Utc::now().timestamp();
-    for inst in app.db.instances(false) {
-        if matches!(inst.state.as_str(), "healthy" | "agent_connected" | "booting") {
-            if let Some(seen) = app.hub.last_seen(inst.vast_id) {
-                if now_ts - seen > 180 {
+    for prior in app.db.try_instances(false)? {
+        let guard=app.management.lock().await;
+        let Some(inst)=app.db.instance(prior.vast_id) else {continue;};
+        let boot=app.db.boot_started_at(inst.vast_id)?;
+        let seen=app.hub.last_seen(inst.vast_id);
+        let silence=capacity::silence_since_boot(boot,seen,now_ts);
+        let current_agent_seen=seen.is_some_and(|s|s>0 && boot.is_none_or(|b|s>=b.timestamp()));
+        if matches!(inst.state.as_str(), "healthy" | "agent_connected" | "booting") && inst.actual_status=="running" && current_agent_seen {
+            {
+                if silence > 180 {
                     let _ = app.db.set_instance_state(inst.vast_id, "unreachable");
                     record_machine_fail(app, inst.slot_id, inst.vast_id, inst.machine_id, "agent >3 min still (unreachable)");
                     // Letzter Agent-Health mit in den Event: Der Degraded-Grund
@@ -101,10 +108,11 @@ pub async fn tick(app: &SharedApp) -> anyhow::Result<()> {
         // 2b. Unreachable-Stopper: Vast sagt running (= GPU-Geld brennt),
         //     Agent bleibt tot → stoppen (Disk bleibt warm), damit die Box
         //     nicht unmetered weiterläuft. Fail wurde beim Übergang gezählt.
-        if inst.state == "unreachable" && inst.actual_status == "running" && !inst.pinned && inst.mode != Mode::Manual
-            && !app.db.slot_pins().iter().any(|(slot, pin)| *slot == inst.slot_id && pin.is_some()) {
+        let should_stop=inst.state == "unreachable" && inst.actual_status == "running" && !inst.pinned && inst.mode != Mode::Manual
+            && !app.db.slot_locks()?.contains(&inst.slot_id);
+        drop(guard);
+        if should_stop {
             let connected = app.hub.heartbeat(inst.vast_id).is_some();
-            let silence = app.hub.last_seen(inst.vast_id).map(|s| now_ts - s).unwrap_or(i64::MAX);
             if !connected && silence > app.cfg().vast.unreachable_stop_after_s.max(180) {
                 let _ = crate::operations::automatic_request(
                     app, inst.vast_id, "stop",
@@ -172,17 +180,22 @@ pub fn refresh_slot_routes(app: &SharedApp, slot_id: i64) -> anyhow::Result<()> 
     Ok(())
 }
 
-async fn sync_vast(app: &SharedApp, list: &[praxis_vast::Instance]) -> anyhow::Result<()> {
+mod capacity;
+
+async fn sync_vast(app: &SharedApp, list: &[praxis_vast::Instance], inventory_requested_at:chrono::DateTime<chrono::Utc>) -> anyhow::Result<()> {
     let _lock = app.management.lock().await;
     meter(app)?;
     let by_id: HashMap<i64, &praxis_vast::Instance> = list.iter().map(|i| (i.id, i)).collect();
     for row in app.db.try_instances(true)? {
+        // An in-flight inventory can predate a resume/create. It must not confirm
+        // an old run, report preemption, or erase a newly acquired contract.
+        if row.phase().awaiting_allocation() && app.db.boot_started_at(row.vast_id)?.is_some_and(|at|inventory_requested_at<at) {continue;}
         let Some(v) = by_id.get(&row.vast_id) else {
             // Vast kennt sie nicht mehr → destroyed markieren.
             if row.state != "destroyed" {
                 // Warmup-Box, die Vast komplett verschluckt = Host-Desaster
                 // (kein normaler GC eines exited Interruptible) → Fail zählen.
-                if matches!(row.state.as_str(), "requested" | "provisioning" | "booting" | "agent_connected") {
+                if matches!(row.state.as_str(), "booting" | "agent_connected") {
                     record_machine_fail(app, row.slot_id, row.vast_id, row.machine_id, "instance_gone während warmup");
                 }
                 let _ = app.db.mark_destroyed(row.vast_id);
@@ -197,15 +210,24 @@ async fn sync_vast(app: &SharedApp, list: &[praxis_vast::Instance]) -> anyhow::R
         // Provider acknowledgement is not always immediate convergence. Retry
         // stopped intent if the next inventory still reports a running GPU.
         if row.state != "destroyed" && row.intended_status == "stopped" {
-            if v.actual_or("") == "running" {
-                app.db.queue_operation(row.vast_id, "stop", "reconcile: provider still running")?;
+            if v.actual_or("") == "running" || v.waiting_for_capacity() {
+                app.db.queue_operation(row.vast_id, "stop", "reconcile: provider still running/queued")?;
             } else if v.actual_or("") == "stopped" {
                 app.db.complete_stop(row.vast_id)?;
             }
         }
 
-        // Preemption: wir WOLLEN running, Vast sagt nein.
-        let intended_run = v.intended_or("").is_empty() || v.intended_or("") == "running" || row.intended_status == "running";
+        if let Some(phase)=capacity::observed_phase(&row,v) {
+            if row.state!=phase {
+                if phase=="booting" {app.hub.clear_boot_health(row.vast_id);}
+                app.db.set_instance_state(row.vast_id,phase)?;
+            }
+            continue;
+        }
+        if row.phase().awaiting_allocation() {continue;}
+        // Only a previously allocated run can be preempted. Local explicit stop
+        // and destroy intent wins over stale provider intended/next-state fields.
+        let intended_run = row.intended_status == "running";
         let actual = v.actual_or("");
         // False-Preempt-Schutz (Spike-Lektion): frische Instanzen melden
         // mitunter cur_state="stopped", während actual noch "loading"/
@@ -549,23 +571,18 @@ pub(crate) fn best_candidate(app: &SharedApp, slot_id: i64) -> Option<OfferSnaps
 pub async fn build_snapshot(app: &SharedApp) -> anyhow::Result<Snapshot> {
     let tz: chrono_tz::Tz = app.cfg().router.tz.parse().unwrap_or(chrono_tz::Europe::Berlin);
     let now_local = chrono::Utc::now().with_timezone(&tz);
-    let seconds_to_day_end = {
-        let next_midnight = (now_local + chrono::Duration::days(1))
-            .date_naive()
-            .and_hms_opt(0, 0, 0)
-            .unwrap();
-        (next_midnight - now_local.naive_local()).num_seconds().max(0)
-    };
+    let seconds_to_day_end = crate::billing::seconds_to_day_end(now_local.with_timezone(&chrono::Utc),tz)?;
     let local_weekday = now_local.weekday().number_from_monday() as u8;
     let local_minutes = now_local.time().hour() as u32 * 60 + now_local.time().minute() as u32;
     let date = now_local.format("%Y-%m-%d").to_string();
 
-    let rows = app.db.instances(false);
-    let pins: HashMap<i64, Option<i64>> = app.db.slot_pins().into_iter().collect();
+    let rows = app.db.try_instances(false)?;
+    let locks=app.db.slot_locks()?;
+    let costs=crate::costs::hourly(&rows)?;
 
     let mut slots: Vec<SlotSnapshot> = Vec::new();
-    let mut running_rate = 0.0;
-    let mut storage_rate = 0.0;
+    let running_rate = costs.compute;
+    let storage_rate = costs.storage;
     let instance_count = rows.len();
 
     for slot in &app.cfg().slots {
@@ -583,17 +600,6 @@ pub async fn build_snapshot(app: &SharedApp) -> anyhow::Result<Snapshot> {
         let mut instances = Vec::new();
         for row in rows.iter().filter(|r| r.slot_id == slot.id) {
             let state = parse_state(&row.state);
-            let is_running = row.actual_status == "running" && state.is_active();
-            let rate = match row.mode {
-                Mode::Interruptible => row.bid_usd_h,
-                _ => row.dph_total,
-            };
-            if is_running {
-                running_rate += rate;
-            }
-            if !is_running && row.destroyed_at.is_none() {
-                storage_rate += row.storage_usd_h;
-            }
             let idle_since = {
                 let last_req = app.traffic.snapshot(slot.id).last_request;
                 let last_req = (last_req > 0)
@@ -639,7 +645,7 @@ pub async fn build_snapshot(app: &SharedApp) -> anyhow::Result<Snapshot> {
                 idle_since,
                 stopped_since: row.stopped_since.as_deref().and_then(crate::db::parse_iso),
                 last_seen: None,
-                pinned: row.pinned || pins.get(&slot.id) == Some(&Some(row.vast_id)),
+                pinned: row.pinned || locks.contains(&slot.id),
             });
         }
         let in_flight = app.traffic.snapshot(slot.id).in_flight;
@@ -647,7 +653,7 @@ pub async fn build_snapshot(app: &SharedApp) -> anyhow::Result<Snapshot> {
             id: slot.id,
             role: slot.role,
             name: slot.name.clone(),
-            pinned: pins.get(&slot.id).cloned().flatten().is_some(),
+            pinned: locks.contains(&slot.id),
             active_instance: active_db,
             instances,
             in_flight,
@@ -674,21 +680,7 @@ pub async fn build_snapshot(app: &SharedApp) -> anyhow::Result<Snapshot> {
     })
 }
 
-fn parse_state(s: &str) -> InstanceState {
-    match s {
-        "requested" => InstanceState::Requested,
-        "provisioning" => InstanceState::Provisioning,
-        "booting" => InstanceState::Booting,
-        "agent_connected" => InstanceState::AgentConnected,
-        "healthy" => InstanceState::Healthy,
-        "draining" => InstanceState::Draining,
-        "stopped" => InstanceState::Stopped,
-        "destroyed" => InstanceState::Destroyed,
-        "preempted" => InstanceState::Preempted,
-        "unreachable" => InstanceState::Unreachable,
-        _ => InstanceState::Failed,
-    }
-}
+fn parse_state(s: &str) -> InstanceState {InstanceState::parse(s)}
 
 // ---------------------------------------------------------------- Actions
 
@@ -709,11 +701,7 @@ pub async fn apply_action(app: &SharedApp, action: &Action) -> anyhow::Result<()
                 .instances(false)
                 .into_iter()
                 .filter(|r| {
-                    r.slot_id == *slot_id
-                        && matches!(
-                            r.state.as_str(),
-                            "requested" | "provisioning" | "booting" | "agent_connected" | "healthy" | "draining"
-                        )
+                    r.slot_id == *slot_id && r.phase().is_active()
                 })
                 .count();
             let replacement = reason.starts_with("bid pressure") || reason.starts_with("optimize cost");
@@ -761,8 +749,12 @@ pub async fn apply_action(app: &SharedApp, action: &Action) -> anyhow::Result<()
         Action::Destroy { instance_id, reason } => {
             // Warmup-Timeout = Host zu langsam/hängend fürs Hochziehen → Fail.
             if reason.contains("warmup timeout") || reason.contains("swap_failed") {
+                let guard=app.management.lock().await;
                 if let Some(inst) = app.db.instance(*instance_id) {
+                    crate::operations::check_lock(app,inst.slot_id,Some(&inst))?;
+                    crate::operations::check_warmup_cleanup(app,&inst)?;
                     record_machine_fail(app, inst.slot_id, *instance_id, inst.machine_id, "warmup timeout");
+                    drop(guard);
                     // WARUM nicht healthy? Diagnose MIT Service-Logs ziehen,
                     // solange die Agent-Session noch steht (CUDA-Arch, OOM,
                     // moe-cache-Guard …) — danach stirbt die Box mit dem Destroy.
@@ -789,7 +781,8 @@ pub async fn apply_action(app: &SharedApp, action: &Action) -> anyhow::Result<()
             let inst = app.db.instance(*instance_id).ok_or_else(|| anyhow::anyhow!("unknown instance"))?;
             // A rejected/deferred FlipSlot must NEVER retire the still-active box.
             anyhow::ensure!(app.db.active_instance(inst.slot_id) != Some(*instance_id), "swap deferred: instance is still active");
-            anyhow::ensure!(!inst.pinned && inst.mode != Mode::Manual, "swap blocked by pin/manual mode");
+            crate::operations::check_lock(app,inst.slot_id,Some(&inst))?;
+            anyhow::ensure!(inst.mode != Mode::Manual, "swap blocked by manual mode");
             if app.traffic.snapshot(inst.slot_id).in_flight > 0 || inst.busy {
                 app.db.set_instance_state(*instance_id, "draining")?;
                 Ok(())
@@ -917,70 +910,13 @@ pub async fn run_schedules(app: &SharedApp) {
                     &serde_json::json!({ "destroyed": n, "rule_time": rule.time }),
                 );
             }
-            // Slot(s) locken: aktive Instanz pinnen + Slot-Pin — kein
-            // Auto-Rent/Replace/Destroy bis unlock. Für „Box soll über
-            // Nacht genau SO bleiben"-Szenarien.
-            "lock" => {
-                let _lock = app.management.lock().await;
+            // Same persistent slot-wide lock as dashboard/API, including empty slots.
+            "lock"|"unlock"|"pin"|"unpin" => {
+                let locked=matches!(action.as_str(),"lock"|"pin");
                 for sid in slot_ids(&slots) {
-                    let insts = app.db.instances(false);
-                    let cand = app
-                        .db
-                        .active_instance(sid)
-                        .or_else(|| {
-                            insts
-                                .iter()
-                                .find(|r| {
-                                    r.slot_id == sid && r.destroyed_at.is_none()
-                                        && matches!(r.state.as_str(), "healthy" | "booting" | "agent_connected" | "provisioning" | "requested")
-                                })
-                                .map(|r| r.vast_id)
-                        });
-                    match cand {
-                        Some(vid) => {
-                            let _ = app.db.update_instance_pinned(vid, true);
-                            let _ = app.db.set_slot_pin(sid, Some(vid));
-                            app.events.emit(&app.db, "locked", Some(sid), Some(vid), "schedule lock", &serde_json::json!({ "rule_time": rule.time }));
-                        }
-                        None => {
-                            app.events.emit(&app.db, "schedule_noop", Some(sid), None, &format!("schedule {}: kein Kandidat zum Locken", rule.time), &serde_json::json!({}));
-                        }
+                    if let Err(error)=crate::operations::set_slot_lock(app,sid,locked,"schedule lock/unlock").await {
+                        tracing::warn!(%error,sid,"scheduled lock update failed");
                     }
-                }
-            }
-            "unlock" => {
-                let _lock = app.management.lock().await;
-                for sid in slot_ids(&slots) {
-                    let _ = app.db.set_slot_pin(sid, None);
-                    for inst in app.db.instances(false) {
-                        if inst.slot_id == sid && inst.pinned {
-                            let _ = app.db.update_instance_pinned(inst.vast_id, false);
-                        }
-                    }
-                    app.events.emit(&app.db, "unlocked", Some(sid), None, "schedule unlock", &serde_json::json!({ "rule_time": rule.time }));
-                }
-            }
-            // Pin/unpin = Slot-Pin ohne Instanz-Brandsatz (klassisches Pin).
-            "pin" => {
-                let _lock = app.management.lock().await;
-                for sid in slot_ids(&slots) {
-                    if let Some(active) = app.db.active_instance(sid) {
-                        let _ = app.db.update_instance_pinned(active, true);
-                        let _ = app.db.set_slot_pin(sid, Some(active));
-                        app.events.emit(&app.db, "pinned", Some(sid), Some(active), "schedule pin", &serde_json::json!({ "rule_time": rule.time }));
-                    }
-                }
-            }
-            "unpin" => {
-                let _lock = app.management.lock().await;
-                for sid in slot_ids(&slots) {
-                    let _ = app.db.set_slot_pin(sid, None);
-                    for inst in app.db.instances(false) {
-                        if inst.slot_id == sid && inst.pinned {
-                            let _ = app.db.update_instance_pinned(inst.vast_id, false);
-                        }
-                    }
-                    app.events.emit(&app.db, "unpinned", Some(sid), None, "schedule unpin", &serde_json::json!({ "rule_time": rule.time }));
                 }
             }
             // Tagesbudget override (€, persistiert in DB bis gelöscht):
@@ -1050,8 +986,8 @@ pub async fn destroy_all_instances(
             app.db.set_slot_desired_audited(slot.id, false, reason)?;
         }
     }
-    for inst in app.db.instances(false) {
-        if inst.destroyed_at.is_some() || inst.pinned {
+    for inst in app.db.try_instances(false)? {
+        if inst.destroyed_at.is_some() || inst.pinned || app.db.slot_locks()?.contains(&inst.slot_id) {
             continue;
         }
         if let Some(ids) = slot_ids {
@@ -1059,7 +995,7 @@ pub async fn destroy_all_instances(
                 continue;
             }
         }
-        match destroy_instance(app, inst.vast_id, reason).await {
+        match crate::operations::guarded_bulk_request(app, inst.vast_id, "destroy",reason).await {
             Ok(()) => n += 1,
             Err(e) => failures.push(format!("{}: {e}", inst.vast_id)),
         }
@@ -1091,16 +1027,13 @@ pub async fn set_auto_rent(app: &SharedApp, enabled: bool, source: &str) -> anyh
         app.db.set_slot_desired_audited(slot.id, false, "auto_rent off")?;
     }
     let mut failures = Vec::new();
-    for inst in app.db.instances(false) {
-        if inst.pinned {
+    for inst in app.db.try_instances(false)? {
+        if inst.pinned || app.db.slot_locks()?.contains(&inst.slot_id) {
             continue;
         }
-        let runningish = matches!(
-            inst.state.as_str(),
-            "requested" | "provisioning" | "booting" | "agent_connected" | "healthy" | "draining"
-        );
+        let runningish = inst.phase().is_active();
         if (runningish || inst.actual_status == "running") && inst.destroyed_at.is_none() {
-            if let Err(e) = stop_instance(app, inst.vast_id, "auto-rent off: stop requested, disk retained").await {
+            if let Err(e) = crate::operations::guarded_bulk_request(app, inst.vast_id, "stop","auto-rent off: stop requested, disk retained").await {
                 failures.push(format!("{}: {e}", inst.vast_id));
             }
         }
@@ -1221,6 +1154,8 @@ async fn mint_netbird_key(app: &SharedApp, name: &str) -> anyhow::Result<String>
 
 #[cfg(test)]
 mod price_tests;
+#[cfg(test)]
+mod capacity_tests;
 
 pub async fn create_instance(
     app: &SharedApp,
@@ -1235,6 +1170,13 @@ pub async fn create_instance(
 ) -> anyhow::Result<i64> {
     let _lock = app.management.lock().await;
     anyhow::ensure!(!automatic || app.db.auto_rent_enabled(), "auto-rent disabled");
+    if automatic {
+        crate::operations::check_lock(app,slot_id,None)?;
+        let target=app.cfg().slot(slot_id).map(|s|s.pool.warm).unwrap_or(1).max(1)
+            +usize::from(reason.starts_with("bid pressure") || reason.starts_with("optimize cost"));
+        let active=app.db.try_instances(false)?.iter().filter(|r|r.slot_id==slot_id && r.phase().is_active()).count();
+        anyhow::ensure!(active<target,"pool already reserved/filled");
+    }
     meter(app)?;
     anyhow::ensure!(disk_gb > 0 && price_usd_h.is_finite() && price_usd_h > 0.0, "invalid rental price/disk");
     let rate = if mode == Mode::Interruptible { price_usd_h } else { offer.dph_total };

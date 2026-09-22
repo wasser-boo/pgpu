@@ -219,6 +219,7 @@ pub fn budget_json(app: &SharedApp) -> serde_json::Value {
         "metered_today_usd": metered.map(|m|m.0),
         "metered_month_usd": metered.map(|m|m.1),
         "vast_usage": crate::billing::status(app),
+        "today_costs": crate::billing::today(app,chrono::Utc::now()),
         "soft_eur": crate::reconciler::effective_policy(&app).budget.daily_soft_eur,
         "hard_eur": crate::reconciler::effective_policy(&app).budget.daily_hard_eur,
         "monthly_eur": app.cfg().budget.monthly_eur,
@@ -380,8 +381,10 @@ pub async fn slot_action(app: AppCtx, Path((slot_id, action)): Path<(i64, String
         "sleep" | "stop" => {
             let _ = app.db.set_slot_desired_audited(slot_id, false, "api: sleep")
                 .map_err(|e| tracing::warn!(%e, "audit write"));
-            if let Some(active) = app.db.active_instance(slot_id) {
-                if let Err(e) = crate::reconciler::stop_instance(&app.0, active, &reason).await {
+            // A queued/warming contract need not be the active route yet.
+            let rows=match app.db.try_instances(false) {Ok(rows)=>rows,Err(e)=>return (StatusCode::INTERNAL_SERVER_ERROR,e.to_string()).into_response()};
+            for row in rows.into_iter().filter(|r|r.slot_id==slot_id && (r.phase().is_active() || r.actual_status=="running")) {
+                if let Err(e) = crate::reconciler::stop_instance(&app.0, row.vast_id, &reason).await {
                     return (StatusCode::BAD_GATEWAY, format!("stop pending: {e}")).into_response();
                 }
             }
@@ -411,25 +414,12 @@ pub async fn slot_action(app: AppCtx, Path((slot_id, action)): Path<(i64, String
             app.reconcile_now.notify_one();
             (StatusCode::OK, "swap requested").into_response()
         }
-        "pin" => {
-            let _lock = app.management.lock().await;
-            if let Some(active) = app.db.active_instance(slot_id) {
-                let _ = app.db.set_slot_pin(slot_id, Some(active));
-                let _ = app.db.update_instance_pinned(active, true);
-                app.events.emit(&app.db, "pinned", Some(slot_id), Some(active), &reason, &payload);
+        "lock"|"unlock"|"pin"|"unpin" => {
+            let locked=matches!(action.as_str(),"lock"|"pin");
+            match crate::operations::set_slot_lock(&app.0,slot_id,locked,&reason).await {
+                Ok(())=>(StatusCode::OK,if locked {"locked"} else {"unlocked"}).into_response(),
+                Err(e)=>(StatusCode::INTERNAL_SERVER_ERROR,e.to_string()).into_response(),
             }
-            (StatusCode::OK, "pinned").into_response()
-        }
-        "unpin" => {
-            let _lock = app.management.lock().await;
-            let _ = app.db.set_slot_pin(slot_id, None);
-            for inst in app.db.instances(false) {
-                if inst.slot_id == slot_id && inst.pinned {
-                    let _ = app.db.update_instance_pinned(inst.vast_id, false);
-                }
-            }
-            app.events.emit(&app.db, "unpinned", Some(slot_id), None, &reason, &payload);
-            (StatusCode::OK, "unpinned").into_response()
         }
         "bid" => {
             let Some(price) = payload.get("price").and_then(|p| p.as_f64()) else {
@@ -551,45 +541,23 @@ pub async fn instance_action(app: AppCtx, Path((vast_id, action)): Path<(i64, St
             Ok(_) => (StatusCode::OK, "destroying").into_response(),
             Err(e) => (StatusCode::BAD_GATEWAY, format!("{e}")).into_response(),
         },
-        "pin" => {
+        "pin"|"unpin" => {
             let _lock = app.management.lock().await;
-            let _ = app.db.update_instance_pinned(vast_id, true);
-            app.events.emit(&app.db, "pinned", None, Some(vast_id), &reason, &payload);
-            (StatusCode::OK, "pinned").into_response()
+            let pinned=action=="pin";
+            if let Err(e)=app.db.update_instance_pinned(vast_id,pinned) {return (StatusCode::INTERNAL_SERVER_ERROR,e.to_string()).into_response();}
+            app.events.emit(&app.db,if pinned {"pinned"} else {"unpinned"},None,Some(vast_id),&reason,&payload);
+            app.reconcile_now.notify_one();
+            (StatusCode::OK,if pinned {"pinned"} else {"unpinned"}).into_response()
         }
-        // Lock: Instanz-Pin + Slot-Pin — die Box wird von NOTHING angefasst
-        // (kein Idle-Destroy, kein Preempt-/Kosten-Swap, keine Lifecycle-
-        // Aktionen) UND der Slot mietet keinen Ersatz (kein Wake-Replace,
-        // kein Pool-Refill, kein Auto-Rent). Manuelles Stop/Destroy bleibt
-        // möglich (bewusste Aktion schlägt immer den Lock).
-        "lock" => {
-            let _lock = app.management.lock().await;
-            let slot_id = app.db.instance(vast_id).map(|i| i.slot_id);
-            let _ = app.db.update_instance_pinned(vast_id, true);
-            if let Some(sid) = slot_id {
-                let _ = app.db.set_slot_pin(sid, Some(vast_id));
+        // Slot lock protects every backer and an empty slot, independently of pins.
+        // Explicit instance commands remain possible; bulk/automatic actions respect it.
+        "lock"|"unlock" => {
+            let Some(row)=app.db.instance(vast_id) else {return (StatusCode::NOT_FOUND,"unknown instance").into_response();};
+            let locked=action=="lock";
+            match crate::operations::set_slot_lock(&app.0,row.slot_id,locked,&reason).await {
+                Ok(())=>(StatusCode::OK,if locked {"locked"} else {"unlocked"}).into_response(),
+                Err(e)=>(StatusCode::INTERNAL_SERVER_ERROR,e.to_string()).into_response(),
             }
-            app.events.emit(&app.db, "locked", slot_id, Some(vast_id), &reason, &payload);
-            (StatusCode::OK, "locked").into_response()
-        }
-        "unlock" => {
-            let _lock = app.management.lock().await;
-            let slot_id = app.db.instance(vast_id).map(|i| i.slot_id);
-            let _ = app.db.update_instance_pinned(vast_id, false);
-            if let Some(sid) = slot_id {
-                // Slot-Pin nur lösen, wenn er auf DIESE Instanz zeigt.
-                let pins: std::collections::HashMap<i64, Option<i64>> = app.db.slot_pins().into_iter().collect();
-                if pins.get(&sid).copied().flatten() == Some(vast_id) {
-                    let _ = app.db.set_slot_pin(sid, None);
-                }
-                for inst in app.db.instances(false) {
-                    if inst.slot_id == sid && inst.pinned && inst.vast_id != vast_id {
-                        let _ = app.db.update_instance_pinned(inst.vast_id, false);
-                    }
-                }
-            }
-            app.events.emit(&app.db, "unlocked", slot_id, Some(vast_id), &reason, &payload);
-            (StatusCode::OK, "unlocked").into_response()
         }
         "bid" => {
             let Some(price) = payload.get("price").and_then(|p| p.as_f64()) else {

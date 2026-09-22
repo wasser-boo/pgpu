@@ -130,6 +130,16 @@ fn compute_usd_h(base: Option<f64>, total: Option<f64>, storage: f64) -> Option<
 }
 
 impl Instance {
+    /// Provider queue signals may appear alongside a lagging actual=stopped.
+    /// Do not infer allocation from intended/next_state=running (that is only a goal).
+    pub fn waiting_for_capacity(&self)->bool {
+        [&self.actual_status,&self.cur_state,&self.status].into_iter().flatten().any(|s|
+            matches!(s.trim().to_ascii_lowercase().as_str(),"scheduling"|"scheduled"|"queued"|"waiting"|"pending"|"waiting_for_resources"|"waiting_for_gpu"))
+    }
+    pub fn allocation_running(&self)->bool {
+        self.actual_status.as_deref()==Some("running") && !self.waiting_for_capacity()
+            && !matches!(self.cur_state.as_deref(),Some("stopped"|"exited"|"error"|"deleted"))
+    }
     pub fn on_demand_compute_usd_h(&self, fallback_storage_usd_h: f64) -> Option<f64> {
         compute_usd_h(
             self.dph_base,

@@ -74,6 +74,12 @@ impl Default for Lifecycle {
 #[serde(rename_all = "snake_case")]
 pub enum InstanceState {
     Requested,
+    /// Retained contract start requested; provider allocation not yet confirmed.
+    StartRequested,
+    /// Provider reports a launch error before allocation; retain disk for explicit retry.
+    StartFailed,
+    /// Waiting for provider GPU capacity, not a dead/unreachable host.
+    Scheduling,
     Provisioning,
     Booting,
     AgentConnected,
@@ -87,10 +93,29 @@ pub enum InstanceState {
 }
 
 impl InstanceState {
+    pub fn parse(value:&str)->Self {
+        match value {
+            "requested"=>Self::Requested,"start_requested"=>Self::StartRequested,"start_failed"=>Self::StartFailed,
+            "scheduling"=>Self::Scheduling,"provisioning"=>Self::Provisioning,
+            "booting"=>Self::Booting,"agent_connected"=>Self::AgentConnected,
+            "healthy"=>Self::Healthy,"draining"=>Self::Draining,"stopped"=>Self::Stopped,
+            "destroyed"=>Self::Destroyed,"preempted"=>Self::Preempted,
+            "unreachable"=>Self::Unreachable,_=>Self::Failed,
+        }
+    }
+    /// No confirmed allocation in this attempt, including a failed/unconfirmed start.
+    pub fn awaiting_allocation(self)->bool {
+        matches!(self,Self::Requested|Self::StartRequested|Self::StartFailed|Self::Scheduling|Self::Provisioning)
+    }
+    /// Includes reservations/pending starts, NOT a claim that a backend serves traffic.
     pub fn is_active(self) -> bool {
         matches!(
             self,
-            InstanceState::Healthy
+            InstanceState::Requested
+                | InstanceState::StartRequested
+                | InstanceState::StartFailed
+                | InstanceState::Scheduling
+                | InstanceState::Healthy
                 | InstanceState::AgentConnected
                 | InstanceState::Booting
                 | InstanceState::Provisioning

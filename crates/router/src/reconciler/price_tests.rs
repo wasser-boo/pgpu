@@ -76,7 +76,7 @@ async fn sync_uses_actual_compute_and_storage_but_preserves_prior_spending() {
     )
     .unwrap();
     let v:praxis_vast::Instance=serde_json::from_value(json!({"id":11,"actual_status":"running","intended_status":"running","dph_base":0.4573333333,"dph_total":0.4684444444,"storage_total_cost":0.0111111111})).unwrap();
-    sync_vast(&t.app, &[v]).await.unwrap();
+    sync_vast(&t.app, &[v],chrono::Utc::now()).await.unwrap();
     let row = t.app.db.instance(11).unwrap();
     close(row.compute_usd_h(), 0.4573333333);
     close(row.storage_usd_h, 0.0111111111);
@@ -162,7 +162,7 @@ async fn provider_loading_does_not_regress_agent_booting_on_every_poll() {
     )
     .unwrap();
     for _ in 0..3 {
-        sync_vast(&t.app, std::slice::from_ref(&v)).await.unwrap();
+        sync_vast(&t.app, std::slice::from_ref(&v),chrono::Utc::now()).await.unwrap();
     }
     assert_eq!(t.app.db.instance(11).unwrap().state, "booting");
     assert!(t.app.db.claim_notification_events().unwrap().is_empty());

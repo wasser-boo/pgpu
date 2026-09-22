@@ -18,11 +18,7 @@ pub fn hourly<'a>(rows: impl IntoIterator<Item = &'a InstanceRow>) -> anyhow::Re
         if row.destroyed_at.is_some() {
             continue;
         }
-        let active = row.actual_status == "running"
-            || matches!(
-                row.state.as_str(),
-                "requested" | "provisioning" | "booting" | "agent_connected"
-            );
+        let active = row.actual_status == "running" || row.phase().is_active();
         let compute = if active { row.compute_usd_h() } else { 0.0 };
         anyhow::ensure!(
             compute.is_finite()

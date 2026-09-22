@@ -27,13 +27,16 @@
     <form method="post" action="/do/instances/{{ inst.vast_id }}/destroy" onsubmit="return confirm('Wirklich zerstören?')"><button>Zerstören</button></form>
     <form method="post" action="/do/instances/{{ inst.vast_id }}/pin"><button>Pin</button></form>
     <form method="post" action="/do/instances/{{ inst.vast_id }}/unpin"><button>Unpin</button></form>
-    {% if inst.pinned %}
+    {% if inst.slot_locked %}
+    <span class="badge b-warn">SLOT LOCKED</span>
     <form method="post" action="/do/instances/{{ inst.vast_id }}/unlock" onsubmit="return confirm('Lock aufheben? Der Slot mietet wieder automatisch Ersatz.')"><button>Unlock</button></form>
     {% else %}
-    <form method="post" action="/do/instances/{{ inst.vast_id }}/lock" onsubmit="return confirm('Instanz locken? Sie wird dann nicht mehr gestoppt/gestaucht/neu gemietet — kein Auto-Rent, kein Wake-Replace, bis du Unlock drückst.')"><button>Lock</button></form>
+    <form method="post" action="/do/instances/{{ inst.vast_id }}/lock" onsubmit="return confirm('Gesamten Slot locken? Keine automatischen Starts/Mieten/Swaps/Stop-/Destroy-Aktionen, auch kein Budget-Drain. Laufende Kosten bleiben. Bereits übermittelte Aufträge sind ggf. nicht mehr abbrechbar. Bewusste Einzelaktionen bleiben möglich.')"><button>Lock</button></form>
     {% endif %}
     <a class="btn" href="/term/{{ inst.vast_id }}">Terminal</a>
   </div>
+  <p class="mut">Pin schützt nur diese Instanz; Lock schützt den ganzen Slot, auch ohne laufende GPU. Unlock entfernt keine unabhängig gesetzten Pins. Ein Lock stoppt keine Kosten und übersteuert automatische Budget-/Lifecycle-Aktionen. Explizite Einzelinstanz-Kommandos bleiben möglich.</p>
+  <p class="mut"><code>[slots.env]</code> gilt beim Neumieten. Stop/Start übernimmt keine geänderten ENV-Werte in diesen Vertrag. Beim Decision-/Codacus-Image kann <code>/workspace/llama.cpp/runtime-settings.json</code> z. B. <code>LLAMA_CONTEXT_SIZE</code> übersteuern; Änderungen benötigen einen gezielten Service-Neustart.</p>
   <div class="actions">
     <form method="post" action="/do/instances/{{ inst.vast_id }}/cmd">
       <input type="hidden" name="command" value="restart">
@@ -76,7 +79,7 @@
   <form method="post" action="/do/instances/{{ inst.vast_id }}/mode">
     <select name="mode">
       <option value="interruptible">interruptible</option>
-      <option value="on_demand">on-demand (Fixpreis, unkillebar)</option>
+      <option value="on_demand">on-demand (Fixpreis, nicht Spot-preemptbar)</option>
       <option value="manual">manual</option>
     </select>
     <button>Wechseln</button>

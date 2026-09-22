@@ -65,6 +65,17 @@ pub(super) fn total(conn: &Connection, period: &str) -> Result<f64> {
     Ok(total)
 }
 impl Db {
+    /// All locally recorded compute/storage/traffic for the day, including stopped
+    /// and destroyed contracts. Never limit this to the active backend.
+    pub fn slot_costs(&self,date:&str)->Result<(f64,HashMap<i64,f64>)> {
+        let conn=self.0.lock().unwrap();
+        let mut stmt=conn.prepare("SELECT i.slot_id,SUM(m.metered_usd+m.storage_usd+m.traffic_usd)
+            FROM instance_meter m JOIN instances i ON i.vast_id=m.instance_id
+            WHERE m.date=?1 GROUP BY i.slot_id")?;
+        let rows:HashMap<i64,f64>=stmt.query_map([date],|r|Ok((r.get(0)?,r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        ensure!(rows.values().all(|v|v.is_finite() && *v>=0.0),"invalid slot costs");
+        Ok((metered(&conn,date)?,rows))
+    }
     pub fn instance_costs(&self, period: &str) -> Result<HashMap<i64, f64>> {
         estimates(&self.0.lock().unwrap(), period)
     }

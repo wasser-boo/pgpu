@@ -46,6 +46,12 @@ fn midnight(date: chrono::NaiveDate, tz: chrono_tz::Tz) -> Result<DateTime<Utc>>
     anyhow::bail!("no valid billing day boundary")
 }
 
+/// Calendar midnight in the configured timezone, including 23/25-hour DST days.
+pub(crate) fn seconds_to_day_end(now:DateTime<Utc>,tz:chrono_tz::Tz)->Result<i64> {
+    let tomorrow=now.with_timezone(&tz).date_naive().succ_opt().context("invalid next day")?;
+    Ok((midnight(tomorrow,tz)?-now).num_seconds().max(0))
+}
+
 fn label<'a>(
     id: i64,
     metadata: Option<&'a str>,
@@ -286,6 +292,9 @@ pub fn status(app: &SharedApp) -> serde_json::Value {
         Err(error) => json!({"scope":slot_labels::scope(&app.cfg()),"error":error.to_string()}),
     }
 }
+
+mod today;
+pub use today::{today,TodayCosts};
 
 #[cfg(test)]
 mod tests;

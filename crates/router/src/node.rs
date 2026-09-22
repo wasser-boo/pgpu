@@ -63,11 +63,12 @@ async fn node_session(app: SharedApp, socket: WebSocket) {
     let vast_id = inst.vast_id;
     registered_vast_id = Some(vast_id);
     tracing::info!(vast_id, role, %agent_version, ?nb_ip, "agent connected");
-    let _ = app
-        .db
-        .update_instance_agent(vast_id, nb_ip.as_deref(), false, "agent_connected");
-    rx = Some(app.hub.register(vast_id, inst.slot_id, nb_ip.clone(), services));
-    app.reconcile_now.notify_one();
+    {
+        let _management=app.management.lock().await;
+        let _ = app.db.update_instance_agent(vast_id, nb_ip.as_deref(), false, "agent_connected");
+        rx = Some(app.hub.register(vast_id, inst.slot_id, nb_ip.clone(), services));
+        app.reconcile_now.notify_one();
+    }
 
     // Asset-Push (Call-home-Pfad: gleiche Session, Router schiebt).
     {
@@ -89,11 +90,14 @@ async fn node_session(app: SharedApp, socket: WebSocket) {
                             Ok(NodeMessage::Hello { token, .. }) => {
                                 // Reconnect: neu registrieren.
                                 if let Some(inst2) = app.db.instance_by_token(&token) {
+                                    let _management=app.management.lock().await;
                                     let _ = app.db.update_instance_agent(inst2.vast_id, nb_ip.as_deref(), false, "agent_connected");
                                     app.reconcile_now.notify_one();
                                 }
                             }
                             Ok(NodeMessage::Heartbeat { health, busy, busy_reason, gpu, progress, disk_free_gb, .. }) => {
+                                // Do not promote a heartbeat across a concurrent start/allocation boundary.
+                                let _management=app.management.lock().await;
                                 let health_json = serde_json::to_value(&health).unwrap_or_default();
                                 let hb = crate::hub::HeartbeatData {
                                     health_json: health_json.clone(),

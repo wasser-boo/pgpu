@@ -296,7 +296,7 @@ impl InstanceSnapshot {
         }
     }
     pub fn is_running(&self) -> bool {
-        self.actual_status == "running" && self.state.is_active()
+        self.actual_status == "running" && self.state.is_active() && !self.state.awaiting_allocation()
     }
 }
 
@@ -342,7 +342,7 @@ pub struct Snapshot {
     pub spent_month_usd: f64,
     pub slots: Vec<SlotSnapshot>,
     pub instance_count: usize,
-    /// Laufender Stundenpreis (running) inkl. Storage gestoppter.
+    /// Current/reserved compute, including pending capacity; storage is separate.
     pub running_rate_usd_h: f64,
     pub storage_rate_usd_h: f64,
     /// Auto-Miete-Schalter (Dashboard/API): `false` = der Router mietet und
@@ -403,6 +403,7 @@ pub fn decide(snap: &Snapshot, cfg: &PolicyConfig) -> Vec<Action> {
             format!("budget hard cap: today {:.2} USD >= {hard_usd:.2} USD", snap.spent_today_usd)
         };
         for slot in &snap.slots {
+            if slot.pinned {continue;}
             for inst in &slot.instances {
                 if inst.pinned {
                     continue; // Lock schlaegt Budget-Drain (bewusste Nutzerwahl).
@@ -422,8 +423,8 @@ pub fn decide(snap: &Snapshot, cfg: &PolicyConfig) -> Vec<Action> {
         }
         actions.push(Action::Alert {
             kind: "budget_hard".into(),
-            message: format!("{cap} — {} nicht gepinnter Instanzen angefordert; Provider-Bestätigung steht aus.",
-                if destroy_mode { "Destroy" } else { "Stop" }),
+            message: format!("{cap} — {} für {} nicht gesperrte Instanz(en) vorgesehen; Provider-Bestätigung steht aus. Locks/Pins bleiben geschützt und können weiter Kosten verursachen.",
+                if destroy_mode { "Destroy" } else { "Stop" },actions.len()),
         });
         return actions;
     }
@@ -460,6 +461,7 @@ pub fn decide(snap: &Snapshot, cfg: &PolicyConfig) -> Vec<Action> {
                 continue;
             }
             if inst.state.is_active()
+                && !inst.state.awaiting_allocation()
                 && inst.state != InstanceState::Healthy
                 && inst.state != InstanceState::Draining
                 && (snap.now - inst.boot_started_at).num_seconds() > scfg.swap.max_warmup_s
@@ -502,7 +504,7 @@ pub fn decide(snap: &Snapshot, cfg: &PolicyConfig) -> Vec<Action> {
                         });
                         actions.push(Action::SwapOut {
                             instance_id: old.vast_id,
-                            destroy: slot.role == Role::Media,
+                            destroy: slot.role == Role::Media && !old.state.awaiting_allocation(),
                             reason: "hot swap: replaced".into(),
                         });
                     }
@@ -819,7 +821,7 @@ pub fn decide(snap: &Snapshot, cfg: &PolicyConfig) -> Vec<Action> {
                                     reason: format!("schedule {spec}: Prewarm {prewarm_s}s"),
                                 });
                             }
-                        } else if inst.is_running() {
+                        } else if inst.is_running() || inst.state.awaiting_allocation() {
                             lifecycle_stop(&mut actions, inst, *destroy, format!("schedule {spec}: Fenster zu"));
                         }
                     }
@@ -855,7 +857,7 @@ pub fn decide(snap: &Snapshot, cfg: &PolicyConfig) -> Vec<Action> {
 }
 
 fn lifecycle_stop(actions: &mut Vec<Action>, inst: &InstanceSnapshot, destroy: bool, why: String) {
-    if inst.is_running() {
+    if inst.is_running() || inst.state.awaiting_allocation() {
         if destroy {
             actions.push(Action::Destroy {
                 instance_id: inst.vast_id,

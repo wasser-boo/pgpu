@@ -4,6 +4,8 @@ use super::{alert, backend_ready};
 use crate::{db::InstanceRow, state::SharedApp};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
+#[cfg(test)]
+mod tests;
 
 pub async fn run(app: SharedApp) {
     let mut timer = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -25,6 +27,9 @@ fn short(s: &str) -> String {
 fn state_hint(state: &str) -> &'static str {
     match state {
         "requested"=>"Mietvertrag angelegt; Start steht noch aus.",
+        "start_requested"=>"Start angefordert; GPU-Zuweisung noch nicht bestätigt. Keine Bereitschaftszusage, kein ENV-Update. Disk bleibt erhalten.",
+        "start_failed"=>"Vast meldet einen Startfehler vor bestätigter Zuweisung. Disk bleibt erhalten; kein blindes Neumieten. Provider-Status prüfen und gezielt erneut starten; Stop/Start übernimmt keine geänderten ENV-Werte.",
+        "scheduling"=>"Wartet auf GPU-Kapazität bei Vast. Das ist kein Preempt-/Agent-Fehler. Disk bleibt erhalten; kein Ersatz/Destroy nur wegen der Wartezeit. Budget- und explizite Lifecycle-Regeln gelten weiter.",
         "provisioning"=>"Provider bereitet die Instanz vor; noch nicht einsatzbereit.",
         "agent_connected"=>"Agent verbunden; Service-Bereitschaft wird noch geprüft.",
         "booting"=>"Services/Modell noch nicht bereit oder Healthcheck nicht grün.",
@@ -50,6 +55,11 @@ fn event_message(app: &SharedApp, event: &crate::db::EventRow) -> Option<(String
         let storage = p["storage_usd_h"].as_f64()?;
         let message=format!("🔄 Slot {} ({}) · Instanz {}\n{} → {}\nGPU: {} · Modus: {}\nProvider: {} · gewünschter Zustand: {}\nMiete bei laufender GPU: {:.4} USD/h · Speicher: {:.4} USD/h (ohne Traffic)\n{}\nZeitpunkt: {}",slot.id,short(&slot.name),event.instance_id?,short(from),short(to),short(p["gpu"].as_str().unwrap_or("unbekannt")),short(p["mode"].as_str().unwrap_or("unbekannt")),short(p["actual_status"].as_str().unwrap_or("unbekannt")),short(p["intended_status"].as_str().unwrap_or("unbekannt")),rate,storage,state_hint(to),event.ts);
         Some(("instance_state_changed".into(), message))
+    } else if event.kind == "slot_lock_changed" {
+        let locked=p["locked"].as_i64()?!=0;
+        Some(("slot_lock_changed".into(),format!("{} Slot {} ({}) · {}\n{}\nZeitpunkt: {}",if locked {"🔒"} else {"🔓"},slot.id,short(&slot.name),if locked {"LOCKED"} else {"UNLOCKED"},
+            if locked {"Automatische Starts/Mieten/Swaps/Stop-/Destroy-Aktionen sind gesperrt, einschließlich Budget-Drain. Laufende Kosten bleiben! Bereits angenommene Aktionen sind ggf. nicht mehr abbrechbar; bewusste Einzelaktionen bleiben möglich."}
+            else {"Automatik folgt wieder der aktuellen Konfiguration und den Budgets. Unabhängige Instanz-Pins bleiben erhalten."},event.ts)))
     } else if event.kind == "slot_backend_changed" {
         let previous = p["previous"].as_i64();
         let next = p["next"].as_i64();
@@ -76,6 +86,12 @@ fn event_message(app: &SharedApp, event: &crate::db::EventRow) -> Option<(String
 fn slot_state(app: &SharedApp, rows: &[InstanceRow]) -> &'static str {
     if rows.iter().any(|r| backend_ready(app, r)) {
         "ready"
+    } else if rows.iter().any(|r|r.state=="scheduling") {
+        "scheduling (wartet auf GPU-Kapazität)"
+    } else if rows.iter().any(|r|r.state=="start_failed") {
+        "start_failed (Vast meldet Startfehler; Disk behalten)"
+    } else if rows.iter().any(|r|r.state=="start_requested") {
+        "start_requested (GPU-Zuweisung unbestätigt)"
     } else if rows.iter().any(|r| {
         matches!(
             r.state.as_str(),

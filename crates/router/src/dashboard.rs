@@ -8,7 +8,6 @@ use axum::extract::multipart::Multipart;
 use axum::extract::{Form, Path, Query, Request};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Redirect, Response};
-use chrono::Timelike;
 use std::collections::HashMap;
 
 pub mod filters {
@@ -160,7 +159,8 @@ pub struct SlotView {
     pub in_flight: u32,
     pub busy: bool,
     pub busy_reason: String,
-    pub cost_today: f64,
+    pub cost_today: Option<f64>,
+    pub provider_cost_today: Option<f64>,
     pub pinned: bool,
     /// Ersatz-Box, die parallel zum aktiven Box wärmt (Hot-Swap).
     pub warming_id: i64,
@@ -175,6 +175,7 @@ pub struct StateView {
 }
 
 pub struct BudgetView {
+    pub costs_known: bool,
     pub spent_usd: f64,
     pub projected_usd: f64,
     pub rate_known: bool,
@@ -195,6 +196,7 @@ pub struct BudgetView {
 #[derive(Template)]
 #[template(path = "index.html")]
 pub struct IndexTpl {
+    pub today: crate::billing::TodayCosts,
     pub slots: Vec<SlotView>,
     pub budget: BudgetView,
     pub events: Vec<EventView>,
@@ -272,6 +274,7 @@ pub struct InstView {
     pub busy_reason: String,
     pub lifecycle: String,
     pub pinned: bool,
+    pub slot_locked: bool,
     /// Letzter Agent-Health ("healthy" oder Degraded-Grund, z. B.
     /// "11434 → 503") — sagt, warum die Box (noch) nicht serviert.
     pub agent_health: String,
@@ -425,6 +428,7 @@ pub struct RoutingView {
 // ---------------------------------------------------------------- State-JSON (API)
 
 pub fn state_json(app: &SharedApp) -> serde_json::Value {
+    let locks=app.db.slot_locks();
     let mut slots = Vec::new();
     for s in &app.cfg().slots {
         let active = app.db.active_instance(s.id);
@@ -439,7 +443,7 @@ pub fn state_json(app: &SharedApp) -> serde_json::Value {
         let shown = active.or_else(|| fallback.map(|r| r.vast_id));
         let inst = shown.and_then(|v| app.db.instance(v));
         let traffic = app.traffic.snapshot(s.id);
-        let hb = shown.and_then(|v| app.hub.heartbeat(v));
+        let hb = shown.filter(|_|!inst.as_ref().is_some_and(|i|matches!(i.state.as_str(),"start_requested"|"start_failed"|"scheduling"))).and_then(|v| app.hub.heartbeat(v));
         // Pool-Sicht: alle lebenden Instanzen des Slots (Multi-Instanz-
         // Slots, Badges/Routing-Transparenz für Praxis).
         let pool_cfg = app.cfg().slot(s.id).map(|c| c.pool).unwrap_or_default();
@@ -464,6 +468,8 @@ pub fn state_json(app: &SharedApp) -> serde_json::Value {
             "role": s.role,
             "name": s.name,
             "desired_running": app.db.slot_desired(s.id),
+            "locked": locks.as_ref().ok().map(|locks|locks.contains(&s.id)),
+            "lock_status_known": locks.is_ok(),
             "active_instance": active,
             "healthy": inst.as_ref().map(|i| i.healthy).unwrap_or(false),
             "state": inst.as_ref().map(|i| i.state.clone()),
@@ -484,29 +490,35 @@ pub fn state_json(app: &SharedApp) -> serde_json::Value {
 
 #[cfg(test)]
 mod price_tests;
+#[cfg(test)]
+mod tests_costs_locks;
 
-fn budget_view(app: &SharedApp) -> BudgetView {
+fn budget_view(app: &SharedApp) -> BudgetView {budget_view_at(app,chrono::Utc::now())}
+
+fn budget_view_at(app:&SharedApp,now:chrono::DateTime<chrono::Utc>)->BudgetView {
     let policy=crate::reconciler::effective_policy(app);
     let soft = policy.budget.daily_soft_eur * policy.budget.usd_per_eur;
     let hard = policy.budget.daily_hard_eur * policy.budget.usd_per_eur;
     let monthly = policy.budget.monthly_eur * policy.budget.usd_per_eur;
-    let date = crate::node::local_date(app);
-    let spent = app.db.spent_today(&date);
+    let date = now.with_timezone(&tz_of(app)).format("%Y-%m-%d").to_string();
+    let totals=app.db.budget_totals(&date);
+    let costs_known=totals.is_ok();
+    let (spent,spent_month)=totals.unwrap_or((0.0,0.0));
     // Same active/reserved compute + retained storage as admission and digests.
     let costs=app.db.try_instances(false).and_then(|rows|crate::costs::hourly(&rows));
-    let rate_known=costs.is_ok();
+    let rate_known=costs.is_ok() && costs_known;
     let current_rate=costs.as_ref().map(|c|format!("{:.4} USD/h (Miete {:.4} + Speicher {:.4})",c.total(),c.compute,c.storage)).unwrap_or_else(|_|"nicht verfügbar".into());
     let rate=costs.map(|c|c.total()).unwrap_or(0.0);
-    let now_local = chrono::Utc::now().with_timezone(&tz_of(app));
-    let hours = 24.0 - now_local.time().hour() as f64 - now_local.time().minute() as f64 / 60.0;
+    let hours = crate::billing::seconds_to_day_end(now,tz_of(app)).unwrap_or(0) as f64 /3600.0;
     let projected = spent + rate * hours;
     let pct = (projected / soft.max(0.01) * 100.0).min(100.0);
     BudgetView {
+        costs_known,
         spent_usd: spent,
         projected_usd: projected,
         rate_known,
         current_rate,
-        spent_month_usd: app.db.spent_month(&date[..7]),
+        spent_month_usd: spent_month,
         soft_usd: soft,
         hard_usd: hard,
         monthly_usd: monthly,
@@ -528,6 +540,9 @@ fn tz_of(app: &SharedApp) -> chrono_tz::Tz {
 
 pub async fn index(app: AppCtx, req: Request) -> Response {
     page_guard!(app, req);
+    let now=chrono::Utc::now();
+    let today=crate::billing::today(&app.0,now);
+    let locks=match app.db.slot_locks() {Ok(locks)=>locks,Err(_)=>return (StatusCode::INTERNAL_SERVER_ERROR,"Lock-Status nicht verfügbar").into_response()};
     let mut slots = Vec::new();
     for s in &app.cfg().slots {
         let active = app.db.active_instance(s.id);
@@ -544,17 +559,17 @@ pub async fn index(app: AppCtx, req: Request) -> Response {
         let shown = active.or_else(|| newest_other.map(|r| r.vast_id));
         let inst = shown.and_then(|v| app.db.instance(v));
         let traffic = app.traffic.snapshot(s.id);
-        let hb = shown.and_then(|v| app.hub.heartbeat(v));
+        let hb = shown.filter(|_|!inst.as_ref().is_some_and(|i|matches!(i.state.as_str(),"start_requested"|"start_failed"|"scheduling"))).and_then(|v| app.hub.heartbeat(v));
         let pct = hb
             .as_ref()
             .and_then(|h| h.progress_json.get("pct").and_then(|p| p.as_f64()))
             .unwrap_or(-1.0);
-        let pinned = app.db.slot_pins().into_iter().any(|(sid, p)| sid == s.id && p.is_some());
+        let pinned = locks.contains(&s.id);
         let state_view = inst.as_ref().map(|i| StateView {
             label: i.state.clone(),
             class: match i.state.as_str() {
                 "healthy" => "b-ok",
-                "preempted" | "unreachable" | "failed" => "b-bad",
+                "preempted" | "unreachable" | "failed" | "start_failed" => "b-bad",
                 "stopped" => "b-mut",
                 _ => "b-info",
             },
@@ -572,7 +587,8 @@ pub async fn index(app: AppCtx, req: Request) -> Response {
             in_flight: traffic.in_flight,
             busy: inst.as_ref().map(|i| i.busy).unwrap_or(false),
             busy_reason: inst.as_ref().map(|i| i.busy_reason.clone()).unwrap_or_default(),
-            cost_today: 0.0,
+            cost_today: today.local.map(|_|today.local_slots.get(&s.id).copied().unwrap_or(0.0)),
+            provider_cost_today: today.provider.map(|_|today.provider_slots.get(&s.id).copied().unwrap_or(0.0)),
             pinned,
             warming_id: if active.is_some() { newest_other.map(|r| r.vast_id).unwrap_or(0) } else { 0 },
             warming_state: if active.is_some() { newest_other.map(|r| r.state.clone()).unwrap_or_default() } else { String::new() },
@@ -601,8 +617,9 @@ pub async fn index(app: AppCtx, req: Request) -> Response {
         .map(|e| EventView { kind: e.kind, ts: e.ts, reason: e.reason })
         .collect();
     let tpl = IndexTpl {
+        today,
         slots,
-        budget: budget_view(&app.0),
+        budget: budget_view_at(&app.0,now),
         events,
         stt_sessions: app.stt_sessions.load(std::sync::atomic::Ordering::Relaxed),
         auto_rent: app.db.auto_rent_enabled(),
@@ -727,11 +744,12 @@ fn inst_view(app: &SharedApp, row: &crate::db::InstanceRow) -> InstView {
         busy_reason: row.busy_reason.clone(),
         lifecycle: row.lifecycle.clone(),
         pinned: row.pinned,
-        agent_health: app
+        slot_locked: app.db.slot_locks().map(|locks|locks.contains(&row.slot_id)).unwrap_or(true),
+        agent_health: if row.phase().awaiting_allocation() {"GPU-Zuweisung ausstehend; kein gültiger Ready-Status".into()} else {app
             .hub
             .heartbeat(row.vast_id)
             .map(|hb| hb.health_json.to_string())
-            .unwrap_or_else(|| "—".into()),
+            .unwrap_or_else(|| "—".into())},
     }
 }
 
@@ -762,7 +780,7 @@ pub async fn instance_page(app: AppCtx, Path(vast_id): Path<i64>, method: axum::
         state: row.state.clone(),
         state_class: match row.state.as_str() {
             "healthy" => "b-ok".into(),
-            "preempted" | "unreachable" | "failed" => "b-bad".into(),
+            "preempted" | "unreachable" | "failed" | "start_failed" => "b-bad".into(),
             "stopped" | "destroyed" => "b-mut".into(),
             _ => "b-info".into(),
         },
