@@ -230,6 +230,8 @@ pub struct OfferSnapshot {
     pub cuda_max_good: Option<f64>,
     #[serde(default)]
     pub cpu_cores: Option<f64>,
+    #[serde(default)]
+    pub geolocation: Option<String>,
 }
 
 impl OfferSnapshot {

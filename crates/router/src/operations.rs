@@ -76,12 +76,8 @@ async fn execute(app: &SharedApp, id: i64, op: &str, reason: &str) -> anyhow::Re
     app.pool_routes.set_healthy(inst.slot_id, targets);
     app.events.emit(&app.db, if op == "destroy" { "instance_destroyed" } else { "instance_stopped" },
         Some(inst.slot_id), Some(id), reason, &serde_json::json!({"provider_confirmed": true}));
-    if op == "destroy" {
-        let hostname = format!("gpu-{}-{}", inst.role, inst.node_token.chars().take(8).collect::<String>());
-        if let Err(e) = crate::reconciler::netbird_delete_peer(app, &hostname).await {
-            tracing::warn!(id, %e, "NetBird peer cleanup failed after confirmed destroy");
-        }
-    }
+    // Peer cleanup is reconciled against complete Vast inventory, with retries.
+    // An accepted delete request alone is not proof that the contract is gone.
     Ok(())
 }
 

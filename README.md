@@ -1,7 +1,7 @@
 # pgpu — Praxis GPU Router
 
-> **Aktueller Qualitätsstatus:** Kernpfade gehärtet, 119 automatisierte Tests
-> und ein isolierter Prozess-Smoke-Test. Noch **keine kommerzielle Freigabe**.
+> **Aktueller Qualitätsstatus:** Kernpfade gehärtet, automatisierte Rust-Tests
+> und isolierte Prozess-/Browser-Smoke-Tests. Noch **keine kommerzielle Freigabe**.
 > Änderungen, Upgrade-Hinweise und konkrete offene Release-Gates:
 > [Produktionsreife / Hardening](docs/production-readiness.md).
 > **Bauplan inklusive Nice-to-haves noch nicht vollständig:**
@@ -41,14 +41,26 @@ Router/wasser erreichen die Boxen nicht. Policies:
   gleicher ID in einem PUT werden verworfen → separate Policy pro Regel.
 Boxen heißen `gpu-<role>-<tok8>` (netbird up --hostname im Fork-Entrypoint).
 
-## Neu im Quellcode: GPU-Messdaten und Host-Auswahl
+## Neu in 0.26: Länderkarte, Kostenabgleich und mehrere Webhooks
+
+- Länderlisten und Ausschlüsse: `geolocation in [DE,AT,CH]`, `geolocation!=DE`, `geolocation notin [DE,FR]`; ungültige Filter werden abgelehnt.
+- Settings-Karte mit Startland Deutschland, optionalem Radius, Länder-Allowlist/Ausschlüssen und mehreren alternativen GPU-Modellen. Länder-Näherung, **kein garantierter Host-Radius**; Ausschlüsse gewinnen immer.
+- Tatsächliche Vast-Nutzung nach **Slot-Labels**, nicht nach Online-Status oder Kontostand. Gestoppte/historische passende Verträge zählen; Grenzen bleiben unverändert, Budgetkorrekturen sind konservativ und dauerhaft.
+- Sichere, wiederholbare NetBird-Bereinigung nur für nachweislich entfernte eigene GPU-Verträge. Schlafende Verträge und unbekannte Geräte bleiben geschützt.
+- Mehrere Webhook-URLs mit separaten Ergebnissen/Wiederholungen, Discord-kompatible Nachrichten und authentifizierter Testbutton/API. Secret-URLs landen nicht im Eventlog.
+
+Anleitungen: [Standort/GPU-Auswahl, Billing und Peer-Cleanup](docs/selection-and-billing.md) · [Discord/Webhooks testen](docs/webhooks.md).
+
+Browser-QA ohne Cloud-Zugang: `cargo build --locked -p praxis-router`, danach `PLAYWRIGHT_MODULE=/pfad/node_modules/playwright node scripts/test-settings.cjs`. Chromium (`CHROMIUM=/pfad/zur/binary`) und Playwright werden nur fürs Testen benötigt, nicht im Router-Image. Der Test startet einen isolierten Router mit leerer Datenbank und zwei Loopback-Webhooks; keine echten Mieten/Benachrichtigungen.
+
+## Ab 0.25: GPU-Messdaten und Host-Auswahl
 
 - Unabhängige `[vast]`-Schalter `activate_blacklist` (Default an) und `activate_whitelist` (Default aus); Ausschalten löscht keine Einträge.
 - Lokale Hardware-/Modell-/Kostenprüfung, auch vor manuellen Mieten und Wiederanlauf. Eine Whitelist oder ein guter Score umgeht keine Limits.
 - Optional passive Inferenzmetriken, dauerhafter Host-/GPU-Katalog, JSON-Export und `/performance` im Dashboard; keine Prompt-/Antworttexte in der Historie.
 - Konfigurierbare, begrenzte LLM-/Disk-Benchmarks mit Agent 0.2.0; automatische Ausführung und scorebasierte Angebotsbevorzugung separat opt-in.
 
-**Anleitung und alle Schalter:** [GPU-Performance und Whitelist](docs/gpu-performance.md), Beispiele in `config.example.toml`. Benchmark-Slots sind während des Tests exklusiv (neue Requests: 503). Die Funktionen sind noch nicht in dem zuvor gestarteten/veröffentlichten Image **0.24** enthalten; bestehende Deployments wurden nicht geändert.
+**Anleitung und alle Schalter:** [GPU-Performance und Whitelist](docs/gpu-performance.md), Beispiele in `config.example.toml`. Benchmark-Slots sind während des Tests exklusiv (neue Requests: 503). Diese Funktionen sind ab Image **0.25** enthalten. Neue Image-Veröffentlichungen aktualisieren bestehende Deployments nicht automatisch.
 
 ## Bauplan-Status (v2)
 

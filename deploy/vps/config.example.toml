@@ -27,6 +27,7 @@ blacklist_after_fails = 2
 unreachable_stop_after_s = 300
 
 [netbird]
+cleanup_unused_peers = true # vorhandene/schlafende Verträge und fremde Geräte bleiben geschützt
 # auto = gleiche automatisch erkannte NetBird-IP wie bind_ip (Call-home-URL
 # für die Agents). PAT nur nötig, weil der Router pro GPU-Box ephemere
 # Setup-Keys mintet.
@@ -54,7 +55,12 @@ max_per_slot = 2
 max_total_rate_usd_h = 0.60
 
 [alerts]
-# webhook_url = "https://***REMOVED***"
+# webhook_urls = [
+#   "https://discord.com/api/webhooks/ID_KANAL_1/TOKEN_1",
+#   "https://discord.com/api/webhooks/ID_KANAL_2/TOKEN_2",
+# ]
+# webhook_format = "discord" # auto für gemischte Dienste; alte webhook_url bleibt kompatibel
+# Nach Speichern: Settings → Testnachricht senden (keine GPU-Aktion). docs/webhooks.md
 
 # ------------------------------------------------------------- Slot 1: LLM
 
@@ -68,6 +74,12 @@ disk_gb = 120
 traffic_gb = 21.0
 search_query = 'gpu_ram>=15 cpu_ram>=62 disk_space>=120 inet_down>=800 disk_bw>=1500 reliability2>=0.95'
 passthrough = { 11434 = "api", 11435 = "webui", 11436 = "embed" }
+
+[slots.location]
+origin_country = "DE"
+# countries = ["DE", "AT", "CH", "NL", "BE", "LU", "FR", "CZ", "PL", "DK"]
+# excluded_countries = []
+# radius_km = 1000.0 # Länderreferenzpunkte; kein exakter Server-Radius
 
 [slots.services]
 api = { port = 11434, health = "/health", busy = "inflight" }

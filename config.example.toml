@@ -27,6 +27,7 @@ blacklist_after_fails = 2
 unreachable_stop_after_s = 300
 
 [netbird]
+cleanup_unused_peers = true # nur nachweislich entfernte eigene GPU-Peers; Schlaf/Stop bleibt geschützt
 # Management-API-Token (nbt_...) für ephemerere Setup-Keys pro Instanz.
 # Ohne: statischer setup_key (Fallback).
 # api_token = "nbt_..."       # Cloud; self-hosted: PAT (nbp_...) + api_url
@@ -57,7 +58,19 @@ max_per_slot = 2
 max_total_rate_usd_h = 0.60
 
 [alerts]
-# webhook_url = "https://***REMOVED***"   # POST {"kind","message"}
+# Discord: Servereinstellungen → Integrationen → Webhooks → URL kopieren.
+# webhook_urls = [
+#   "https://discord.com/api/webhooks/ID_KANAL_1/TOKEN_1",
+#   "https://discord.com/api/webhooks/ID_KANAL_2/TOKEN_2",
+# ]
+# webhook_format = "discord"  # auto (Default), discord, slack, ntfy oder json
+# Die bisherige einzelne webhook_url bleibt gültig; doppelte URLs senden nur einmal.
+# Jede Warnung/Testnachricht geht an alle Ziele (max. 16), mit separatem Ergebnis.
+# Settings → Speichern → „Testnachricht senden“; alternativ POST /api/v1/alerts/test.
+# Eine erfolgreiche Discord-Testnachricht lautet „✅ PGPU-Testnachricht …“.
+# ntfy.sh wird automatisch erkannt; bei eigenem ntfy-Server webhook_format="ntfy".
+# Generisches JSON: {"kind":"...","message":"..."}; Details: docs/webhooks.md.
+# Die vollständige Webhook-URL ist ein Geheimnis — niemals ins Git einchecken.
 
 # ------------------------------------------------------------- Slot 1: LLM
 
@@ -72,6 +85,13 @@ search_query = 'gpu_ram>=15 cpu_ram>=30 disk_space>=120 inet_down>=500 disk_bw>=
 # Flash-Next-82GB-Rezept:
 # search_query = 'gpu_name="RTX 5070 Ti" cpu_ram>=62 cuda_vers>=12.9 disk_space>=120 inet_down>=800 disk_bw>=1500 reliability2>=0.95'
 passthrough = { 11434 = "api", 11435 = "webui", 11436 = "embed" }
+
+# Ab 0.26: Settings-Karte; Länder-Näherung, kein tatsächlicher GPU-Host-Abstand.
+[slots.location]
+origin_country = "DE"
+# countries = ["DE", "AT", "CH", "NL", "BE", "LU", "FR", "CZ", "PL", "DK"]
+# excluded_countries = ["RU"]  # gewinnt immer; auch geolocation!=DE / notin im Suchstring
+# radius_km = 1000.0           # nicht gesetzt = kein Radiusfilter; Liste und Radius werden geschnitten
 
 [slots.services]
 api = { port = 11434, health = "/health", busy = "inflight" }
@@ -97,7 +117,7 @@ keep_warm_window_s = 1800
 
 # Lokale Prüfungen ZUSÄTZLICH zum Vast-Suchstring (auch manuelle Mieten).
 [slots.requirements]
-# gpu_names = ["RTX 5090", "RTX 5070 Ti"] # exakte Modelle, keine Teilstrings
+# gpu_names = ["RTX 5070 Ti", "RTX 4060 Ti", "RTX A4000", "RTX 3090"] # Alternativen, keine Teilstrings
 # machine_ids = [12345, 67890] # zusätzliche harte Allowlist, unabhängig von [vast]
 min_gpu_ram_gb = 15.0
 min_cpu_ram_gb = 30.0

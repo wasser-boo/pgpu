@@ -115,6 +115,7 @@ pub async fn config_put(app: AppCtx, req: Request) -> Response {
 /// dekonfiguriert.
 pub async fn apply_config(app: &SharedApp, raw: &str) -> anyhow::Result<String> {
     let mut new_cfg = crate::config::Config::load_str(raw)?; // wirft bei TOML-/Validierungs-Fehler
+    let _management = app.management.lock().await;
     let cur = app.cfg();
     // "auto"-Auflösungen der laufenden Config übernehmen (detect läuft nur
     // beim Boot; die laufenden Werte sind bereits real).
@@ -139,11 +140,23 @@ pub async fn apply_config(app: &SharedApp, raw: &str) -> anyhow::Result<String> 
     new_cfg.validate_auth()?;
     // Slot-DB synchronisieren (neue Slots, geänderte Rollen/Namen).
     app.db.init_slots(&new_cfg)?;
+    // Clear stale offers before writing: a ledger failure must leave the saved
+    // file and active config unchanged, not fail after a successful rename.
+    app.db.invalidate_offers()?;
     // Atomar schreiben: tmp + rename — der Router startet nach einem Crash
     // nie mit halber TOML.
-    let tmp = format!("{}.tmp", app.config_path);
-    std::fs::write(&tmp, raw)?;
-    std::fs::rename(&tmp, &app.config_path)?;
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp = format!("{}.tmp-{:016x}", app.config_path, rand::random::<u64>());
+    let save = (|| -> std::io::Result<()> {
+        // Never turn private router/webhook credentials into a mode-0644 file.
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
+        file.write_all(raw.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, &app.config_path)
+    })();
+    if save.is_err() { let _ = std::fs::remove_file(&tmp); }
+    save?;
 
     let slots: Vec<String> = new_cfg.slots.iter().map(|s| format!("#{} {}", s.id, s.name)).collect();
     app.cfg_swap(new_cfg);
@@ -158,6 +171,15 @@ pub async fn apply_config(app: &SharedApp, raw: &str) -> anyhow::Result<String> 
     // Reconciler sofort ticken lassen (neue warmups/ceilings greifen in <30s).
     app.reconcile_now.notify_one();
     Ok(format!("ok — {} Slots aktiv", slots.len()))
+}
+
+/// Authenticated test of the saved webhook. No URL/message override and no GPU operations.
+pub async fn webhook_test(app: AppCtx, req: Request) -> Response {
+    guarded!(app, req);
+    match crate::notifications::test(&app.0).await {
+        Ok(report) => (if report.ok { StatusCode::OK } else { StatusCode::BAD_GATEWAY }, Json(report)).into_response(),
+        Err(error) => (error.status(), Json(serde_json::json!({"ok":false,"error":error.to_string()}))).into_response(),
+    }
 }
 
 // ------------------------------------------------------------- State
@@ -182,17 +204,21 @@ pub async fn state(app: AppCtx, req: Request) -> Response {
 
 pub async fn budget(app: AppCtx, req: Request) -> Response {
     guarded!(app, req);
-    axum::Json(budget_json(&app.0)).into_response()
+    let data=budget_json(&app.0);
+    (if data.get("error").is_some() { StatusCode::SERVICE_UNAVAILABLE } else { StatusCode::OK },axum::Json(data)).into_response()
 }
 
 pub fn budget_json(app: &SharedApp) -> serde_json::Value {
     let date = crate::node::local_date(app);
-    let spent = app.db.spent_today(&date);
-    let month = app.db.spent_month(&date[..7]);
+    let Ok((spent,month))=app.db.budget_totals(&date) else { return serde_json::json!({"error":"budget ledger unavailable"}); };
+    let metered=app.db.metered_totals(&date).ok();
     serde_json::json!({
         "date": date,
         "spent_today_usd": spent,
         "spent_month_usd": month,
+        "metered_today_usd": metered.map(|m|m.0),
+        "metered_month_usd": metered.map(|m|m.1),
+        "vast_usage": crate::billing::status(app),
         "soft_eur": crate::reconciler::effective_policy(&app).budget.daily_soft_eur,
         "hard_eur": crate::reconciler::effective_policy(&app).budget.daily_hard_eur,
         "monthly_eur": app.cfg().budget.monthly_eur,

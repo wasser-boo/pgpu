@@ -5,8 +5,15 @@ use praxis_policy::{eligibility::{self, Assessment}, OfferSnapshot};
 
 pub fn assess(app: &SharedApp, slot: &SlotCfg, offer: &OfferSnapshot, mode: Mode, price: f64, disk: i64) -> Assessment {
     let stat=app.db.machine_stat(offer.machine_id);
-    eligibility::assess(&slot.requirements,&slot.bid,offer,mode,price,disk,slot.traffic_gb,
-        stat.as_ref().is_some_and(|s|s.whitelisted),app.cfg().vast.activate_blacklist && stat.is_some_and(|s|s.blacklisted),app.cfg().vast.activate_whitelist)
+    let mut result=eligibility::assess(&slot.requirements,&slot.bid,offer,mode,price,disk,slot.traffic_gb,
+        stat.as_ref().is_some_and(|s|s.whitelisted),app.cfg().vast.activate_blacklist && stat.is_some_and(|s|s.blacklisted),app.cfg().vast.activate_whitelist);
+    match crate::selection::rejection(slot,offer.geolocation.as_deref(),&offer.gpu_name,mode != Mode::Interruptible) {
+        Ok(Some(reason))=>result.reasons.push(reason),
+        Err(error)=>result.reasons.push(format!("Ungültige Standort-/GPU-Auswahl: {error}")),
+        Ok(None)=>{},
+    }
+    result.eligible=result.reasons.is_empty();
+    result
 }
 
 pub fn check_resume(app: &SharedApp, inst: &crate::db::InstanceRow, price: f64) -> anyhow::Result<()> {

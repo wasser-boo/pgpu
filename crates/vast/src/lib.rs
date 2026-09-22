@@ -1,8 +1,10 @@
 //! Vast.ai API-Client (v0). Poll-Intervall ≥ 30 s, Aktionen mit einfachem
 //! Backoff (Ratelimit-Fehler → Retry).
 
-mod query;
+pub mod query;
 mod types;
+mod billing;
+pub use billing::{Charge, ChargeMetadata};
 
 pub use types::{CreateInstanceParams, CurrentUser, Instance, LogEntry, Offer, OfferType};
 
@@ -211,6 +213,11 @@ impl Vast {
         interruptible: bool,
         allocated_storage_gb: f64,
     ) -> Result<Vec<Offer>> {
+        self.search_filters(query::parse_query(query).context("invalid Vast search query")?, interruptible, allocated_storage_gb).await
+    }
+
+    /// Parsed predicates shared with caller-side admission/selection validation.
+    pub async fn search_filters(&self, filters: serde_json::Map<String, serde_json::Value>, interruptible: bool, allocated_storage_gb: f64) -> Result<Vec<Offer>> {
         #[derive(serde::Deserialize)]
         struct Bundles {
             offers: Vec<Offer>,
@@ -224,7 +231,7 @@ impl Vast {
             "limit": 64,
             "allocated_storage": allocated_storage_gb,
         });
-        for (k, v) in query::parse_query(query) {
+        for (k, v) in filters {
             q[&k] = v;
         }
         q["type"] = if interruptible { "bid".into() } else { "on-demand".into() };

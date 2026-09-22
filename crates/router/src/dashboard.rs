@@ -321,14 +321,77 @@ pub struct SettingsTpl {
     pub limits: praxis_policy::LimitsConfig,
     pub slots: Vec<SlotSettingView>,
     pub routing: RoutingView,
+    pub webhook: WebhookView,
+    pub billing: BillingView,
     /// Rohtext der config.toml — editierbar (Hot-Reload, kein Neustart).
     pub config_raw: String,
     /// Status-Message (Query-Param nach Save/Reload).
     pub config_msg: String,
 }
 
+pub struct BillingRowView {
+    pub id: i64,
+    pub slot: i64,
+    pub state: String,
+    pub provider: String,
+    pub estimate: String,
+}
+pub struct BillingView {
+    pub scope: String,
+    pub status: String,
+    pub synced: String,
+    pub day: String,
+    pub month: String,
+    pub day_provider: String,
+    pub day_estimate: String,
+    pub month_provider: String,
+    pub month_estimate: String,
+    pub rows: Vec<BillingRowView>,
+}
+fn billing_view(app: &SharedApp) -> BillingView {
+    let status=crate::billing::status(app);
+    let snapshot=crate::billing::snapshot(app).ok().flatten();
+    let money=|v:Option<f64>|v.map(|v|format!("{v:.4} $")).unwrap_or_else(||"noch unbekannt".into());
+    BillingView {
+        scope:crate::slot_labels::scope(&app.cfg()).join(", "),
+        status:status.get("error").or_else(||status["last_attempt"].get("message")).and_then(|v|v.as_str()).unwrap_or(
+            if snapshot.is_some() { "Abgleich verfügbar; Vast kann verzögert abrechnen." } else { "Noch kein Abgleich; wird nach Start und anschließend stündlich im Hintergrund versucht." }).into(),
+        synced:snapshot.as_ref().map(|s|s.synced_at.clone()).unwrap_or_else(||"—".into()),
+        day:snapshot.as_ref().map(|s|s.day.period.clone()).unwrap_or_else(||crate::node::local_date(app)),
+        month:snapshot.as_ref().map(|s|s.month.period.clone()).unwrap_or_else(||crate::node::local_date(app)[..7].into()),
+        day_provider:money(snapshot.as_ref().map(|s|s.day.provider_usd)),
+        day_estimate:money(snapshot.as_ref().map(|s|s.day.estimated_usd)),
+        month_provider:money(snapshot.as_ref().map(|s|s.month.provider_usd)),
+        month_estimate:money(snapshot.as_ref().map(|s|s.month.estimated_usd)),
+        rows:snapshot.as_ref().map(|s|s.month.rows.iter().map(|row|BillingRowView {
+            id:row.instance_id,slot:row.slot_id,state:row.state.clone(),provider:money(row.provider_usd),estimate:money(row.estimated_usd),
+        }).collect()).unwrap_or_default(),
+    }
+}
+
+pub struct WebhookView {
+    pub configured: bool,
+    pub targets: Vec<WebhookTargetView>,
+    pub last_event: String,
+}
+pub struct WebhookTargetView {
+    pub number: usize,
+    pub host: String,
+    pub format: String,
+}
+
 pub struct SlotSettingView {
     pub id: i64,
+    pub name: String,
+    pub countries: String,
+    pub excluded_countries: String,
+    pub origin_country: String,
+    pub radius_km: String,
+    pub latitude: String,
+    pub longitude: String,
+    pub gpu_names: String,
+    pub raw_query: String,
+    pub raw_on_demand: String,
     pub ceiling: f64,
     pub margin: f64,
     pub stop_after_s: i64,
@@ -407,9 +470,10 @@ pub fn state_json(app: &SharedApp) -> serde_json::Value {
 }
 
 fn budget_view(app: &SharedApp) -> BudgetView {
-    let soft = app.cfg().budget.daily_soft_eur * app.cfg().budget.usd_per_eur;
-    let hard = app.cfg().budget.daily_hard_eur * app.cfg().budget.usd_per_eur;
-    let monthly = app.cfg().budget.monthly_eur * app.cfg().budget.usd_per_eur;
+    let policy=crate::reconciler::effective_policy(app);
+    let soft = policy.budget.daily_soft_eur * policy.budget.usd_per_eur;
+    let hard = policy.budget.daily_hard_eur * policy.budget.usd_per_eur;
+    let monthly = policy.budget.monthly_eur * policy.budget.usd_per_eur;
     let date = crate::node::local_date(app);
     let spent = app.db.spent_today(&date);
     // Projektion: verbraucht + aktuelle Rates bis Tagesende.
@@ -765,6 +829,16 @@ pub async fn settings_page(app: AppCtx, Query(q): Query<HashMap<String, String>>
         .iter()
         .map(|s| SlotSettingView {
             id: s.id,
+            name: s.name.clone(),
+            countries: s.location.countries.join(", "),
+            excluded_countries: s.location.excluded_countries.join(", "),
+            origin_country: s.location.origin_country.clone(),
+            radius_km: s.location.radius_km.map(|v|v.to_string()).unwrap_or_default(),
+            latitude: s.location.latitude.map(|v|v.to_string()).unwrap_or_default(),
+            longitude: s.location.longitude.map(|v|v.to_string()).unwrap_or_default(),
+            gpu_names: s.requirements.gpu_names.join("\n"),
+            raw_query: s.search_query.clone(),
+            raw_on_demand: s.search_query_on_demand.clone().unwrap_or_else(||s.search_query.clone()),
             ceiling: s.bid.ceiling_usd_h,
             margin: s.bid.margin,
             stop_after_s: s.idle_cfg(s.role).stop_after_s,
@@ -781,6 +855,7 @@ pub async fn settings_page(app: AppCtx, Query(q): Query<HashMap<String, String>>
         }
     }
     passthrough.sort_by_key(|(p, _, _)| *p);
+    let webhook_targets = crate::webhook::targets(&app.cfg().alerts).unwrap_or_default();
     let tpl = SettingsTpl {
         budget: budget_view(&app.0),
         limits: app.cfg().limits.clone(),
@@ -792,6 +867,15 @@ pub async fn settings_page(app: AppCtx, Query(q): Query<HashMap<String, String>>
             stt: format!("{} ({})", app.cfg().stt.mode, app.cfg().stt.url),
             vast_ok: !app.cfg().vast_api_key().is_empty(),
         },
+        webhook: WebhookView {
+            configured: !webhook_targets.is_empty(),
+            targets: webhook_targets.iter().map(|target| WebhookTargetView {
+                number: target.number, host: target.host(), format: target.format.label().into(),
+            }).collect(),
+            last_event: app.db.events(200, None).into_iter().find(|e| e.kind.starts_with("webhook_"))
+                .map(|e| format!("{} · {}", e.ts, e.reason)).unwrap_or_else(|| "Noch kein Zustellversuch in den letzten Events.".into()),
+        },
+        billing: billing_view(&app.0),
         config_raw: app.cfg_raw(),
         config_msg,
     };
@@ -817,6 +901,17 @@ pub async fn do_config_save(app: AppCtx, headers: axum::http::HeaderMap, Form(fo
         Ok(msg) => Redirect::to(&format!("/settings?msg=gespeichert%3A%20{}", urlencode(&msg))).into_response(),
         Err(e) => Redirect::to(&format!("/settings?msg=fehler%3A%20{}", urlencode(&format!("{e}")))).into_response(),
     }
+}
+
+/// The same authenticated test as the API, without exposing the webhook URL.
+pub async fn do_webhook_test(app: AppCtx, headers: axum::http::HeaderMap) -> Response {
+    page_guard!(app, ReqOf(&headers));
+    let message = match crate::notifications::test(&app.0).await {
+        Ok(report) => format!("{} — {report}. Bitte in den Zielkanälen prüfen.",
+            if report.ok { "Webhook-Test erfolgreich" } else { "Webhook-Test mit Fehlern" }),
+        Err(error) => format!("Webhook-Test fehlgeschlagen: {error}"),
+    };
+    Redirect::to(&format!("/settings?msg={}", urlencode(&message))).into_response()
 }
 
 /// Reload von Disk (Datei außerhalb geändert — z. B. per SSH/Editor).

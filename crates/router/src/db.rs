@@ -2,6 +2,7 @@
 //! kurz genug für v1 (Reconciler-Takt 30 s, Dashboard-Einzelabrufe).
 
 mod performance_store;
+mod billing_store;
 pub use performance_store::PerformanceRow;
 
 use crate::config::Config;
@@ -162,6 +163,15 @@ impl Db {
                 traffic_usd REAL NOT NULL DEFAULT 0,
                 last_metered_at TEXT NOT NULL,
                 PRIMARY KEY(date, instance_id)
+            );
+            CREATE TABLE IF NOT EXISTS provider_spend(
+                period TEXT NOT NULL,
+                instance_id INTEGER NOT NULL,
+                provider_usd REAL NOT NULL,
+                floor_usd REAL NOT NULL,
+                meter_at_sync REAL NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(period,instance_id)
             );
             CREATE TABLE IF NOT EXISTS events(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -515,16 +525,20 @@ impl Db {
     }
 
     pub fn instances(&self, include_destroyed: bool) -> Vec<InstanceRow> {
+        self.try_instances(include_destroyed).unwrap_or_default()
+    }
+
+    /// Ownership-sensitive callers must not act on a partial local inventory.
+    pub fn try_instances(&self, include_destroyed: bool) -> anyhow::Result<Vec<InstanceRow>> {
         let conn = self.0.lock().unwrap();
         let sql = if include_destroyed {
             "SELECT * FROM instances ORDER BY created_at DESC"
         } else {
             "SELECT * FROM instances WHERE state != 'destroyed' ORDER BY created_at DESC"
         };
-        let Ok(mut stmt) = conn.prepare(sql) else { return vec![] };
-        stmt.query_map([], Self::row_from)
-            .map(|rows| rows.filter_map(Result::ok).collect())
-            .unwrap_or_default()
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map([], Self::row_from)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn instance(&self, vast_id: i64) -> Option<InstanceRow> {
@@ -704,47 +718,23 @@ impl Db {
         Ok(())
     }
 
-    pub fn meter_traffic(&self, date: &str, traffic_usd: f64) -> anyhow::Result<()> {
-        let conn = self.0.lock().unwrap();
-        conn.execute(
-            "INSERT INTO budget_days(date, traffic_usd) VALUES(?1,?2)
-             ON CONFLICT(date) DO UPDATE SET traffic_usd = traffic_usd + excluded.traffic_usd",
-            params![date, traffic_usd],
-        )?;
-        Ok(())
-    }
-
     /// Safety-critical callers must propagate read errors instead of assuming $0.
     pub fn budget_totals(&self, date: &str) -> anyhow::Result<(f64, f64)> {
         let conn = self.0.lock().unwrap();
-        let today = conn.query_row("SELECT COALESCE(SUM(metered_usd+traffic_usd),0) FROM budget_days WHERE date=?1", params![date], |r| r.get(0))?;
-        let month = conn.query_row("SELECT COALESCE(SUM(metered_usd+traffic_usd),0) FROM budget_days WHERE date LIKE ?1", params![format!("{}%", &date[..7])], |r| r.get(0))?;
-        Ok((today, month))
+        Ok((billing_store::total(&conn,date)?,billing_store::total(&conn,&date[..7])?))
     }
 
     pub fn spent_today(&self, date: &str) -> f64 {
-        let conn = self.0.lock().unwrap();
-        conn.query_row(
-            "SELECT COALESCE(metered_usd,0) + COALESCE(traffic_usd,0) FROM budget_days WHERE date=?1",
-            params![date],
-            |r| r.get::<_, f64>(0),
-        )
-        .unwrap_or(0.0)
+        billing_store::total(&self.0.lock().unwrap(),date).unwrap_or(0.0)
     }
 
     pub fn spent_month(&self, month_prefix: &str) -> f64 {
-        let conn = self.0.lock().unwrap();
-        conn.query_row(
-            "SELECT COALESCE(SUM(COALESCE(metered_usd,0) + COALESCE(traffic_usd,0)),0)
-               FROM budget_days WHERE date LIKE ?1",
-            params![format!("{month_prefix}%")],
-            |r| r.get::<_, f64>(0),
-        )
-        .unwrap_or(0.0)
+        billing_store::total(&self.0.lock().unwrap(),month_prefix).unwrap_or(0.0)
     }
 
     /// Accumulate balance deltas atomically. This is diagnostic only: top-ups,
     /// refunds and non-pgpu contracts prevent balance changes being an invoice.
+    #[allow(dead_code)] // Legacy diagnostic, deliberately not used for budget enforcement.
     pub fn record_credit(&self, date: &str, credit: f64) -> anyhow::Result<f64> {
         anyhow::ensure!(credit.is_finite(), "invalid provider balance");
         let mut conn = self.0.lock().unwrap();
@@ -767,6 +757,11 @@ impl Db {
              ON CONFLICT(slot_id) DO UPDATE SET ts=?2, query=?3, offers_json=?4",
             params![slot_id, now_iso(), query, offers],
         )?;
+        Ok(())
+    }
+
+    pub fn invalidate_offers(&self) -> anyhow::Result<()> {
+        self.0.lock().unwrap().execute("DELETE FROM offers_cache", [])?;
         Ok(())
     }
 
@@ -855,8 +850,12 @@ impl Db {
 
     #[allow(dead_code)]
     pub fn setting(&self, k: &str) -> Option<String> {
+        self.try_setting(k).ok().flatten()
+    }
+
+    pub fn try_setting(&self, k: &str) -> anyhow::Result<Option<String>> {
         let conn = self.0.lock().unwrap();
-        conn.query_row("SELECT v FROM settings WHERE k=?1", params![k], |r| r.get(0)).ok()
+        Ok(conn.query_row("SELECT v FROM settings WHERE k=?1", params![k], |r| r.get(0)).optional()?)
     }
 
     #[allow(dead_code)]
@@ -867,6 +866,21 @@ impl Db {
             params![k, v],
         )?;
         Ok(())
+    }
+
+    /// Atomically reserve a persisted interval (manual notification tests/cleanup).
+    pub fn claim_interval(&self, key: &str, now: i64, interval_s: i64) -> anyhow::Result<bool> {
+        anyhow::ensure!(interval_s > 0, "invalid interval");
+        let mut conn = self.0.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let last: Option<String> = tx.query_row("SELECT v FROM settings WHERE k=?1", params![key], |r| r.get(0)).optional()?;
+        if let Some(last) = last {
+            let last: i64 = last.parse()?;
+            if now >= last && now.saturating_sub(last) < interval_s { return Ok(false); }
+        }
+        tx.execute("INSERT INTO settings(k,v) VALUES(?1,?2) ON CONFLICT(k) DO UPDATE SET v=?2", params![key,now.to_string()])?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// Auto-Miete-Schalter (Default an): aus = Policy erzeugt keine

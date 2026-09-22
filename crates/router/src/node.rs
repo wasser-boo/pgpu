@@ -196,9 +196,12 @@ pub async fn report(app: AppCtx, req: Request) -> Response {
     let kind = payload.get("kind").and_then(|k| k.as_str()).unwrap_or("report").to_string();
     // Traffic-Report: GB → Budget buchen.
     if let Some(gb) = payload.get("downloaded_gb").and_then(|g| g.as_f64()) {
-        let offer_cost = 0.005; // $/GB — Offer-abhängig, konservativ.
+        if !gb.is_finite() || gb < 0.0 { return (StatusCode::BAD_REQUEST,"invalid downloaded_gb").into_response(); }
+        let offer_cost = 0.005; // $/GB — estimate; actual usage is reconciled from Vast.
         let date = local_date(&app.0);
-        let _ = app.db.meter_traffic(&date, gb * offer_cost);
+        if app.db.meter_instance_traffic(&date,inst.vast_id,gb * offer_cost).is_err() {
+            return (StatusCode::INTERNAL_SERVER_ERROR,"traffic ledger unavailable").into_response();
+        }
         app.events.emit(
             &app.db,
             "traffic",

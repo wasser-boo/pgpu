@@ -152,13 +152,16 @@ pub struct NetbirdCfg {
     /// Port des Router-Dashboards aus Agent-Sicht (Call-home).
     #[serde(default = "d_nb_port")]
     pub router_nb_port: u16,
+    /// Retired owned GPU peers only; existing/sleeping contracts are never removed.
+    #[serde(default = "d_true")]
+    pub cleanup_unused_peers: bool,
 }
 
 impl Default for NetbirdCfg {
     fn default() -> Self {
         Self { api_token: String::new(), api_url: d_nb_api(), management_url: d_nb_mgmt(),
             setup_key: String::new(), group: d_group(), groups: Vec::new(),
-            router_nb_ip: String::new(), router_nb_port: d_nb_port() }
+            router_nb_ip: String::new(), router_nb_port: d_nb_port(), cleanup_unused_peers: true }
     }
 }
 
@@ -285,9 +288,15 @@ const DAY_NAMES: [&str; 7] = ["monday", "tuesday", "wednesday", "thursday", "fri
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct AlertsCfg {
-    /// Optional: Webhook (ntfy/Telegram/Discord) für Alerts.
+    /// Optional alert endpoint; treat the entire URL as a secret.
     #[serde(default)]
     pub webhook_url: String,
+    /// Additional destinations. All receive alerts/tests; duplicates are sent once.
+    #[serde(default)]
+    pub webhook_urls: Vec<String>,
+    /// auto detects Discord, Slack and ntfy.sh per target; otherwise generic JSON.
+    #[serde(default)]
+    pub webhook_format: crate::webhook::Format,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -311,6 +320,8 @@ pub struct SlotCfg {
     #[serde(default)]
     #[allow(dead_code)]
     pub search_query_on_demand: Option<String>,
+    #[serde(default)]
+    pub location: crate::selection::Location,
     /// Passthrough: lokaler Router-Port (als String im TOML) → Servicename.
     #[serde(default)]
     pub passthrough: HashMap<String, String>,
@@ -424,7 +435,14 @@ impl Config {
     /// Parse+Validierung ohne Disk (Hot-Reload: Dashboard/API schicken
     /// Rohtext, erst NACH erfolgreicher Validierung wird geschrieben).
     pub fn load_str(raw: &str) -> anyhow::Result<Self> {
-        let cfg: Config = toml::from_str(raw)?;
+        // TOML's Display includes the original line (possibly a webhook/API
+        // secret). Never echo that into logs, API errors or redirect URLs.
+        let cfg: Config = toml::from_str(raw).map_err(|error: toml::de::Error| {
+            let prefix=raw.get(..error.span().map(|span|span.start).unwrap_or(0)).unwrap_or("");
+            let line=prefix.bytes().filter(|b|*b==b'\n').count()+1;
+            let column=prefix.rsplit('\n').next().unwrap_or("").chars().count()+1;
+            anyhow::anyhow!("TOML/schema error at line {line}, column {column}; check field names/types (values hidden to protect secrets)")
+        })?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -433,6 +451,7 @@ impl Config {
         if self.slots.is_empty() {
             anyhow::bail!("keine Slots konfiguriert");
         }
+        crate::webhook::validate(&self.alerts)?;
         anyhow::ensure!(self.router.tz.parse::<chrono_tz::Tz>().is_ok(), "invalid router.tz");
         anyhow::ensure!(self.router.bind_ip == "auto" || self.router.bind_ip.parse::<std::net::IpAddr>().is_ok(), "invalid router.bind_ip");
         let nonnegative = |v: f64| v.is_finite() && v >= 0.0;
@@ -456,6 +475,16 @@ impl Config {
             anyhow::ensure!(["", "interruptible", "on_demand", "on-demand", "ondemand"].contains(&s.mode.as_str()), "invalid slot mode");
             anyhow::ensure!(s.pool.warm > 0 && s.pool.warm <= s.pool.total && s.pool.total <= self.limits.max_per_slot as usize, "invalid pool limits for slot {}", s.id);
             anyhow::ensure!([s.bid.margin, s.bid.ceiling_usd_h, s.bid.rent_min_usd_h].into_iter().all(nonnegative) && s.bid.rent_min_usd_h <= s.bid.ceiling_usd_h, "invalid bid window for slot {}", s.id);
+            praxis_vast::query::parse_query(&s.search_query)
+                .map_err(|e| anyhow::anyhow!("slot {} search_query: {e}", s.id))?;
+            if let Some(query) = &s.search_query_on_demand {
+                praxis_vast::query::parse_query(query)
+                    .map_err(|e| anyhow::anyhow!("slot {} search_query_on_demand: {e}", s.id))?;
+            }
+            for on_demand in [false,true] {
+                crate::selection::query(s,on_demand)
+                    .map_err(|e| anyhow::anyhow!("slot {} selection: {e}",s.id))?;
+            }
             s.requirements.validate().map_err(anyhow::Error::msg)?;
             s.performance.validate().map_err(anyhow::Error::msg)?;
             if s.performance.benchmark.enabled {

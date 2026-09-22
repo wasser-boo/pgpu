@@ -49,7 +49,7 @@ impl TestApp {
 
     pub fn insert(&self, id: i64, created: &str) {
         self.app.db.insert_instance(&InstanceRow {
-            vast_id: id, slot_id: 1, role: praxis_common::Role::Llm, node_token: format!("test-token-{id}"),
+            vast_id: id, slot_id: 1, role: praxis_common::Role::Llm, node_token: format!("{id:08x}{id:040x}"),
             offer_id: 1, machine_id: 1, gpu_name: "test".into(), nb_ip: None, image: "test".into(),
             mode: praxis_common::Mode::Interruptible, lifecycle: "{\"kind\":\"auto\"}".into(), pinned: false,
             actual_status: "running".into(), intended_status: "running".into(), state: "healthy".into(),

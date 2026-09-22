@@ -1,6 +1,6 @@
 //! Reconciler: 30-s-Takt (+ Wake-Notifies). Synchronisiert Vast-Instanzen,
 //! errechnet Busy pro Service, wendet die Policy an, meteret Kosten und
-//! reconciled stündlich gegen den Vast-Kontostand.
+//! vergleicht stündlich echte Vast-Nutzung nach Slot-Labels (kein Kontostand).
 
 use crate::state::SharedApp;
 use praxis_common::{Action, InstanceState, Mode, Role};
@@ -16,7 +16,8 @@ pub async fn run(app: SharedApp) {
     let poll = std::time::Duration::from_secs(app.cfg().vast.poll_interval_s.max(5));
     let offer_every = std::time::Duration::from_secs(app.cfg().vast.offer_poll_s.max(15));
     let mut offer_due = tokio::time::Instant::now();
-    let mut meter_hour = tokio::time::Instant::now() + std::time::Duration::from_secs(3600);
+    let mut meter_hour = tokio::time::Instant::now();
+    let mut billing_task: Option<tokio::task::JoinHandle<()>> = None;
     loop {
         if app.shutting_down.load(std::sync::atomic::Ordering::Relaxed) { return; }
         tokio::select! {
@@ -39,9 +40,9 @@ pub async fn run(app: SharedApp) {
             Ok(()) => app.last_reconcile.store(chrono::Utc::now().timestamp(), std::sync::atomic::Ordering::Relaxed),
             Err(e) => tracing::warn!(error = format!("{e:#}"), "reconcile tick failed"),
         }
-        if tokio::time::Instant::now() >= meter_hour {
+        if tokio::time::Instant::now() >= meter_hour && billing_task.as_ref().is_none_or(|task|task.is_finished()) {
             meter_hour = tokio::time::Instant::now() + std::time::Duration::from_secs(3600);
-            reconcile_credit(&app).await;
+            billing_task = Some(tokio::spawn(crate::billing::refresh(app.clone())));
         }
     }
 }
@@ -63,6 +64,9 @@ pub async fn tick(app: &SharedApp) -> anyhow::Result<()> {
     };
     if let Some(list) = &vast_instances {
         sync_vast(app, list).await?;
+        if let Err(e) = crate::netbird::reconcile(app, list).await {
+            tracing::warn!(%e, "NetBird cleanup deferred; will retry without changing live peers");
+        }
     }
 
     // 2. Agent-Liveness: unreachable-Erkennung + Host-Fail-Buchung.
@@ -171,7 +175,7 @@ async fn sync_vast(app: &SharedApp, list: &[praxis_vast::Instance]) -> anyhow::R
     let _lock = app.management.lock().await;
     meter(app)?;
     let by_id: HashMap<i64, &praxis_vast::Instance> = list.iter().map(|i| (i.id, i)).collect();
-    for row in app.db.instances(true) {
+    for row in app.db.try_instances(true)? {
         let Some(v) = by_id.get(&row.vast_id) else {
             // Vast kennt sie nicht mehr → destroyed markieren.
             if row.state != "destroyed" {
@@ -397,23 +401,6 @@ pub(crate) fn meter(app: &SharedApp) -> anyhow::Result<()> {
     app.db.meter_until(chrono::Utc::now(), tz)
 }
 
-async fn reconcile_credit(app: &SharedApp) {
-    let vast_client = app.vast.lock().unwrap().clone();
-    let Some(vast) = vast_client else { return };
-    let Ok(user) = vast.current_user().await else { return };
-    let date = crate::node::local_date(app);
-    let metered = app.db.spent_today(&date);
-    match app.db.record_credit(&date, user.credit) {
-        Ok(spent) if metered > 0.05 && (spent - metered).abs() / metered.max(0.05) > 0.25 => {
-            app.events.emit(&app.db, "budget_drift", None, None,
-                &format!("Metering {metered:.2} $ vs. Kontostand-Deltas {spent:.2} $ — Differenz > 25 %"),
-                &serde_json::json!({"metered":metered,"reconciled":spent}));
-        }
-        Err(e) => tracing::warn!(%e, "balance reconciliation failed"),
-        _ => {}
-    }
-}
-
 // ---------------------------------------------------------------- Offers
 
 pub async fn search_slot_offers(
@@ -442,10 +429,10 @@ pub async fn search_slot_offers(
     // Beide Modi suchen und per offer-id mergen: min_bid (interruptible)
     // und dph_total (on-demand) landen im selben Snapshot.
     let disk = slot.disk_gb as f64;
-    let interruptible = vast.search(&slot.search_query, true, disk).await.inspect_err(|e| {
+    let interruptible = vast.search_filters(crate::selection::query(&slot,false)?, true, disk).await.inspect_err(|e| {
         tracing::error!(%e, "vast bid-Suche fehlgeschlagen (API-Key? Filter?)");
     })?;
-    let ondemand = vast.search(&slot.search_query, false, disk).await.inspect_err(|e| {
+    let ondemand = vast.search_filters(crate::selection::query(&slot,true)?, false, disk).await.inspect_err(|e| {
         tracing::error!(%e, "vast on-demand-Suche fehlgeschlagen (API-Key? Filter?)");
     })?;
     let mut by_id: std::collections::HashMap<i64, OfferSnapshot> = std::collections::HashMap::new();
@@ -466,6 +453,7 @@ pub async fn search_slot_offers(
         num_gpus: o.num_gpus,
         cuda_max_good: o.cuda_max_good,
         cpu_cores: o.cpu_cores,
+        geolocation: o.geolocation.clone(),
     };
     for o in &interruptible {
         let snap = snap_from(o, o.min_bid_or(0.0).max(0.0), o.dph_or(0.0));
@@ -663,11 +651,12 @@ pub async fn build_snapshot(app: &SharedApp) -> anyhow::Result<Snapshot> {
         });
     }
 
+    let (spent_today_usd,spent_month_usd)=app.db.budget_totals(&date)?;
     Ok(Snapshot {
         now: chrono::Utc::now(),
         seconds_to_day_end,
-        spent_today_usd: app.db.spent_today(&date),
-        spent_month_usd: app.db.spent_month(&date[..7]),
+        spent_today_usd,
+        spent_month_usd,
         slots,
         instance_count,
         running_rate_usd_h: running_rate,
@@ -813,14 +802,7 @@ pub async fn apply_action(app: &SharedApp, action: &Action) -> anyhow::Result<()
                 return Ok(());
             }
             app.events.emit(&app.db, kind, None, None, message, &serde_json::json!({}));
-            let url = &app.cfg().alerts.webhook_url;
-            if !url.is_empty() {
-                let url = url.clone();
-                let body = serde_json::json!({"kind": kind, "message": message});
-                let _ = tokio::spawn(async move {
-                    let _ = reqwest::Client::new().post(&url).json(&body).timeout(std::time::Duration::from_secs(10)).send().await;
-                });
-            }
+            crate::notifications::alert(app, kind, message);
             Ok(())
         }
     }
@@ -1292,7 +1274,7 @@ pub async fn create_instance(
     }
 
     // Unique per rental: label-based recovery must not select an old contract.
-    let label = format!("praxis-{}-s{}-{tok8}", slot.role, slot_id);
+    let label = crate::slot_labels::create(slot.role,slot_id,tok8);
     let params = CreateInstanceParams {
         client: "me",
         image: &slot.image,
@@ -1364,53 +1346,4 @@ pub async fn create_instance(
     );
     app.reconcile_now.notify_one();
     Ok(vast_id)
-}
-
-/// NetBird-Peer nach Hostname (gpu-<role>-<tok8>) suchen und löschen.
-/// Match wie im Connector: name ODER hostname-Feld ODER dns_label-Präfix.
-pub(crate) async fn netbird_delete_peer(app: &SharedApp, hostname: &str) -> anyhow::Result<()> {
-    let token = app.cfg().netbird_api_token();
-    if token.is_empty() {
-        return Ok(());
-    }
-    let base = app.cfg().netbird.api_url.trim_end_matches('/').to_string();
-    let resp = reqwest::Client::new()
-        .get(format!("{base}/api/peers"))
-        .bearer_auth(&token)
-        .timeout(std::time::Duration::from_secs(15))
-        .send()
-        .await?;
-    let peers: Vec<serde_json::Value> = resp.json().await.unwrap_or_default();
-    let exp = hostname.to_ascii_lowercase();
-    let peer_id = peers.iter().find_map(|p| {
-        let name = p.get("name").and_then(|n| n.as_str())?;
-        let ip = p.get("ip").and_then(|i| i.as_str())?;
-        let hostname_f = p.get("hostname").and_then(|h| h.as_str()).unwrap_or("");
-        let dns = p.get("dns_label").and_then(|d| d.as_str()).unwrap_or("");
-        let hit = name.eq_ignore_ascii_case(hostname)
-            || hostname_f.eq_ignore_ascii_case(hostname)
-            || dns.starts_with(&format!("{exp}."))
-            || dns.starts_with(&format!("{exp}-"));
-        if hit {
-            p.get("id").and_then(|i| i.as_str()).map(|s| (s.to_string(), ip.to_string()))
-        } else {
-            None
-        }
-    });
-    let Some((peer_id, ip)) = peer_id else {
-        tracing::debug!(%hostname, "kein NetBird-Peer zum Löschen gefunden");
-        return Ok(());
-    };
-    let resp = reqwest::Client::new()
-        .delete(format!("{base}/api/peers/{peer_id}"))
-        .bearer_auth(&token)
-        .timeout(std::time::Duration::from_secs(15))
-        .send()
-        .await?;
-    if resp.status().is_success() {
-        tracing::info!(%hostname, %ip, "NetBird-Peer gelöscht (destroy-Hygiene)");
-    } else {
-        anyhow::bail!("netbird peer delete {}: {}", peer_id, resp.status());
-    }
-    Ok(())
 }

@@ -2,6 +2,51 @@
 {% block title %}pgpu — Settings{% endblock %}
 {% block content %}
 <h1>Settings</h1>
+{% if !config_msg.is_empty() %}<p role="status">{{ config_msg }}</p>{% endif %}
+<style>
+.selection label{display:block;margin:8px 0}.selection input,.selection textarea,.selection select{width:100%;box-sizing:border-box;background:#0d1116;color:var(--fg);border:1px solid var(--line);padding:7px;border-radius:4px}
+.selection-map{width:100%;height:310px;background:#101a26;border:1px solid var(--line);border-radius:6px;cursor:crosshair}.selection-status{overflow-wrap:anywhere}
+</style>
+{% for s in slots %}
+<div class="card">
+  <h2>Slot {{ s.id }} · {{ s.name }} — Länder &amp; GPU-Modelle</h2>
+  <form method="post" action="/do/selection" class="selection" data-slot="{{ s.id }}">
+    <input type="hidden" name="slot_id" value="{{ s.id }}">
+    <div class="grid">
+      <div>
+        <label>Startland <select name="origin_country" data-selected="{{ s.origin_country }}" required><option value="{{ s.origin_country }}">{{ s.origin_country }}</option></select></label>
+        <label>Radius in km (leer = kein Radiusfilter) <input name="radius_km" type="number" min="0" max="20020" step="any" value="{{ s.radius_km }}" placeholder="z. B. 1000"></label>
+        <label>Erlaubte Länder / ISO-Codes (leer = alle) <input name="countries" value="{{ s.countries }}" placeholder="DE, AT, CH, NL, BE, LU, FR, CZ, PL, DK"></label>
+        <label>Ausgeschlossene Länder <input name="excluded_countries" value="{{ s.excluded_countries }}" placeholder="z. B. RU, US"></label>
+        <p class="mut">Liste, Radius und Suchfilter wirken zusammen. Für reine Radiusauswahl die Länderliste leeren. <strong>Ausschlüsse haben immer Vorrang.</strong></p>
+        <details><summary>Optional: exakter Startpunkt / Kartenklick</summary>
+          <label>Breitengrad <input name="latitude" type="number" min="-90" max="90" step="any" value="{{ s.latitude }}"></label>
+          <label>Längengrad <input name="longitude" type="number" min="-180" max="180" step="any" value="{{ s.longitude }}"></label>
+          <button type="button" data-country-origin>Wieder Startland verwenden</button>
+        </details>
+      </div>
+      <div>
+        <svg class="selection-map" viewBox="-180 -90 360 180" role="img" aria-label="Länderauswahl und Radius"></svg>
+        <button type="button" data-map-world>Welt / Startregion</button>
+        <p class="mut">Grün: in mindestens einem Mietmodus erlaubt. Klick setzt einen eigenen Startpunkt. Natural Earth (Public Domain).</p>
+        <p class="selection-status" role="status">Vorschau wird geladen …</p>
+      </div>
+    </div>
+    <p><strong>Länder-Näherung, kein Server-Radius:</strong> Ein Land wird anhand seines kartografischen Referenzpunkts ausgewählt; das gesamte Land gilt dann als erlaubt. Ein tatsächlicher GPU-Standort kann deutlich weiter entfernt sein.</p>
+    <label>Erlaubte GPU-Modelle — ein Modell pro Zeile, leer = alle passenden Modelle
+      <textarea name="gpu_names" rows="3" placeholder="RTX 5070 Ti&#10;RTX 4060 Ti&#10;RTX A4000">{{ s.gpu_names }}</textarea>
+    </label>
+    <p class="mut">Alternative Modelle, nicht zusätzliche physische GPUs. VRAM/RAM-, Anzahl-, Preis- und Host-Trust-Grenzen bleiben aktiv. Modellnamen wie in Vast verwenden.</p>
+    <details><summary>Zusätzliche Suchfilter (ändern im TOML-Editor)</summary>
+      <p>Interruptible: <code>{{ s.raw_query }}</code></p><p>On-demand: <code>{{ s.raw_on_demand }}</code></p>
+      <p class="mut">Diese Einschränkungen bleiben aktiv; die Auswahl oben lockert sie nicht. Beispiele: <code>geolocation!=DE</code>, <code>geolocation notin [DE,FR]</code>.</p>
+    </details>
+    <button type="submit">Auswahl speichern &amp; live anwenden</button>
+    <p class="mut">Die Karte ist nur eine Vorschau. Speichern aktualisiert Such-/Annahmeregeln ohne direkten Instanzumbau oder Benchmark. Die automatische Policy bleibt aktiv und verwendet die neue Auswahl beim nächsten Abgleich.</p>
+  </form>
+</div>
+{% endfor %}
+<script src="/static/selection.js" defer></script>
 <div class="grid">
 <div class="card">
   <h2 style="margin-top:0">Budget</h2>
@@ -44,8 +89,51 @@
 </div>
 
 <div class="card">
+  <h2 style="margin-top:0">Vast-Kostenabgleich nach Slot-Labels</h2>
+  <p>{{ billing.status }}</p>
+  <p class="mut">Scope: <code>{{ billing.scope }}</code> · letzter erfolgreicher Abgleich {{ billing.synced }}</p>
+  <table>
+    <thead><tr><th>Zeitraum</th><th>Vast-Nutzung</th><th>Lokale Slot-Schätzung</th></tr></thead>
+    <tbody>
+      <tr><td>{{ billing.day }}</td><td>{{ billing.day_provider }}</td><td>{{ billing.day_estimate }}</td></tr>
+      <tr><td>{{ billing.month }}</td><td>{{ billing.month_provider }}</td><td>{{ billing.month_estimate }}</td></tr>
+    </tbody>
+  </table>
+  <p><strong>Labels, nicht Online-Status:</strong> Passende laufende, gestoppte/schlafende und historische Verträge zählen. Fremde Labels, Einzahlungen und Kontostandänderungen zählen nicht zum Abgleich.</p>
+  <details><summary>Monatsvergleich je GPU-Vertrag</summary>
+    <table><thead><tr><th>Instanz</th><th>Slot</th><th>Status</th><th>Vast</th><th>Schätzung</th></tr></thead><tbody>
+      {% for row in billing.rows %}<tr><td class="mono">{{ row.id }}</td><td>{{ row.slot }}</td><td>{{ row.state }}</td><td>{{ row.provider }}</td><td>{{ row.estimate }}</td></tr>{% endfor %}
+    </tbody></table>
+  </details>
+  <p class="mut">Das Budget bleibt konservativ: bestätigte Nutzung bildet einen dauerhaften Mindestwert; weitere lokale Nutzung wird fortgeschrieben, nicht doppelt addiert. Verzögerte Rechnungen senken den Verbrauch nicht. Bei alter, nicht zuordenbarer Historie wird ein Gesamt-Mindestwert statt doppelter Einzelkorrekturen verwendet. Historische Kosten und laufende Speicherkosten bleiben erhalten; konfigurierte Limits werden nicht geändert.</p>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">Webhooks / Discord</h2>
+  {% if webhook.configured %}
+  <ul>{% for target in webhook.targets %}<li>Ziel {{ target.number }}: <strong>{{ target.host }}</strong> · Format {{ target.format }}</li>{% endfor %}</ul>
+  {% else %}<p><strong>Nicht konfiguriert.</strong> Die URLs unten im Config-Editor eintragen und speichern.</p>{% endif %}
+  <form method="post" action="/do/webhook/test">
+    <button type="submit" {% if !webhook.configured %}disabled{% endif %}>Testnachricht senden</button>
+  </form>
+  <p class="mut">Eine Testnachricht an jedes gespeicherte Ziel, mit separatem Ergebnis. Doppelte URLs werden nur einmal angeschrieben. Keine GPU-Aktion. Maximal ein Test alle 10 Sekunden.</p>
+  <p role="status">{{ webhook.last_event }}</p>
+  <details>
+    <summary>Discord-Beispielkonfiguration</summary>
+    <pre>[alerts]
+webhook_urls = [
+  "https://discord.com/api/webhooks/ID_KANAL_1/TOKEN_1",
+  "https://discord.com/api/webhooks/ID_KANAL_2/TOKEN_2",
+]
+webhook_format = "discord"</pre>
+    <p>Discord → Servereinstellungen → Integrationen → Webhooks → Webhook-URL kopieren. Einen vorhandenen <code>[alerts]</code>-Abschnitt bearbeiten, nicht doppelt anlegen. URL geheim halten.</p>
+    <p>Nach „Speichern &amp; live anwenden“ den Testknopf drücken. In jedem Kanal erscheint eine <strong>✅ PGPU-Testnachricht</strong>. Fehler werden pro Ziel angezeigt und blockieren die anderen Ziele nicht. URLs bleiben geheim. Die bisherige einzelne <code>webhook_url</code> funktioniert weiterhin; für gemischte Dienste <code>webhook_format = "auto"</code> wählen.</p>
+  </details>
+  <p class="mut">Automatische Warnungen: Budget, Preemption, Bid-Limit und fehlgeschlagene Swaps (gleiche Art höchstens alle 30 Minuten). Zustellversuche erscheinen in Events; vorübergehende Fehler werden bis zu zweimal wiederholt. Ein bloßes Speichern sendet noch keine Nachricht.</p>
+</div>
+
+<div class="card">
   <h2 style="margin-top:0">config.toml (Live-Editor)</h2>
-  {% if !config_msg.is_empty() %}<p class="badge b-info">{{ config_msg }}</p>{% endif %}
   <form method="post" action="/do/config">
     <textarea name="raw" rows="24" style="width:100%; font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px; background:#0d1116; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:8px;">{{ config_raw }}</textarea>
     <div class="actions">

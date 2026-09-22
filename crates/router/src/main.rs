@@ -8,6 +8,7 @@ mod api;
 mod catalog;
 mod performance;
 mod assets;
+mod billing;
 mod connector;
 mod config;
 mod dashboard;
@@ -15,7 +16,10 @@ mod db;
 mod events;
 mod hub;
 mod node;
+mod netbird;
+mod notifications;
 mod operations;
+mod webhook;
 
 #[cfg(test)]
 mod test_support;
@@ -26,6 +30,9 @@ mod performance_tests;
 mod proxy;
 mod reconciler;
 mod schedule_time;
+mod selection;
+mod selection_ui;
+mod slot_labels;
 mod state;
 
 use anyhow::{Context, Result};
@@ -49,6 +56,10 @@ fn main() -> anyhow::Result<()> {
 
 async fn async_main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a|a=="--version") {
+        println!("praxis-router {}",env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     let config_path = args
         .iter()
         .position(|a| a == "--config")
@@ -58,6 +69,10 @@ async fn async_main() -> Result<()> {
         .unwrap_or_else(|| "config.toml".to_string());
     let mut cfg = config::Config::load(&config_path)
         .with_context(|| format!("config {config_path} laden"))?;
+    if args.iter().any(|a|a=="--check-config") {
+        println!("configuration valid ({} slots; schema only, no provider calls)",cfg.slots.len());
+        return Ok(());
+    }
     cfg.validate_auth()?;
     // bind_ip = "auto": erste IPv4 im NetBird-Range (100.64.0.0/10) am
     // wt0/anderen Interfaces erkennen — VPS-Deploy ohne hartcodierte IP
@@ -159,6 +174,9 @@ async fn async_main() -> Result<()> {
         .route("/settings", get(dashboard::settings_page))
         .route("/do/config", post(dashboard::do_config_save))
         .route("/do/config/reload", post(dashboard::do_config_reload))
+        .route("/do/webhook/test", post(dashboard::do_webhook_test))
+        .route("/do/selection", post(selection_ui::save))
+        .route("/api/v1/selection/preview", post(selection_ui::preview))
         .route("/do/slots/:id/:action", post(dashboard::do_slot_action))
         .route("/do/auto_rent", post(dashboard::do_auto_rent))
         .route("/do/rent", post(dashboard::do_rent))
@@ -168,6 +186,7 @@ async fn async_main() -> Result<()> {
         .route("/api/v1/state", get(api::state))
         .route("/api/v1/settings/auto_rent", post(api::auto_rent_set))
         .route("/api/v1/config", get(api::config_get).put(api::config_put))
+        .route("/api/v1/alerts/test", post(api::webhook_test))
         .route("/api/v1/destroy_all", post(api::destroy_all))
         .route("/api/v1/sleep_all", post(api::sleep_all))
         .route("/do/destroy_all", post(dashboard::do_destroy_all))
