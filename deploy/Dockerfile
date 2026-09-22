@@ -17,7 +17,7 @@ RUN case "${TARGETPLATFORM:-linux/amd64}" in \
     rustup target add "$T" && \
     apt-get update && apt-get install -y --no-install-recommends musl-tools && rm -rf /var/lib/apt/lists/* && \
     echo "$T" > /rusttarget
-ARG TARGETARCH=""
+ARG TARGETARCH
 WORKDIR /agent
 COPY --from=agent Cargo.toml Cargo.lock ./
 COPY --from=agent src ./src
@@ -30,7 +30,7 @@ RUN --mount=type=cache,target=/agent-tgt \
     cp "/agent-tgt/${TARGETARCH:-host}/$T/release/praxis-gpu-agent" /gpu-agent
 
 FROM rust:1-bookworm AS router-builder
-ARG TARGETARCH=""
+ARG TARGETARCH
 WORKDIR /build
 # Workspace-Metadaten zuerst (Layer-Cache für Deps), dann echte Quellen.
 COPY Cargo.toml Cargo.lock ./
