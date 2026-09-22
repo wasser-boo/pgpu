@@ -7,8 +7,10 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::Request;
 use axum::response::{IntoResponse, Response};
 use praxis_common::node::NodeMessage;
-use praxis_common::node::RouterCommand;
 use futures::{SinkExt, StreamExt};
+
+#[cfg(test)]
+mod tests;
 
 /// Bearer-Token aus Header ziehen.
 pub fn bearer(req_headers: &axum::http::HeaderMap) -> Option<String> {
@@ -34,11 +36,6 @@ pub async fn node_ws(app: AppCtx, ws: WebSocketUpgrade, req: Request) -> Respons
 
 async fn node_session(app: SharedApp, socket: WebSocket) {
     let (mut sink, mut stream) = socket.split();
-    #[allow(unused_assignments)]
-    let mut registered_vast_id: Option<i64> = None;
-    #[allow(unused_assignments)]
-    let mut rx: Option<tokio::sync::mpsc::UnboundedReceiver<RouterCommand>> = None;
-
     // 1. Hello mit Token abwarten (60 s).
     let hello = tokio::time::timeout(std::time::Duration::from_secs(60), stream.next()).await;
     let raw = match hello {
@@ -61,14 +58,14 @@ async fn node_session(app: SharedApp, socket: WebSocket) {
         return;
     };
     let vast_id = inst.vast_id;
-    registered_vast_id = Some(vast_id);
     tracing::info!(vast_id, role, %agent_version, ?nb_ip, "agent connected");
-    {
+    let (session, mut rx) = {
         let _management=app.management.lock().await;
         let _ = app.db.update_instance_agent(vast_id, nb_ip.as_deref(), false, "agent_connected");
-        rx = Some(app.hub.register(vast_id, inst.slot_id, nb_ip.clone(), services));
+        let registration = app.hub.register_session(vast_id, inst.slot_id, nb_ip.clone(), services);
         app.reconcile_now.notify_one();
-    }
+        registration
+    };
 
     // Asset-Push (Call-home-Pfad: gleiche Session, Router schiebt).
     {
@@ -86,18 +83,14 @@ async fn node_session(app: SharedApp, socket: WebSocket) {
             from_agent = stream.next() => {
                 match from_agent {
                     Some(Ok(Message::Text(raw))) => {
+                        if !session.is_current() { break; }
                         match serde_json::from_str::<NodeMessage>(&raw) {
-                            Ok(NodeMessage::Hello { token, .. }) => {
-                                // Reconnect: neu registrieren.
-                                if let Some(inst2) = app.db.instance_by_token(&token) {
-                                    let _management=app.management.lock().await;
-                                    let _ = app.db.update_instance_agent(inst2.vast_id, nb_ip.as_deref(), false, "agent_connected");
-                                    app.reconcile_now.notify_one();
-                                }
-                            }
+                            // A reconnect gets a new socket/session, not another Hello.
+                            Ok(NodeMessage::Hello { .. }) => {}
                             Ok(NodeMessage::Heartbeat { health, busy, busy_reason, gpu, progress, disk_free_gb, .. }) => {
                                 // Do not promote a heartbeat across a concurrent start/allocation boundary.
                                 let _management=app.management.lock().await;
+                                if !session.is_current() { break; }
                                 let health_json = serde_json::to_value(&health).unwrap_or_default();
                                 let hb = crate::hub::HeartbeatData {
                                     health_json: health_json.clone(),
@@ -142,30 +135,23 @@ async fn node_session(app: SharedApp, socket: WebSocket) {
                     Some(Err(_)) => break,
                 }
             }
-            from_router = async {
-                match rx {
-                    Some(ref mut r) => r.recv().await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                if let Some(cmd) = from_router {
-                    let Ok(text) = serde_json::to_string(&cmd) else { continue };
-                    if sink.send(Message::Text(text.into())).await.is_err() {
-                        break;
-                    }
+            from_router = rx.recv() => {
+                let Some(cmd) = from_router else { break; };
+                if !session.is_current() { break; }
+                let Ok(text) = serde_json::to_string(&cmd) else { continue };
+                if sink.send(Message::Text(text.into())).await.is_err() {
+                    break;
                 }
             }
         }
     }
-    if let Some(v) = registered_vast_id {
-        tracing::info!(v, "agent disconnected");
-        app.hub.unregister(v);
-        // NICHT sofort unreachable: Blips (Agent-Restart, NetBird-Zucken)
-        // soll der Connector in ~10 s wieder flicken. Der Reconciler
-        // setzt unreachable erst nach >3 min Agent-Stille — und genau dort
-        // wird der Maschinen-Fail gezählt (Blacklist-Basis).
-        app.reconcile_now.notify_one();
-    }
+    tracing::info!(vast_id, "agent disconnected");
+    drop(session);
+    // NICHT sofort unreachable: Blips (Agent-Restart, NetBird-Zucken)
+    // soll der Connector in ~10 s wieder flicken. Der Reconciler
+    // setzt unreachable erst nach >3 min Agent-Stille — und genau dort
+    // wird der Maschinen-Fail gezählt (Blacklist-Basis).
+    app.reconcile_now.notify_one();
 }
 
 /// `GET /api/v1/node/assets/manifest`

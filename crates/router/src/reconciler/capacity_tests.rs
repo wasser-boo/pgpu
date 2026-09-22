@@ -23,7 +23,7 @@ async fn resumed_contract_waits_without_preemption_duplicate_start_or_stale_heal
     t.app.hub.record_heartbeat(11,HeartbeatData {health_json:json!("healthy"),..Default::default()},None);
     crate::operations::start_instance(&t.app,11,"test resume").await.unwrap();
     assert_eq!(t.app.db.instance(11).unwrap().state,"start_requested");
-    assert_ne!(t.app.hub.heartbeat(11).unwrap().health_json,json!("healthy"));
+    assert!(t.app.hub.heartbeat(11).is_none());
     let epoch=t.app.db.boot_started_at(11).unwrap().unwrap();
     for v in [provider("stopped","stopped"),provider("scheduling","stopped"),provider("running","scheduling")] {
         observe(&t,&v).await;

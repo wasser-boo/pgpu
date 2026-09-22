@@ -14,9 +14,6 @@ use praxis_common::node::NodeMessage;
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::Message;
 
-/// Laufende Connector-Tasks pro Instanz.
-static CONNECTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 pub async fn run(app: SharedApp) {
     loop {
         if let Err(e) = tick(&app).await {
@@ -44,6 +41,7 @@ async fn tick(app: &SharedApp) -> Result<()> {
         return Ok(());
     }
     let peers = fetch_peers(app).await.unwrap_or_default();
+    let mut attempts = 0;
     for inst in active {
         // Bereits verbunden? (Heartbeat vorhanden)
         if app.hub.heartbeat(inst.vast_id).is_some() {
@@ -66,21 +64,26 @@ async fn tick(app: &SharedApp) -> Result<()> {
         if inst.nb_ip.as_deref() != Some(ip.as_str()) {
             let _ = app.db.update_instance_agent(inst.vast_id, Some(&ip), false, "booting");
         }
+        let Some(attempt) = app.hub.try_dial(inst.vast_id) else { continue; };
         tracing::info!(vast_id = inst.vast_id, %ip, "verbinde mit gpu-agent :9100");
         let app2 = app.clone();
         let tok = inst.node_token.clone();
-        let ip2 = ip.clone();
-        CONNECTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let url = format!("ws://{ip}:9100");
         tokio::spawn(async move {
-            if let Err(e) = dial_session(&app2, &ip2, &tok).await {
-                tracing::debug!(%e, "agent-session beendet");
+            let _attempt = attempt;
+            if let Err(e) = dial_session(&app2, &url, &tok).await {
+                tracing::debug!(vast_id = inst.vast_id, %e, "agent-session beendet");
             }
-            CONNECTED.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            app2.reconcile_now.notify_one();
         });
-        // pro Takt höchstens 3 neue Wählversuche (Rate-Gnade).
+        attempts += 1;
+        if attempts == 3 { break; }
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;
 
 /// NetBird-Peers via Management-API (name/hostname/dns_label → ip).
 #[derive(Debug, Clone)]
@@ -131,9 +134,10 @@ async fn fetch_peers(app: &SharedApp) -> Result<Vec<PeerInfo>> {
 }
 
 /// WS-Session zum Agent: Hello → Auth → gleiche Loop wie node.rs.
-async fn dial_session(app: &SharedApp, ip: &str, expect_token: &str) -> Result<()> {
-    let url = format!("ws://{ip}:9100");
-    let (mut sink, mut stream) = tokio_tungstenite::connect_async(&url).await?.0.split();
+async fn dial_session(app: &SharedApp, url: &str, expect_token: &str) -> Result<()> {
+    let (mut sink, mut stream) = tokio::time::timeout(
+        Duration::from_secs(15), tokio_tungstenite::connect_async(url),
+    ).await??.0.split();
 
     // Hello abwarten (Agent sendet zuerst).
     let first = tokio::time::timeout(Duration::from_secs(15), stream.next()).await?;
@@ -163,9 +167,13 @@ async fn dial_session(app: &SharedApp, ip: &str, expect_token: &str) -> Result<(
         &format!("Router→Agent {hostname:?} ({role}) verbunden"),
         &serde_json::json!({"dial": true}),
     );
-    let _ = app.db.update_instance_agent(vast_id, nb_ip.as_deref(), false, "agent_connected");
-    let mut rx = app.hub.register(vast_id, inst.slot_id, nb_ip.clone(), services.clone());
-    app.reconcile_now.notify_one();
+    let (session, mut rx) = {
+        let _management = app.management.lock().await;
+        let _ = app.db.update_instance_agent(vast_id, nb_ip.as_deref(), false, "agent_connected");
+        let registration = app.hub.register_session(vast_id, inst.slot_id, nb_ip.clone(), services);
+        app.reconcile_now.notify_one();
+        registration
+    };
 
     // Asset-Push nach Hello (Outbound-Pull der Boxen ist auf Vast unzuverlässlich
     // — der Router schiebt Manifest + Bytes über genau diese Session).
@@ -184,9 +192,12 @@ async fn dial_session(app: &SharedApp, ip: &str, expect_token: &str) -> Result<(
             inbound = stream.next() => {
                 match inbound {
                     Some(Ok(Message::Text(raw))) => {
+                        anyhow::ensure!(session.is_current(), "agent session superseded");
                         match serde_json::from_str::<NodeMessage>(&raw) {
                             Ok(NodeMessage::Hello { .. }) => {}
                             Ok(NodeMessage::Heartbeat { health, busy, busy_reason, gpu, progress, disk_free_gb, .. }) => {
+                                let _management = app.management.lock().await;
+                                anyhow::ensure!(session.is_current(), "agent session superseded");
                                 let health_json = serde_json::to_value(&health).unwrap_or_default();
                                 let hb = crate::hub::HeartbeatData {
                                     health_json: health_json.clone(),
@@ -225,15 +236,11 @@ async fn dial_session(app: &SharedApp, ip: &str, expect_token: &str) -> Result<(
                     Some(Err(e)) => anyhow::bail!("WS-Fehler: {e}"),
                 }
             }
-            from_hub = async {
-                rx.recv().await
-            } => {
-                if let Some(cmd) = from_hub {
-                    let json = serde_json::to_string(&cmd)?;
-                    if sink.send(Message::Text(json.into())).await.is_err() {
-                        anyhow::bail!("send failed");
-                    }
-                }
+            from_hub = rx.recv() => {
+                let Some(cmd) = from_hub else { anyhow::bail!("agent session invalidated"); };
+                anyhow::ensure!(session.is_current(), "agent session superseded");
+                let json = serde_json::to_string(&cmd)?;
+                sink.send(Message::Text(json.into())).await?;
             }
         }
     }

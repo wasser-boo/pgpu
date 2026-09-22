@@ -2,9 +2,12 @@
 //! Heartbeats, Kommandos mit Ergebnis (oneshot) und Terminal-Relays.
 
 use praxis_common::node::RouterCommand;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
+
+#[cfg(test)]
+mod tests;
 
 pub type CommandResult = Result<serde_json::Value, String>;
 
@@ -34,6 +37,7 @@ impl Default for HeartbeatData {
 
 #[allow(dead_code)]
 pub struct AgentHandle {
+    session_id: u64,
     pub tx: mpsc::UnboundedSender<RouterCommand>,
     pub slot_id: i64,
     pub nb_ip: Option<String>,
@@ -46,6 +50,8 @@ pub struct AgentHandle {
 
 struct HubInner {
     agents: HashMap<i64, Arc<Mutex<AgentHandle>>>,
+    dialing: HashSet<i64>,
+    next_session_id: u64,
     /// Letzte Herzschlag-Zeit pro Instanz — überlebt `unregister`, damit
     /// der Reconciler auch NACH einem WS-Abriß „Agent seit X s still"
     /// erkennen kann (Sitzung weg = last_seen(None) sonst nicht unterscheidbar).
@@ -59,6 +65,8 @@ impl Default for HubInner {
     fn default() -> Self {
         Self {
             agents: HashMap::new(),
+            dialing: HashSet::new(),
+            next_session_id: 0,
             last_seen_all: HashMap::new(),
             pending: HashMap::new(),
             terms: HashMap::new(),
@@ -67,22 +75,86 @@ impl Default for HubInner {
     }
 }
 
+impl HubInner {
+    fn remove_agent(&mut self, vast_id: i64) {
+        self.agents.remove(&vast_id);
+        self.pending.retain(|(agent, _), _| *agent != vast_id);
+        self.terms.retain(|(agent, _), _| *agent != vast_id);
+        // Preserve last_seen_all for the reconciler's disconnect grace period.
+    }
+}
+
+/// Both inbound and outbound WebSocket tasks own a registration guard.
+/// Drop runs on errors AND cancellation; an old task cannot evict its replacement.
+pub struct AgentSession {
+    hub: Hub,
+    vast_id: i64,
+    session_id: u64,
+}
+
+impl AgentSession {
+    pub fn is_current(&self) -> bool {
+        self.hub.inner.lock().unwrap().agents.get(&self.vast_id)
+            .is_some_and(|h| h.lock().unwrap().session_id == self.session_id)
+    }
+}
+
+impl Drop for AgentSession {
+    fn drop(&mut self) {
+        let mut inner = self.hub.inner.lock().unwrap();
+        if inner.agents.get(&self.vast_id)
+            .is_some_and(|h| h.lock().unwrap().session_id == self.session_id) {
+            inner.remove_agent(self.vast_id);
+        }
+    }
+}
+
+/// One dial task per instance, including TCP connect and the Hello handshake.
+pub struct DialAttempt {
+    hub: Hub,
+    vast_id: i64,
+}
+
+impl Drop for DialAttempt {
+    fn drop(&mut self) { self.hub.inner.lock().unwrap().dialing.remove(&self.vast_id); }
+}
+
 #[derive(Clone, Default)]
 pub struct Hub {
     inner: Arc<Mutex<HubInner>>,
 }
 
 impl Hub {
-    /// Registriert einen Agent. Der WS-Task hält die Receiver-Seite.
+    pub fn try_dial(&self, vast_id: i64) -> Option<DialAttempt> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.agents.contains_key(&vast_id) || !inner.dialing.insert(vast_id) { return None; }
+        Some(DialAttempt { hub: self.clone(), vast_id })
+    }
+
+    pub fn register_session(
+        &self, vast_id: i64, slot_id: i64, nb_ip: Option<String>, services: HashMap<String, bool>,
+    ) -> (AgentSession, mpsc::UnboundedReceiver<RouterCommand>) {
+        let (session_id, rx) = self.register_inner(vast_id, slot_id, nb_ip, services);
+        (AgentSession { hub: self.clone(), vast_id, session_id }, rx)
+    }
+
+    /// Fixtures can register a simulated agent without a WebSocket task.
+    #[cfg(test)]
     pub fn register(
-        &self,
-        vast_id: i64,
-        slot_id: i64,
-        nb_ip: Option<String>,
-        services: HashMap<String, bool>,
+        &self, vast_id: i64, slot_id: i64, nb_ip: Option<String>, services: HashMap<String, bool>,
     ) -> mpsc::UnboundedReceiver<RouterCommand> {
+        self.register_inner(vast_id, slot_id, nb_ip, services).1
+    }
+
+    fn register_inner(
+        &self, vast_id: i64, slot_id: i64, nb_ip: Option<String>, services: HashMap<String, bool>,
+    ) -> (u64, mpsc::UnboundedReceiver<RouterCommand>) {
         let (tx, rx) = mpsc::unbounded_channel();
+        let mut inner = self.inner.lock().unwrap();
+        let session_id = inner.next_session_id;
+        inner.next_session_id += 1;
         let handle = AgentHandle {
+            session_id,
             tx,
             slot_id,
             nb_ip,
@@ -92,21 +164,15 @@ impl Hub {
             draining: false,
             services,
         };
-        self.inner
-            .lock()
-            .unwrap()
-            .agents
-            .insert(vast_id, Arc::new(Mutex::new(handle)));
-        self.inner.lock().unwrap().last_seen_all.insert(vast_id, chrono::Utc::now().timestamp());
-        rx
+        inner.remove_agent(vast_id);
+        inner.agents.insert(vast_id, Arc::new(Mutex::new(handle)));
+        inner.last_seen_all.insert(vast_id, chrono::Utc::now().timestamp());
+        (session_id, rx)
     }
 
+    #[cfg(test)]
     pub fn unregister(&self, vast_id: i64) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.agents.remove(&vast_id);
-        inner.pending.retain(|(agent, _), _| *agent != vast_id);
-        inner.terms.retain(|(agent, _), _| *agent != vast_id);
-        // last_seen_all bleibt bewusst stehen (s. oben).
+        self.inner.lock().unwrap().remove_agent(vast_id);
     }
 
     #[allow(dead_code)]
@@ -120,14 +186,13 @@ impl Hub {
         inner.agents.get(&vast_id).map(|h| h.lock().unwrap().heartbeat.clone())
     }
 
-    /// A new allocation must obtain a new heartbeat, not reuse the pre-stop one.
-    /// Caller serializes with node heartbeat processing via management lock.
-    pub fn clear_boot_health(&self,vast_id:i64) {
-        let mut inner=self.inner.lock().unwrap();
+    /// A new allocation needs a fresh session, not the pre-stop socket/heartbeat.
+    /// Removing the sender wakes the old task; its guard cannot remove a new one.
+    /// Caller serializes with BOTH WebSocket paths via the management lock.
+    pub fn clear_boot_health(&self, vast_id: i64) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.remove_agent(vast_id);
         inner.last_seen_all.remove(&vast_id);
-        if let Some(h)=inner.agents.get(&vast_id) {
-            let mut h=h.lock().unwrap();h.heartbeat=HeartbeatData::default();h.last_seen=0;
-        }
     }
 
     pub fn last_seen(&self, vast_id: i64) -> Option<i64> {
