@@ -17,7 +17,10 @@
     {% if budget.costs_known %}{{ budget.spent_usd|fmt4 }} USD für das Budget berücksichtigt{% else %}Budget-Verbrauch nicht verfügbar{% endif %} · Projektion bis Mitternacht {% if budget.rate_known %}{{ budget.projected_usd|fmt2 }} ${% else %}unbekannt{% endif %} ·
     Soft {{ budget.soft_usd|fmt2 }} $ / Hard {{ budget.hard_usd|fmt2 }} $ · Monat {% if budget.costs_known %}{{ budget.spent_month_usd|fmt2 }}{% else %}unbekannt{% endif %} / {{ budget.monthly_usd|fmt2 }} $
   </div>
-  <div class="bar"><div class="{{ budget.bar_class }}" style="width:{{ budget.pct }}%"></div></div>
+  <div class="bar" aria-label="Projektion bis Mitternacht"><div class="{{ budget.bar_class }}" style="width:{{ budget.pct }}%"></div></div>
+  <div class="mono">Bisher verbraucht (heute): {% if budget.costs_known %}{{ budget.spent_usd|fmt4 }} USD / {{ budget.soft_usd|fmt2 }} USD Soft-Limit{% else %}nicht verfügbar{% endif %}</div>
+  {% if budget.costs_known %}<div class="bar" aria-label="Bisheriger Tagesverbrauch"><div class="{{ budget.spent_bar_class }}" style="width:{{ budget.spent_pct }}%"></div></div>{% endif %}
+  <p class="mut">Ohne zukünftige Kosten; konservativ aus gemeldeten Charges und lokaler Schätzung. Tagesbudget startet um 00:00 Uhr ({{ today.tz }}) neu; Monatsverbrauch bleibt erhalten.</p>
   {% if stt_sessions > 0 %}<span class="badge b-info">STT: {{ stt_sessions }} WS-Session(s) aktiv</span>{% else %}<span class="badge b-mut">STT idle</span>{% endif %}
   <div class="actions" style="margin-top:10px">
     <form method="post" action="/do/destroy_all" onsubmit="return confirm('WIRKLICH ALLE Instanzen (über alle Slots, ungepinnt) zerstören?')"><button style="color:var(--bad)">Alle Instanzen zerstören</button></form>

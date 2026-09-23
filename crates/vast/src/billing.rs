@@ -13,6 +13,10 @@ pub struct Charge {
     pub source: String,
     pub amount: f64,
     #[serde(default)]
+    pub start: Option<f64>,
+    #[serde(default)]
+    pub end: Option<f64>,
+    #[serde(default)]
     pub metadata: Option<ChargeMetadata>,
 }
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -21,6 +25,23 @@ pub struct ChargeMetadata {
     pub label: Option<String>,
 }
 impl Charge {
+    /// Reject overlapping/older billing buckets rather than booking their entire
+    /// amount into a new local day. Never prorate aggregate provider charges.
+    pub fn validate_window(&self, from_unix: i64, through_unix: i64) -> Result<()> {
+        if let Some(start) = self.start {
+            ensure!(start.is_finite() && start >= from_unix as f64 && start <= through_unix as f64,
+                "Vast charge starts outside requested billing window");
+        }
+        if let Some(end) = self.end {
+            ensure!(end.is_finite() && end >= from_unix as f64 && end <= through_unix as f64,
+                "Vast charge ends outside requested billing window");
+            if let Some(start) = self.start {
+                ensure!(end >= start, "invalid Vast charge interval");
+            }
+        }
+        Ok(())
+    }
+
     pub fn instance_id(&self) -> Option<i64> {
         if self.kind != "instance" {
             return None;

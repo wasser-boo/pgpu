@@ -115,6 +115,7 @@ fn compare(
             ignored_contracts += 1;
             continue;
         };
+        charge.validate_window(from_unix, through_unix)?;
         ensure!(
             charge.amount.is_finite() && charge.amount >= 0.0,
             "invalid tagged usage amount"

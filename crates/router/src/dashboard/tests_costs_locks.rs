@@ -42,7 +42,7 @@ async fn dashboard_costs_include_stopped_destroyed_traffic_and_provider_only_his
     let response=index(crate::state::AppCtx(t.app.clone()),t.request("{}")).await;
     assert!(response.status().is_success());
     let html=String::from_utf8(axum::body::to_bytes(response.into_body(),1<<20).await.unwrap().to_vec()).unwrap();
-    for value in ["7.2000 USD","3.3000 USD","4.1500 USD","4.6500 USD","10.5000 USD","Vast bisher gemeldet","Schätzung","30000"] {assert!(html.contains(value),"missing {value}");}
+    for value in ["7.2000 USD","3.3000 USD","4.1500 USD","4.6500 USD","10.5000 USD","Vast bisher gemeldet","Schätzung","30000","Bisher verbraucht (heute): 10.5000 USD","aria-label=\"Bisheriger Tagesverbrauch\""] {assert!(html.contains(value),"missing {value}");}
     assert_eq!(t.app.db.budget_totals(&date).unwrap(),before,"rendering cannot alter ledgers");
     assert_eq!(t.app.cfg().budget.daily_hard_eur,2000.0);
 }
@@ -98,6 +98,36 @@ async fn unavailable_local_cost_ledger_never_renders_as_zero_spend() {
     assert!(html.contains("Budget-Verbrauch nicht verfügbar"));
     assert!(html.contains("Lokal erfasst (Schätzung): nicht verfügbar"));
     assert!(!html.contains("0.0000 USD für das Budget"));
+    assert!(html.contains("Bisher verbraucht (heute): nicht verfügbar"));
+    assert!(!html.contains("aria-label=\"Bisheriger Tagesverbrauch\""));
+}
+
+#[test]
+fn daily_budget_and_consumption_bar_reset_at_local_midnight_without_erasing_month() {
+    let t=TestApp::new();
+    let mut cfg=(*t.app.cfg()).clone();
+    cfg.router.tz="Europe/Berlin".into();
+    cfg.budget.daily_soft_eur=10.0;cfg.budget.daily_hard_eur=20.0;cfg.budget.usd_per_eur=1.0;
+    t.app.cfg_swap(cfg);
+    // Midnight in Berlin is still the previous UTC date.
+    let midnight=Utc.with_ymd_and_hms(2026,1,2,23,0,0).unwrap();
+    t.insert(11,&(midnight-Duration::hours(1)).to_rfc3339());
+    t.app.db.meter_until(midnight,chrono_tz::Europe::Berlin).unwrap();
+    t.app.db.record_provider_usage("{}",&[
+        ("2026-01-02".into(),11,15.0,1.1),
+        ("2026-01".into(),11,15.0,1.1),
+    ]).unwrap();
+    let before=budget_view_at(&t.app,midnight-Duration::seconds(1));
+    near(before.spent_usd,15.0);near(before.spent_pct,100.0);
+    assert_eq!(before.spent_bar_class,"warn");
+    let after=budget_view_at(&t.app,midnight);
+    near(after.spent_usd,0.0);near(after.spent_pct,0.0);near(after.spent_month_usd,15.0);
+    assert_eq!(after.spent_bar_class,"");
+    assert!(after.projected_usd>0.0,"future running costs are not consumption");
+    t.app.db.meter_until(midnight+Duration::hours(1),chrono_tz::Europe::Berlin).unwrap();
+    let later=budget_view_at(&t.app,midnight+Duration::hours(1));
+    near(later.spent_usd,1.1);near(later.spent_pct,11.0);near(later.spent_month_usd,16.1);
+    near(t.app.db.spent_today("2026-01-02"),15.0);
 }
 
 #[test]

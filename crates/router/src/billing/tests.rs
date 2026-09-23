@@ -90,6 +90,26 @@ fn scope_uses_exact_slot_labels_including_sleeping_and_deleted_not_account_payme
 }
 
 #[test]
+fn previous_day_provider_buckets_cannot_be_booked_as_today() {
+    let t=TestApp::new();
+    let from=Utc.with_ymd_and_hms(2026,1,2,23,0,0).unwrap().timestamp();
+    let through=from+3600;
+    let mut row=charge(11,15.0,"praxis-llm-s1-deadbeef");
+    let check=|row| compare(&t.app.cfg(),"2026-01-03".into(),from,through,
+        &[row],&HashMap::new(),&HashMap::new(),&HashMap::new());
+    row.start=Some((from-86400) as f64);row.end=Some(through as f64);
+    assert!(check(row.clone()).is_err(),"overlapping old costs must not raise today's floor");
+    row.end=Some((from-1) as f64);
+    assert!(check(row.clone()).is_err());
+    row.start=Some(from as f64);row.end=Some(through as f64);
+    close(check(row.clone()).unwrap().provider_usd,15.0);
+    row.end=Some((through+1) as f64);
+    assert!(check(row.clone()).is_err());
+    row.end=Some((from-1) as f64);
+    assert!(check(row).is_err());
+}
+
+#[test]
 fn tagged_contract_without_local_history_has_unknown_estimate_not_a_fake_zero() {
     let t = TestApp::new();
     let result = compare(
