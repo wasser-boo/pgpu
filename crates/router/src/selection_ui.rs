@@ -156,8 +156,7 @@ pub async fn save(
     }
     let result = async {
         let input = Input::form(&form)?;
-        let raw = patch(&app.cfg_raw(), &input)?;
-        crate::api::apply_config(&app.0, &raw).await
+        crate::api::patch_config(&app.0, |raw| patch(raw, &input)).await
     }
     .await;
     let message=match result { Ok(_)=>"Länder-/GPU-Auswahl gespeichert. Die automatische Policy verwendet sie beim nächsten Abgleich; kein direkter Instanzumbau.".to_string(), Err(error)=>format!("Auswahl nicht gespeichert: {error}") };

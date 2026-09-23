@@ -65,15 +65,15 @@ role = "llm"
         assert status(base + "/api/v1/state") == 401
         assert status(base + "/api/v1/state", Authorization=f"Bearer {TOKEN}") == 200
         assert status(base + "/api/v1/events/stream", Cookie=f"pgpu_session={TOKEN}", Origin="http://other-host") == 401
-        for path in ("/api/v1/performance", "/api/v1/performance/summary"):
+        for path in ("/api/v1/performance", "/api/v1/performance/summary", "/api/v1/free-router"):
             assert status(base + path) == 401
             assert status(base + path, Authorization=f"Bearer {TOKEN}") == 200
-        for path in ("/performance", "/offers"):
+        for path in ("/performance", "/offers", "/settings"):
             assert status(base + path, Cookie=f"pgpu_session={TOKEN}") == 200
         process.send_signal(signal.SIGTERM)
         output = process.communicate(timeout=6)[0]
         assert process.returncode == 0, output.decode()
-        print("offline process smoke: health, readiness, auth, performance API/pages, cross-origin guard, SIGTERM OK")
+        print("offline process smoke: health, readiness, auth, performance/free-router API, settings/pages, cross-origin guard, SIGTERM OK")
     finally:
         if process.poll() is None:
             process.kill()

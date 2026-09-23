@@ -15,6 +15,7 @@ mod costs;
 mod dashboard;
 mod db;
 mod events;
+mod free_router;
 mod hub;
 mod node;
 mod netbird;
@@ -122,6 +123,7 @@ async fn async_main() -> Result<()> {
         db: db.clone(),
         management: tokio::sync::Mutex::new(()),
         proxy_client: proxy::http_client(),
+        free_router: free_router::Router::new()?,
         last_reconcile: Default::default(),
         shutting_down: Default::default(),
         events: event_bus,
@@ -192,6 +194,7 @@ async fn async_main() -> Result<()> {
         .route("/api/v1/state", get(api::state))
         .route("/api/v1/settings/auto_rent", post(api::auto_rent_set))
         .route("/api/v1/config", get(api::config_get).put(api::config_put))
+        .route("/api/v1/free-router", get(free_router::ui::get).put(free_router::ui::save))
         .route("/api/v1/alerts/test", post(api::webhook_test))
         .route("/api/v1/destroy_all", post(api::destroy_all))
         .route("/api/v1/sleep_all", post(api::sleep_all))
@@ -225,6 +228,7 @@ async fn async_main() -> Result<()> {
         // Widget renderte nie. Erste live bemerkt 21.09. (Terminal-Seite ohne
         // xterm). Local reproduziert und verifiziert.
         .nest_service("/static", tower_http::services::ServeDir::new(static_dir()))
+        .fallback(free_router::endpoint)
         .with_state(app.clone());
 
     let bind_ip = app.cfg().router.bind_ip.clone();

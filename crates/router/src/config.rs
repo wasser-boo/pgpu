@@ -16,6 +16,8 @@ pub struct Config {
     pub netbird: NetbirdCfg,
     #[serde(default)]
     pub stt: SttCfg,
+    #[serde(default)]
+    pub free_router: crate::free_router::config::Config,
     #[serde(default = "default_budget")]
     pub budget: BudgetConfig,
     #[serde(default = "default_limits")]
@@ -462,6 +464,7 @@ impl Config {
             anyhow::bail!("keine Slots konfiguriert");
         }
         crate::webhook::validate(&self.alerts)?;
+        self.free_router.validate()?;
         anyhow::ensure!(self.router.tz.parse::<chrono_tz::Tz>().is_ok(), "invalid router.tz");
         anyhow::ensure!(self.router.bind_ip == "auto" || self.router.bind_ip.parse::<std::net::IpAddr>().is_ok(), "invalid router.bind_ip");
         let nonnegative = |v: f64| v.is_finite() && v >= 0.0;

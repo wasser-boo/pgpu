@@ -229,6 +229,17 @@ Ports (alle an `bind_ip` = NetBird-IP gebunden, kein EXPOSE im Image):
 - **Dashboard**: `8080` — `/`, `/offers`, `/schedules`, `/assets`, `/settings`, `/api/v1/*`
 - **Pfad-Routing**: `/gpu/<slot>/<svc>/…`, `/inst/<vast_id>/<svc>/…`
 
+## Free-API-Router & Jumper (optional)
+
+**Settings → Free-API-Router & Jumper**: Anbieter mit eigenen Keys, kostenlosen Modell-IDs, Limits und gewünschter Reihenfolge eintragen. `Use free router when all offline` aktiviert den LLM-Textchat-Fallback, sobald im angefragten Slot keine gesunde GPU verfügbar ist. Gesunde GPUs behalten Vorrang.
+
+- **Priorität:** ersten verfügbaren Anbieter bis zur Reservegrenze nutzen.
+- **Jumper:** bei jedem Request zum nächsten verfügbaren Anbieter, auch bei parallelen Requests.
+- Standardmäßig **5 Requests Reserve**, persistente SQLite-Zähler, Minuten-/Stunden-/Tages-/Monats- und Tokenlimits, Provider-Cooldowns/`Retry-After`.
+- 40 Verzeichnis-Einträge als Vorlagen, Free-Tiers vs. Testguthaben/Adapter klar markiert; keine automatische Aktivierung. Alle Kontingente erschöpft → 503 mit Wartezeit, nicht unbegrenzte Nutzung.
+
+Standardmäßig aus. Externe Anbieter erhalten Prompts/Tool-Inhalte; kostenlose Modelle und Accountlimits selbst bestätigen, bezahlte Nutzung beim Anbieter sperren. **[Einrichtung, Konfiguration und Grenzen](docs/free-api-router.md)**.
+
 ## Praxis-Anbindung
 
 `settings.llama_base_url`/`comfyui_base_url`/`voice_vosk_url` auf die

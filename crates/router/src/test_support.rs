@@ -39,6 +39,7 @@ impl TestApp {
         let app = Arc::new(App {
             cfg: RwLock::new(Arc::new(cfg)), config_path: dir.join("config.toml").to_string_lossy().into(),
             db, management: tokio::sync::Mutex::new(()), proxy_client: crate::proxy::http_client(),
+            free_router: crate::free_router::Router::new().unwrap(),
             last_reconcile: Default::default(), shutting_down: Default::default(),
             events: crate::events::EventBus::new(32), traffic: Default::default(), jobs: Default::default(),
             targets: Default::default(), pool_routes: Default::default(), hub: Default::default(),

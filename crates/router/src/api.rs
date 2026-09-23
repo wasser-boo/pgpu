@@ -83,11 +83,12 @@ pub async fn destroy_all(app: AppCtx, req: Request) -> Response {
 /// `GET /api/v1/config` — Rohtext der config.toml (Bearer-geschützt).
 pub async fn config_get(app: AppCtx, req: Request) -> Response {
     guarded!(app, req);
-    Json(serde_json::json!({
+    let mut response = Json(serde_json::json!({
         "path": app.config_path,
         "raw": app.cfg_raw(),
-    }))
-    .into_response()
+    })).into_response();
+    response.headers_mut().insert(axum::http::header::CACHE_CONTROL, "no-store".parse().unwrap());
+    response
 }
 
 /// `PUT /api/v1/config` {"raw": "<toml>"} — validiert, schreibt atomar auf
@@ -114,8 +115,21 @@ pub async fn config_put(app: AppCtx, req: Request) -> Response {
 /// der laufenden Konfig, damit ein Edit am File den laufenden Router nicht
 /// dekonfiguriert.
 pub async fn apply_config(app: &SharedApp, raw: &str) -> anyhow::Result<String> {
-    let mut new_cfg = crate::config::Config::load_str(raw)?; // wirft bei TOML-/Validierungs-Fehler
+    let new_cfg = crate::config::Config::load_str(raw)?;
     let _management = app.management.lock().await;
+    apply_config_locked(app, raw, new_cfg)
+}
+
+/// Read/modify/write forms share the same lock as full config replacement.
+/// This prevents unrelated settings being lost between reading and saving.
+pub async fn patch_config(app: &SharedApp, patch: impl FnOnce(&str) -> anyhow::Result<String>) -> anyhow::Result<String> {
+    let _management = app.management.lock().await;
+    let raw = patch(&app.cfg_raw())?;
+    let cfg = crate::config::Config::load_str(&raw)?;
+    apply_config_locked(app, &raw, cfg)
+}
+
+fn apply_config_locked(app: &SharedApp, raw: &str, mut new_cfg: crate::config::Config) -> anyhow::Result<String> {
     let cur = app.cfg();
     // "auto"-Auflösungen der laufenden Config übernehmen (detect läuft nur
     // beim Boot; die laufenden Werte sind bereits real).

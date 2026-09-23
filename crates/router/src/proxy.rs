@@ -316,9 +316,11 @@ async fn resolve_slot_target(
         .unwrap_or(0)
         .min(app.cfg().router.wait_for_backend_max_s);
 
-    // Auto-Miete aus: kein impliziter Wake, kein Hold — Praxis/Cloud-Fallback
-    // greift sofort statt X-Router-Wait-Sekunden zu verschwenden.
-    if !app.db.auto_rent_enabled() {
+    // Preserve the legacy auto-rent-off behavior unless this LLM service has
+    // explicitly opted into GPU-first/free-fallback routing.
+    let free_fallback = slot_cfg.role == praxis_common::Role::Llm && service == "api"
+        && app.cfg().free_router.use_when_all_offline;
+    if !app.db.auto_rent_enabled() && !free_fallback {
         return Err(service_unavailable(slot_id, "auto_rent_off"));
     }
 
@@ -340,6 +342,11 @@ async fn resolve_slot_target(
             if app.pool_routes.healthy(slot_id).is_empty() {
                 return Ok(UpstreamTarget { vast_id, nb_ip, port: svc.port });
             }
+        }
+        // Existing healthy GPUs still win; disabling rentals only prevents
+        // implicit waking/holding once no usable backend remains.
+        if !app.db.auto_rent_enabled() {
+            return Err(service_unavailable(slot_id, "auto_rent_off"));
         }
         if wait_s == 0 || tokio::time::Instant::now() >= deadline {
             let state = describe_slot_state(app, slot_id);
@@ -430,6 +437,11 @@ pub async fn passthrough(
     service: String,
     req: Request,
 ) -> Response {
+    // External fallback is decided before GPU traffic/wake bookkeeping: free
+    // requests must not rent GPUs or keep sleeping slots artificially busy.
+    if crate::free_router::eligible(&app, slot_id, &service, &req) {
+        return crate::free_router::proxy(&app, Some(slot_id), req).await;
+    }
     app.traffic.mark(slot_id);
     app.db.mark_traffic(slot_id);
 

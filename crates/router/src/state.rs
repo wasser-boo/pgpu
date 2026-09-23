@@ -224,6 +224,7 @@ pub struct App {
     /// Serialize lifecycle/rental admission across API and reconciliation.
     pub management: tokio::sync::Mutex<()>,
     pub proxy_client: crate::proxy::HttpClient,
+    pub free_router: crate::free_router::Router,
     pub last_reconcile: std::sync::atomic::AtomicI64,
     pub shutting_down: std::sync::atomic::AtomicBool,
     pub events: EventBus,

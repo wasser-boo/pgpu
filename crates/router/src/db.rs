@@ -5,6 +5,7 @@ mod performance_store;
 mod billing_store;
 mod notification_store;
 mod lock_store;
+pub(crate) mod free_router_store;
 pub use performance_store::PerformanceRow;
 
 use crate::config::Config;
@@ -113,6 +114,7 @@ impl Db {
         }
         let conn = Connection::open(path)?;
         Self::migrate(&conn)?;
+        Self::migrate_free_router(&conn)?;
         Ok(Self(Arc::new(Mutex::new(conn)), Arc::new(Mutex::new(None))))
     }
 

@@ -13,6 +13,36 @@ tz = "Europe/Berlin"
 # Hold-Window für X-Router-Wait (Sekunden, 0 = sofort 503)
 wait_for_backend_max_s = 600
 
+# Optionaler LLM-Fallback; Settings → Free-API-Router bietet Anbieter-Vorlagen.
+# Nur /v1/chat/completions (Text/Tools/SSE) und /v1/models; keine Media-/STT-APIs.
+# Prompts gehen an externe Anbieter! Limits/Free-Modell im Account prüfen.
+# Details: docs/free-api-router.md. Standardmäßig vollständig AUS.
+[free_router]
+use_when_all_offline = false  # keine gesunde GPU im angefragten LLM-Slot
+jumper = false                # true: nächster Anbieter bei JEDEM Request
+safety_buffer_requests = 5    # pro Requestfenster; bei kleinen Quoten überschreiben
+
+[[free_router.providers]]
+id = "groq"
+enabled = false
+base_url = "https://api.groq.com/openai/v1"
+api_key_env = "GROQ_API_KEY"  # alternativ api_key = "..."; Env hat Vorrang
+model = ""                   # exakte kostenlose Modell-ID selbst wählen
+requests_per_minute = 30      # Vorschlag, nicht für alle Modelle gültig!
+# requests_per_day = 1000     # tatsächliches Modell-/Account-Limit einsetzen
+# tokens_per_minute = 6000
+max_output_tokens = 1024
+
+[[free_router.providers]]
+id = "openrouter"
+enabled = false
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+model = "openrouter/free"     # keine automatische Auswahl bezahlter Modelle
+requests_per_minute = 20
+requests_per_day = 50
+max_output_tokens = 1024
+
 [vast]
 # api_key = ""               # oder env VAST_API_KEY
 poll_interval_s = 30

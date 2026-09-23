@@ -47,6 +47,7 @@
 </div>
 {% endfor %}
 <script src="/static/selection.js" defer></script>
+{% include "free_router.html" %}
 <div class="grid">
 <div class="card">
   <h2 style="margin-top:0">Budget</h2>
@@ -145,6 +146,6 @@ webhook_format = "discord"</pre>
   <form method="post" action="/do/config/reload" style="margin-top:8px">
     <button type="submit">Von Disk neu laden</button>
   </form>
-  <p class="mut">Speichern validiert die TOML, schreibt atomar auf Disk und tauscht die Konfig live (Slots, Budget, Limits, Bid/Idle/Swap/Pool — wirksam im nächsten Reconciler-Tick ≤ 30 s, kein Neustart). Base-Parameter ([router] bind/ports, [vast]/[netbird] Keys/URLs, [stt]) werden gespeichert, brauchen aber einen Router-Neustart. Fehlerhafte TOML wird abgelehnt — die laufende Konfig bleibt unverändert.</p>
+  <p class="mut">Speichern validiert die TOML, schreibt atomar auf Disk und tauscht die Konfig live (Free-Router/Jumper sofort; Slots, Budget, Limits, Bid/Idle/Swap/Pool — wirksam im nächsten Reconciler-Tick ≤ 30 s, kein Neustart). Base-Parameter ([router] bind/ports, [vast]/[netbird] Keys/URLs, [stt]) werden gespeichert, brauchen aber einen Router-Neustart. Fehlerhafte TOML wird abgelehnt — die laufende Konfig bleibt unverändert.</p>
 </div>
 {% endblock %}

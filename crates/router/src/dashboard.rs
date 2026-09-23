@@ -915,7 +915,9 @@ pub async fn settings_page(app: AppCtx, Query(q): Query<HashMap<String, String>>
         config_raw: app.cfg_raw(),
         config_msg,
     };
-    Html(tpl.render().unwrap_or_default()).into_response()
+    let mut response = Html(tpl.render().unwrap_or_default()).into_response();
+    response.headers_mut().insert(axum::http::header::CACHE_CONTROL, "no-store".parse().unwrap());
+    response
 }
 
 /// Dashboard-Button „Alle Instanzen zerstören“ — gleiches Primitiv wie

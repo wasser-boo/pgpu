@@ -1,0 +1,24 @@
+<div class="card" id="free-router">
+  <h2>Free-API-Router &amp; Jumper</h2>
+  <p>Optionaler Fallback für <code>/v1/chat/completions</code> (Text/Tools, auch SSE), wenn keine gesunde GPU des angefragten LLM-Slots verfügbar ist. Gesunde GPUs haben Vorrang. Keine automatische GPU-Miete durch Free-Requests.</p>
+  <p><strong>Externe Verarbeitung:</strong> Prompts und Tool-Inhalte verlassen dein GPU-Netz und gehen an die eingetragenen Anbieter. Nur eigene, berechtigte API-Keys verwenden. Free-Tiers, Datenschutz und Modellfähigkeiten vor Aktivierung prüfen.</p>
+  <form id="free-router-form">
+    <p><label><input type="checkbox" name="use_when_all_offline"> Use free router when all offline</label></p>
+    <p><label><input type="checkbox" name="jumper"> Jumper aktivieren — bei jedem Request zum nächsten Anbieter (Round-Robin)</label></p>
+    <p><label>Request-Reserve pro Limit: <input type="number" name="safety_buffer_requests" min="0" max="10000" value="5" required style="width:90px"></label></p>
+    <p class="mut">Ohne Jumper gilt die Reihenfolge: erster verfügbarer Anbieter bis zur Reservegrenze. Mit Jumper starten aufeinanderfolgende Requests bei wechselnden Anbietern; Cooldowns werden übersprungen. Zehn Anbieter sind mehr Kontingent, aber nicht unbegrenzt.</p>
+    <div id="free-router-providers"></div>
+    <p><select id="free-router-catalog" aria-label="Anbieter-Vorlage"></select> <button type="button" id="free-router-add">Anbieter hinzufügen</button></p>
+    <p id="free-router-catalog-note" class="mut"></p>
+    <button type="submit">Free-Router speichern &amp; live anwenden</button>
+    <button type="button" id="free-router-reload">Gespeicherte Einstellungen laden</button>
+    <p id="free-router-status" role="status">Lade Free-Router …</p>
+  </form>
+  <p class="mut">API-Keys werden hier nicht zurückgegeben. Leeres Key-Feld behält den gespeicherten Key; „Key löschen“ entfernt ihn. Alternativ Env-Variablennamen eintragen. Reihenfolge, Schalter, Modelle und Limits gelten sofort, Zähler bleiben erhalten.</p>
+  <details><summary>Kontingente, Anbieter-Vorlagen und Grenzen</summary>
+    <p>Vorlagen aus <a href="https://github.com/nejib1/Free-LLM#quick-reference--base-urls--api-keys" target="_blank" rel="noopener noreferrer">Free-LLM</a> sind Startpunkte, keine bestätigten Account-Limits. Alle neuen Anbieter bleiben aus. Exakte kostenlose Modell-ID und Limits selbst prüfen; unbekannte RPM = 0 verhindert Aktivierung. Trial-/Guthaben-Anbieter sind ausdrücklich markiert. Native APIs brauchen einen Adapter.</p>
+    <p>SQLite reserviert jeden Versuch atomar, auch bei parallelen Requests, Fehlern und Neustarts. Rollierende Minuten-, Stunden-, 24h- und konservative 31-Tage-Limits; Anbieter-Header und Retry-After können zusätzlich sperren. Bei kleinen Kontingenten ≤ 5 die Reserve pro Anbieter explizit reduzieren. Tokenlimits nutzen eine konservative Schätzung (JSON-Bytes + maximale Ausgabe), keinen modellspezifischen Tokenizer. Geteilte Accounts/andere Clients können unbekanntes Restkontingent verbrauchen.</p>
+    <p>Keine Umgehung von Limits, keine Garantie für Guthaben-/Neuronen-/Wochenbudgets. Kostenpflichtige Nutzung beim Anbieter deaktivieren! Sind alle Anbieter gesperrt, folgt HTTP 503 mit Retry-After. Ein begonnener Antwortstream wird niemals neu gestartet oder mit einem anderen Modell vermischt.</p>
+  </details>
+</div>
+<script src="/static/free-router.js" defer></script>
