@@ -32,8 +32,8 @@ cleanup_unused_peers = true # vorhandene/schlafende Verträge und fremde Geräte
 # für die Agents). PAT nur nötig, weil der Router pro GPU-Box ephemere
 # Setup-Keys mintet.
 api_token = ""                # env NB_API_TOKEN (nbp_...)
-api_url = "https://***REMOVED***"
-management_url = "https://***REMOVED***"
+api_url = ""
+management_url = ""
 setup_key = ""
 groups = ["Gpuserver", "servers"]
 router_nb_ip = "auto"

@@ -1,4 +1,4 @@
-# ***REMOVED*** — GPU-NetBird (VPS ***REMOVED***, separiert von tgrid)
+# GPU-NetBird (Management-URL/VPS-IP entfernt)
 
 Stand 20.09. abends II: Management läuft (netbird-server + dashboard + traefik, ~/docker-compose.yml).
 **Langlebiger PAT „pgpu-router-mint" ist gemintet (bis 20.09.2027)** — liegt als
@@ -13,8 +13,7 @@ benötigt).
   (praxis-stack→vast-gpus:9100,8188,2700,11434-36), operators-dashboards
   (operators→praxis-stack:8080,1337,3537,8188,2700,11434-36), operators-debug-boxes
   (operators→vast-gpus:8188,9100,11434,11435)
-- **Setup-Keys**: Router/Peer `praxis-stack`: ***REMOVED***,
-  Operators/NAS: ***REMOVED***
+- **Setup-Keys**: entfernt/rotiert. Echte Werte nur lokal in `.env`, nie im Repo.
 
 ## API-Schema des NEUEN netbird-server (weicht von tgrid ab!)
 - POST /api/policies: `rules[].sources|destinations` = **Array von Gruppen-ID-Strings**
@@ -48,8 +47,8 @@ Offen nach NAS-Start:
 2. Optional Heimserver-Daten übernehmen (alpine-tar pro Volume):
    praxis-data (Chats), router-data (Metering+Host-Blacklist), stt-models.
 
-Erledigt (21.09. nachts): ✅ toter tgrid-`praxis-vps`-Peer (***REMOVED***,
-alter Heimserver) per API gelöscht; ✅ Workstation dual-enroll
+Erledigt (21.09. nachts): ✅ alter tgrid-`praxis-vps`-Peer (Overlay-IP entfernt)
+per API gelöscht; ✅ Workstation dual-enroll
 (`deploy/ws-jfinx-compose.yml`: jfinx als Host-Netz-Container, wt1/WG-51821/
 no-DNS via `netbird-wt1.sh`, live bewiesen: Router/Praxis/Gateway von der
 Workstation erreichbar); ✅ Multi-Arch-Images (router 0.15, praxis 0.5,
@@ -61,8 +60,8 @@ wget-Resume/Retries.
 NetBird im Stack-Netns (network_mode: service:netbird) mit Interface wt1,
 WG-Port 51821, DNS aus (alles regelt `deploy/nas/netbird-wt1.sh`, gleiche
 Wrapper-Datei wie Workstation). Peer-Name „praxis-vps", Gruppen servers+test,
-reusable Key „praxis-vps-nas" `***REMOVED***`
-(bis 20.09.2027; tgrid-API: expires_in in SEKUNDEN!). Damit greifen die
+reusable Key „praxis-vps-nas" entfernt/rotiert
+(tgrid-API: expires_in in SEKUNDEN!). Damit greifen die
 tgrid-ACLs: developers→servers:ALLE (volle Nutzung von allen dev-
 Maschinen) + Gpuaccess→test:8080,8188,2700,11434-36 (Legacy). Muster live
 getestet (Testpair mit Dummy-HTTP: aus beiden Netzen HTTP 200 auf dieselbe
@@ -74,21 +73,20 @@ erreichbar (wt0) — Boxen/Agents laufen NUR über jfinx.
 ## NAS: fertig ✅ (20.09. abends II) — zwei Artefakte
 1. `deploy/nas-compose.yml` — NUR die beiden Access-NetBirds (Bridge-Netns,
    Sidecar-Muster): netbird-tgrid → tgrid (Peer „nas", Gruppen
-developers+servers, reusable Key „nas-dual" `***REMOVED***-…`, bis 20.09.2027 —
-tgrid nimmt expires_in in SEKUNDEN!) + netbird-jfinx → jfinx (Operators-Key).
-Live getestet: beide Enrollments Connected (tgrid ***REMOVED*** / jfinx
-***REMOVED***), Overlay-Datenpfad via ACL (nas→forgejo:22 OK); Test-Peers
+developers+servers, reusable Key lokal/rotiert —
+tgrid nimmt expires_in in SEKUNDEN!) + netbird-jfinx → jfinx (Operators-Key lokal/rotiert).
+Live getestet: beide Enrollments Connected (Overlay-IPs entfernt), Overlay-Datenpfad via ACL (nas→forgejo:22 OK); Test-Peers
 hinterher per API gelöscht.
 2. `deploy/nas/` (gitignored — echte Secrets inline!) = KOMPLETT-Bundle:
 `docker-compose.yml` mit dem GANZEN GPU-Stack (netbird → jfinx als
-„praxis-vps" mit Key `***REMOVED***-…`; stt; router mit ROUTER_TOKEN/VAST_API_KEY/
-NB_API_TOKEN=jfinx-PAT inline; praxis mit ALLEN Env inline + master_key-
+„praxis-vps" mit lokalem Key; stt; router mit ROUTER_TOKEN/VAST_API_KEY/
+NB_API_TOKEN lokal inline; praxis mit ALLEN Env inline + master_key-
 Secret + praxis-state-Bind) PLUS den beiden Access-NetBirds. Dazu `vps/
 config.toml` (auf jfinx+vast-gpus umgestellt; Budget 12/14 € Test-Wert),
 `vps/master_key`, `vps/praxis-state/` (Secret-Store). Start auf dem NAS:
 das Verzeichnis rsyncen + `docker compose up -d` (Details im Compose-Header).
 Verifiziert: `docker compose config` valid; praxis-stack-Key live enrollt
-(praxis-vps → ***REMOVED***, Connected; Test-Peer danach gelöscht).
+(praxis-vps → Overlay-IP entfernt, Connected; Test-Peer danach gelöscht).
 Frisch auf dem NAS: neue Peer-IPs, leere Volumes (keine Chats/Metering —
 Übernahme optional, s. Migration Punkt 3).
 

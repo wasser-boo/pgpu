@@ -23,8 +23,8 @@ services:
     devices:
       - /dev/net/tun:/dev/net/tun
     environment:
-      NB_MANAGEMENT_URL: https://***REMOVED***
-      NB_SETUP_KEY: ***REMOVED*** # reusable operators-nas-workstation
+      NB_MANAGEMENT_URL: ${NB_JFINX_MANAGEMENT_URL:?NB_JFINX_MANAGEMENT_URL setzen}
+      NB_SETUP_KEY: ${NB_JFINX_SETUP_KEY:?NB_JFINX_SETUP_KEY setzen} # reusable operators/workstation setup key
       NB_HOSTNAME: wasser-jfinx
       NETBIRD_BIN: /usr/local/bin/netbird-wt1
     volumes:

@@ -33,7 +33,7 @@ services:
       # Eigene NetBird-Instanz (empfohlen, getrennt vom Rest-Netz) oder
       # tgrid — nur die URL unterscheidet die Netze, der Stack ist identisch.
       NB_SETUP_KEY: ${NB_SETUP_KEY:?NB_SETUP_KEY setzen (reusable, Gruppen s. vps/README.md)}
-      NB_MANAGEMENT_URL: ${NB_MANAGEMENT_URL:?NB_MANAGEMENT_URL setzen, z. B. https://nb.deine-domain}
+      NB_MANAGEMENT_URL: ${NB_MANAGEMENT_URL:?NB_MANAGEMENT_URL setzen}
       NB_HOSTNAME: praxis-vps
     volumes:
       - netbird-config:/etc/netbird

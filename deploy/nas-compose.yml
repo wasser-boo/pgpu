@@ -1,15 +1,15 @@
 # NAS — Dual-NetBird: ein Peer in tgrid, ein Peer in jfinx (GPU-Netz).
 #
-# Zero-Config: Setup-Keys + Management-URLs sind eingebacken — nur
+# Setup-Keys kommen aus der Umgebung/.env — keine echten Keys committen.
 # `docker compose -f nas-compose.yml up -d` starten. Voraussetzungen auf
 # dem NAS: Docker + Compose v2, /dev/net/tun (haben die anderen NetBird-
 # Stacks schon: jellyfin/immich/… laufen nach demselben Muster).
 #
 # Was hier enrollt:
-#   * netbird-tgrid → https://***REMOVED***, Peer "nas", Gruppen developers+servers
-#     (reusable Key "nas-dual", gemintet 20.09.2026, gültig bis 20.09.2027)
-#   * netbird-jfinx → https://***REMOVED***, Peer "nas", Gruppe operators
-#     (reusable Key "operators-nas-workstation") — Zugriff auf den GPU-Stack:
+#   * netbird-tgrid → NB_TGRID_MANAGEMENT_URL, Peer "nas", Gruppen developers+servers
+#     (reusable Key lokal per NB_TGRID_SETUP_KEY setzen)
+#   * netbird-jfinx → NB_JFINX_MANAGEMENT_URL, Peer "nas", Gruppe operators
+#     (reusable Key lokal per NB_JFINX_SETUP_KEY setzen) — Zugriff auf den GPU-Stack:
 #     Router-Dashboard :8080, Praxis :1337, Gateway :3537, ComfyUI :8188,
 #     STT :2700, llama :11434-36 (sobald der Router in jfinx migriert ist).
 #
@@ -40,8 +40,8 @@ services:
     devices:
       - /dev/net/tun:/dev/net/tun
     environment:
-      NB_MANAGEMENT_URL: https://***REMOVED***
-      NB_SETUP_KEY: ***REMOVED***
+      NB_MANAGEMENT_URL: ${NB_TGRID_MANAGEMENT_URL:?NB_TGRID_MANAGEMENT_URL setzen}
+      NB_SETUP_KEY: ${NB_TGRID_SETUP_KEY:?NB_TGRID_SETUP_KEY setzen}
       NB_HOSTNAME: nas
     volumes:
       - tgrid-config:/etc/netbird
@@ -54,8 +54,8 @@ services:
     devices:
       - /dev/net/tun:/dev/net/tun
     environment:
-      NB_MANAGEMENT_URL: https://***REMOVED***
-      NB_SETUP_KEY: ***REMOVED***
+      NB_MANAGEMENT_URL: ${NB_JFINX_MANAGEMENT_URL:?NB_JFINX_MANAGEMENT_URL setzen}
+      NB_SETUP_KEY: ${NB_JFINX_SETUP_KEY:?NB_JFINX_SETUP_KEY setzen}
       NB_HOSTNAME: nas
     volumes:
       - jfinx-config:/etc/netbird
