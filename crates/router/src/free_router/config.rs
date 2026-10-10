@@ -15,11 +15,13 @@ pub struct Config {
     pub providers: Vec<Provider>,
 }
 impl Default for Config {
+    /// Fail closed: nothing sends requests unless the operator opts in
+    /// (docs/free-api-router.md: "Standardmäßig vollständig AUS").
     fn default() -> Self {
         Self {
             use_when_all_offline: false,
             endpoint_path: "/free/v1".into(),
-            jumper: true,
+            jumper: false,
             safety_buffer_requests: 5,
             providers: Vec::new(),
         }
@@ -47,10 +49,13 @@ pub struct Provider {
     pub max_output_tokens: u32,
 }
 impl Default for Provider {
+    /// An entry without an explicit `enabled` must never auto-activate: catalog
+    /// presets and hand-written TOML entries stay off until the operator checks
+    /// the account quota and enables them deliberately.
     fn default() -> Self {
         Self {
             id: String::new(),
-            enabled: true,
+            enabled: false,
             base_url: String::new(),
             api_key: String::new(),
             api_key_env: String::new(),
@@ -100,7 +105,23 @@ impl Provider {
 impl Config {
     pub fn validate(&self) -> Result<()> {
         let path = &self.endpoint_path;
-        let reserved = ["api", "gpu", "inst", "static", "login", "settings", "do", "offers", "performance", "instances", "term", "schedules", "assets", "healthz", "readyz"];
+        let reserved = [
+            "api",
+            "gpu",
+            "inst",
+            "static",
+            "login",
+            "settings",
+            "do",
+            "offers",
+            "performance",
+            "instances",
+            "term",
+            "schedules",
+            "assets",
+            "healthz",
+            "readyz",
+        ];
         ensure!(path.starts_with('/') && path.len() >= 2 && path.len() <= 128
             && !path.ends_with('/') && !path.contains("//")
             && path.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'/' || b == b'-' || b == b'_')
